@@ -1,8 +1,8 @@
 //! Syntax highlighting initialization.
 //!
 //! Provides lazily-initialized `Syntect` instances for code highlighting.
-//! Dark themes (GrokNight, TokyoNight) share `grok-night.tmTheme`;
-//! GrokDay uses `grok-day.tmTheme` with deepened colors for light backgrounds.
+//! GrokNight and the compatible dark themes share `grok-night.tmTheme`;
+//! TokyoNight, OpenCode, and GrokDay each use a dedicated syntax theme.
 //!
 //! ## Minimal / terminal-native lock
 //!
@@ -33,6 +33,7 @@ use crate::theme::ThemeKind;
 static SYNTECT_GROKNIGHT: OnceLock<Syntect> = OnceLock::new();
 static SYNTECT_TOKYONIGHT: OnceLock<Syntect> = OnceLock::new();
 static SYNTECT_GROKDAY: OnceLock<Syntect> = OnceLock::new();
+static SYNTECT_OPENCODE: OnceLock<Syntect> = OnceLock::new();
 
 /// Convert syntect style to ratatui foreground-only style, quantized for
 /// terminal color support (or polarity-safe under the terminal-native lock).
@@ -154,6 +155,8 @@ pub fn get_syntect() -> &'static Syntect {
             .get_or_init(|| Syntect::new(include_bytes!("../assets/tokyo-night.tmTheme"))),
         ThemeKind::GrokDay => SYNTECT_GROKDAY
             .get_or_init(|| Syntect::new(include_bytes!("../assets/grok-day.tmTheme"))),
+        ThemeKind::OpenCode => SYNTECT_OPENCODE
+            .get_or_init(|| Syntect::new(include_bytes!("../assets/opencode.tmTheme"))),
     }
 }
 
@@ -265,5 +268,12 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// 验证独立的 OpenCode TextMate 资源能够被生产加载器解析。
+    #[test]
+    fn opencode_theme_resource_loads() {
+        let syntect = Syntect::new(include_bytes!("../assets/opencode.tmTheme"));
+        assert!(syntect.syntax_set.find_syntax_by_token("rust").is_some());
     }
 }

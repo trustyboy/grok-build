@@ -71,6 +71,11 @@ const THEME_CHOICES: &[EnumChoice] = &[
         display: "Oscura Midnight",
         description: "Deep dark with warm accents; needs truecolor.",
     },
+    EnumChoice {
+        canonical: "opencode",
+        display: "OpenCode",
+        description: "OpenCode TUI typography and dark palette.",
+    },
 ];
 
 // ---------------------------------------------------------------------------

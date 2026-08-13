@@ -16,6 +16,7 @@ pub mod env_appearance;
 mod grokday;
 mod groknight;
 pub mod md_style;
+mod opencode;
 pub mod osc11;
 mod oscura;
 mod rosepine;
@@ -34,6 +35,7 @@ pub enum ThemeKind {
     TokyoNight = 2,
     RosePineMoon = 3,
     OscuraMidnight = 5,
+    OpenCode = 6,
     /// Meta-variant: follow system dark/light appearance.
     ///
     /// Never stored in `cache::CURRENT` — resolved to a concrete
@@ -52,6 +54,7 @@ impl ThemeKind {
         ThemeKind::TokyoNight,
         ThemeKind::RosePineMoon,
         ThemeKind::OscuraMidnight,
+        ThemeKind::OpenCode,
     ];
 
     /// Theme kinds available on the current terminal.
@@ -62,7 +65,11 @@ impl ThemeKind {
         // Two possible results — pick the right const slice based on
         // the detected color level. No heap allocation needed.
         const ALL: &[ThemeKind] = ThemeKind::ALL;
-        const NO_TRUECOLOR: &[ThemeKind] = &[ThemeKind::GrokNight, ThemeKind::GrokDay];
+        const NO_TRUECOLOR: &[ThemeKind] = &[
+            ThemeKind::GrokNight,
+            ThemeKind::GrokDay,
+            ThemeKind::OpenCode,
+        ];
 
         if color_support::detect().has_truecolor() {
             ALL
@@ -79,6 +86,7 @@ impl ThemeKind {
             Self::GrokDay => "grokday",
             Self::RosePineMoon => "rosepine-moon",
             Self::OscuraMidnight => "oscura-midnight",
+            Self::OpenCode => "opencode",
             Self::Auto => "auto",
         }
     }
@@ -95,6 +103,7 @@ impl ThemeKind {
             Self::GrokDay => false,
             Self::RosePineMoon => true,
             Self::OscuraMidnight => true,
+            Self::OpenCode => false,
             // Auto is resolved to a concrete theme before rendering.
             Self::Auto => false,
         }
@@ -113,6 +122,7 @@ impl ThemeKind {
                 Some(Self::RosePineMoon)
             }
             "oscura" | "oscura-midnight" => Some(Self::OscuraMidnight),
+            "opencode" | "open-code" | "oc" => Some(Self::OpenCode),
             _ => None,
         }
     }
@@ -148,6 +158,7 @@ pub fn display_name_for_canonical(value: &str) -> &str {
         "grokday" => "Grok Day",
         "tokyonight" => "Tokyo Night",
         "rosepine-moon" => "Rose Pine Moon",
+        "opencode" => "OpenCode",
         other => other,
     }
 }
@@ -159,6 +170,11 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// OpenCode 默认 TUI 深色主题。
+    pub const fn opencode() -> Self {
+        opencode::theme()
+    }
+
     /// Return a copy with every color quantized to the given level.
     ///
     /// This adapts the theme to terminals with limited color support.
@@ -274,6 +290,7 @@ impl Theme {
             ThemeKind::GrokDay => Self::grokday(),
             ThemeKind::RosePineMoon => Self::rosepine_moon(),
             ThemeKind::OscuraMidnight => Self::oscura_midnight(),
+            ThemeKind::OpenCode => Self::opencode(),
             // Auto is resolved to a concrete theme before being stored;
             // if reached, fall back to GrokNight.
             ThemeKind::Auto => Self::groknight(),
@@ -706,6 +723,7 @@ mod tests {
         assert!(!ThemeKind::TokyoNight.is_auto());
         assert!(!ThemeKind::RosePineMoon.is_auto());
         assert!(!ThemeKind::OscuraMidnight.is_auto());
+        assert!(!ThemeKind::OpenCode.is_auto());
     }
 
     #[test]
@@ -725,6 +743,7 @@ mod tests {
         assert!(Theme::tokyonight().is_dark());
         assert!(Theme::rosepine_moon().is_dark());
         assert!(Theme::oscura_midnight().is_dark());
+        assert!(Theme::opencode().is_dark());
         assert!(!Theme::grokday().is_dark());
     }
 
@@ -1063,6 +1082,7 @@ mod tests {
                 ThemeKind::TokyoNight => Theme::tokyonight(),
                 ThemeKind::RosePineMoon => Theme::rosepine_moon(),
                 ThemeKind::OscuraMidnight => Theme::oscura_midnight(),
+                ThemeKind::OpenCode => Theme::opencode(),
                 ThemeKind::Auto => unreachable!("ALL excludes Auto"),
             };
             let track = lum(theme.scrollbar_bg, "scrollbar_bg", kind);
@@ -1146,6 +1166,7 @@ mod tests {
     #[test]
     fn auto_does_not_require_truecolor() {
         assert!(!ThemeKind::Auto.requires_truecolor());
+        assert!(!ThemeKind::OpenCode.requires_truecolor());
     }
 
     #[test]
@@ -1211,6 +1232,7 @@ mod tests {
             ThemeKind::from_name("oscura-midnight"),
             Some(ThemeKind::OscuraMidnight)
         );
+        assert_eq!(ThemeKind::from_name("opencode"), Some(ThemeKind::OpenCode));
     }
 
     /// `FromStr` agrees with `from_name` for all canonicals + aliases.
@@ -1234,6 +1256,9 @@ mod tests {
             ("rose-pine", ThemeKind::RosePineMoon),
             ("rosepine-moon", ThemeKind::RosePineMoon),
             ("rose-pine-moon", ThemeKind::RosePineMoon),
+            ("opencode", ThemeKind::OpenCode),
+            ("open-code", ThemeKind::OpenCode),
+            ("oc", ThemeKind::OpenCode),
         ];
         for (name, expected) in cases {
             assert_eq!(

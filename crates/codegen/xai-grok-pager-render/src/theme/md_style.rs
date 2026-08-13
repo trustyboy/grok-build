@@ -107,6 +107,10 @@ pub fn style() -> MarkdownStyle {
 fn build_style() -> MarkdownStyle {
     let theme = super::Theme::current();
 
+    if super::Theme::current_kind() == super::ThemeKind::OpenCode {
+        return super::opencode::markdown_style(&theme);
+    }
+
     let heading_colors = [
         theme.md_heading_h1,
         theme.md_heading_h2,
