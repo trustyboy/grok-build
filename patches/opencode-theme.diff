@@ -1,0 +1,1041 @@
+diff --git a/crates/codegen/xai-grok-pager-render/assets/opencode.tmTheme b/crates/codegen/xai-grok-pager-render/assets/opencode.tmTheme
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b3d618e833575caeebbe2274541c54618b8f5c6
+--- /dev/null
++++ b/crates/codegen/xai-grok-pager-render/assets/opencode.tmTheme
+@@ -0,0 +1,209 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++  <key>name</key>
++  <string>OpenCode</string>
++  <key>settings</key>
++  <array>
++    <dict>
++      <key>settings</key>
++      <dict>
++        <key>background</key>
++        <string>#0a0a0a</string>
++        <key>caret</key>
++        <string>#eeeeee</string>
++        <key>foreground</key>
++        <string>#eeeeee</string>
++        <key>invisibles</key>
++        <string>#3c3c3c</string>
++        <key>lineHighlight</key>
++        <string>#141414</string>
++        <key>selection</key>
++        <string>#323232</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Comments</string>
++      <key>scope</key>
++      <string>comment, punctuation.definition.comment, string.quoted.docstring</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#808080</string>
++        <key>fontStyle</key>
++        <string>italic</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Keywords</string>
++      <key>scope</key>
++      <string>keyword, storage.modifier, storage.type, keyword.control, keyword.operator.word</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#9d7cd8</string>
++        <key>fontStyle</key>
++        <string>italic</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Functions</string>
++      <key>scope</key>
++      <string>entity.name.function, support.function, meta.function-call, variable.function</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#fab283</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Variables and properties</string>
++      <key>scope</key>
++      <string>variable, variable.parameter, variable.other, support.variable, meta.object-literal.key, meta.property-name</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#e06c75</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Strings</string>
++      <key>scope</key>
++      <string>string, constant.other.symbol, constant.character</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#7fd88f</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Numbers and constants</string>
++      <key>scope</key>
++      <string>constant.numeric, constant.language, constant.other, support.constant</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#f5a742</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Types and classes</string>
++      <key>scope</key>
++      <string>entity.name.type, entity.name.class, support.type, support.class, storage.type.class</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#e5c07b</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Operators and escapes</string>
++      <key>scope</key>
++      <string>keyword.operator, punctuation.separator, punctuation.accessor, constant.character.escape</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#56b6c2</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Tags and builtins</string>
++      <key>scope</key>
++      <string>entity.name.tag, support.type.builtin, support.function.builtin, variable.language</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#e06c75</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Markup headings</string>
++      <key>scope</key>
++      <string>markup.heading, entity.name.section</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#9d7cd8</string>
++        <key>fontStyle</key>
++        <string>bold</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Markup bold</string>
++      <key>scope</key>
++      <string>markup.bold, markup.strong</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#f5a742</string>
++        <key>fontStyle</key>
++        <string>bold</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Markup italic and quotes</string>
++      <key>scope</key>
++      <string>markup.italic, markup.quote</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#e5c07b</string>
++        <key>fontStyle</key>
++        <string>italic</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Markup raw</string>
++      <key>scope</key>
++      <string>markup.raw, markup.raw.inline</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#7fd88f</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Markup links</string>
++      <key>scope</key>
++      <string>markup.underline.link, string.other.link, meta.link</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#56b6c2</string>
++        <key>fontStyle</key>
++        <string>underline</string>
++      </dict>
++    </dict>
++    <dict>
++      <key>name</key>
++      <string>Invalid</string>
++      <key>scope</key>
++      <string>invalid, invalid.illegal</string>
++      <key>settings</key>
++      <dict>
++        <key>foreground</key>
++        <string>#e06c75</string>
++        <key>fontStyle</key>
++        <string>bold</string>
++      </dict>
++    </dict>
++  </array>
++  <key>uuid</key>
++  <string>9159ef93-fc84-48a0-a6d9-6fd4677548f8</string>
++</dict>
++</plist>
+diff --git a/crates/codegen/xai-grok-pager-render/src/syntax.rs b/crates/codegen/xai-grok-pager-render/src/syntax.rs
+index 7de80cb2770519f0c426dee2e5b6d76c21b756db..9d7c6c3e696e806704735c207ce974bcb0228fae 100644
+--- a/crates/codegen/xai-grok-pager-render/src/syntax.rs
++++ b/crates/codegen/xai-grok-pager-render/src/syntax.rs
+@@ -1,8 +1,8 @@
+ //! Syntax highlighting initialization.
+ //!
+ //! Provides lazily-initialized `Syntect` instances for code highlighting.
+-//! Dark themes (GrokNight, TokyoNight) share `grok-night.tmTheme`;
+-//! GrokDay uses `grok-day.tmTheme` with deepened colors for light backgrounds.
++//! GrokNight and the compatible dark themes share `grok-night.tmTheme`;
++//! TokyoNight, OpenCode, and GrokDay each use a dedicated syntax theme.
+ //!
+ //! ## Minimal / terminal-native lock
+ //!
+@@ -33,6 +33,7 @@ use crate::theme::ThemeKind;
+ static SYNTECT_GROKNIGHT: OnceLock<Syntect> = OnceLock::new();
+ static SYNTECT_TOKYONIGHT: OnceLock<Syntect> = OnceLock::new();
+ static SYNTECT_GROKDAY: OnceLock<Syntect> = OnceLock::new();
++static SYNTECT_OPENCODE: OnceLock<Syntect> = OnceLock::new();
+ 
+ /// Convert syntect style to ratatui foreground-only style, quantized for
+ /// terminal color support (or polarity-safe under the terminal-native lock).
+@@ -154,6 +155,8 @@ pub fn get_syntect() -> &'static Syntect {
+             .get_or_init(|| Syntect::new(include_bytes!("../assets/tokyo-night.tmTheme"))),
+         ThemeKind::GrokDay => SYNTECT_GROKDAY
+             .get_or_init(|| Syntect::new(include_bytes!("../assets/grok-day.tmTheme"))),
++        ThemeKind::OpenCode => SYNTECT_OPENCODE
++            .get_or_init(|| Syntect::new(include_bytes!("../assets/opencode.tmTheme"))),
+     }
+ }
+ 
+@@ -266,4 +269,11 @@ mod tests {
+             }
+         });
+     }
++
++    /// 验证独立的 OpenCode TextMate 资源能够被生产加载器解析。
++    #[test]
++    fn opencode_theme_resource_loads() {
++        let syntect = Syntect::new(include_bytes!("../assets/opencode.tmTheme"));
++        assert!(syntect.syntax_set.find_syntax_by_token("rust").is_some());
++    }
+ }
+diff --git a/crates/codegen/xai-grok-pager-render/src/theme/cache.rs b/crates/codegen/xai-grok-pager-render/src/theme/cache.rs
+index 3a7b2f9c2b9d8b81bcbfa0ead7d3edb14e8a62cf..b5f462d1e1273ed1cf962f5839a3f2d8f62fe3e9 100644
+--- a/crates/codegen/xai-grok-pager-render/src/theme/cache.rs
++++ b/crates/codegen/xai-grok-pager-render/src/theme/cache.rs
+@@ -48,6 +48,7 @@ fn theme_kind_from_u8(byte: u8) -> ThemeKind {
+         x if x == ThemeKind::TokyoNight as u8 => ThemeKind::TokyoNight,
+         x if x == ThemeKind::RosePineMoon as u8 => ThemeKind::RosePineMoon,
+         x if x == ThemeKind::OscuraMidnight as u8 => ThemeKind::OscuraMidnight,
++        x if x == ThemeKind::OpenCode as u8 => ThemeKind::OpenCode,
+         x if x == ThemeKind::Auto as u8 => ThemeKind::Auto,
+         _ => ThemeKind::GrokNight,
+     }
+diff --git a/crates/codegen/xai-grok-pager-render/src/theme/md_style.rs b/crates/codegen/xai-grok-pager-render/src/theme/md_style.rs
+index 315ccf9cdad0416146ed5f651d74f4355942bd7f..ff2e68b136fd6e66aaebc61b9e0bed6acb6dadb6 100644
+--- a/crates/codegen/xai-grok-pager-render/src/theme/md_style.rs
++++ b/crates/codegen/xai-grok-pager-render/src/theme/md_style.rs
+@@ -107,6 +107,10 @@ pub fn style() -> MarkdownStyle {
+ fn build_style() -> MarkdownStyle {
+     let theme = super::Theme::current();
+ 
++    if super::Theme::current_kind() == super::ThemeKind::OpenCode {
++        return super::opencode::markdown_style(&theme);
++    }
++
+     let heading_colors = [
+         theme.md_heading_h1,
+         theme.md_heading_h2,
+diff --git a/crates/codegen/xai-grok-pager-render/src/theme/mod.rs b/crates/codegen/xai-grok-pager-render/src/theme/mod.rs
+index fff8675b694c6f3407e1414d2ef537cafb70aa0a..e1a1334525e147d84ad025d9e61d47cb09cedb64 100644
+--- a/crates/codegen/xai-grok-pager-render/src/theme/mod.rs
++++ b/crates/codegen/xai-grok-pager-render/src/theme/mod.rs
+@@ -16,6 +16,7 @@ pub mod env_appearance;
+ mod grokday;
+ mod groknight;
+ pub mod md_style;
++mod opencode;
+ pub mod osc11;
+ mod oscura;
+ mod rosepine;
+@@ -34,6 +35,7 @@ pub enum ThemeKind {
+     TokyoNight = 2,
+     RosePineMoon = 3,
+     OscuraMidnight = 5,
++    OpenCode = 6,
+     /// Meta-variant: follow system dark/light appearance.
+     ///
+     /// Never stored in `cache::CURRENT` — resolved to a concrete
+@@ -52,6 +54,7 @@ impl ThemeKind {
+         ThemeKind::TokyoNight,
+         ThemeKind::RosePineMoon,
+         ThemeKind::OscuraMidnight,
++        ThemeKind::OpenCode,
+     ];
+ 
+     /// Theme kinds available on the current terminal.
+@@ -62,7 +65,11 @@ impl ThemeKind {
+         // Two possible results — pick the right const slice based on
+         // the detected color level. No heap allocation needed.
+         const ALL: &[ThemeKind] = ThemeKind::ALL;
+-        const NO_TRUECOLOR: &[ThemeKind] = &[ThemeKind::GrokNight, ThemeKind::GrokDay];
++        const NO_TRUECOLOR: &[ThemeKind] = &[
++            ThemeKind::GrokNight,
++            ThemeKind::GrokDay,
++            ThemeKind::OpenCode,
++        ];
+ 
+         if color_support::detect().has_truecolor() {
+             ALL
+@@ -79,6 +86,7 @@ impl ThemeKind {
+             Self::GrokDay => "grokday",
+             Self::RosePineMoon => "rosepine-moon",
+             Self::OscuraMidnight => "oscura-midnight",
++            Self::OpenCode => "opencode",
+             Self::Auto => "auto",
+         }
+     }
+@@ -95,6 +103,7 @@ impl ThemeKind {
+             Self::GrokDay => false,
+             Self::RosePineMoon => true,
+             Self::OscuraMidnight => true,
++            Self::OpenCode => false,
+             // Auto is resolved to a concrete theme before rendering.
+             Self::Auto => false,
+         }
+@@ -113,6 +122,7 @@ impl ThemeKind {
+                 Some(Self::RosePineMoon)
+             }
+             "oscura" | "oscura-midnight" => Some(Self::OscuraMidnight),
++            "opencode" | "open-code" | "oc" => Some(Self::OpenCode),
+             _ => None,
+         }
+     }
+@@ -148,6 +158,7 @@ pub fn display_name_for_canonical(value: &str) -> &str {
+         "grokday" => "Grok Day",
+         "tokyonight" => "Tokyo Night",
+         "rosepine-moon" => "Rose Pine Moon",
++        "opencode" => "OpenCode",
+         other => other,
+     }
+ }
+@@ -159,6 +170,11 @@ impl Default for Theme {
+ }
+ 
+ impl Theme {
++    /// OpenCode 默认 TUI 深色主题。
++    pub const fn opencode() -> Self {
++        opencode::theme()
++    }
++
+     /// Return a copy with every color quantized to the given level.
+     ///
+     /// This adapts the theme to terminals with limited color support.
+@@ -274,6 +290,7 @@ impl Theme {
+             ThemeKind::GrokDay => Self::grokday(),
+             ThemeKind::RosePineMoon => Self::rosepine_moon(),
+             ThemeKind::OscuraMidnight => Self::oscura_midnight(),
++            ThemeKind::OpenCode => Self::opencode(),
+             // Auto is resolved to a concrete theme before being stored;
+             // if reached, fall back to GrokNight.
+             ThemeKind::Auto => Self::groknight(),
+@@ -706,6 +723,7 @@ mod tests {
+         assert!(!ThemeKind::TokyoNight.is_auto());
+         assert!(!ThemeKind::RosePineMoon.is_auto());
+         assert!(!ThemeKind::OscuraMidnight.is_auto());
++        assert!(!ThemeKind::OpenCode.is_auto());
+     }
+ 
+     #[test]
+@@ -725,6 +743,7 @@ mod tests {
+         assert!(Theme::tokyonight().is_dark());
+         assert!(Theme::rosepine_moon().is_dark());
+         assert!(Theme::oscura_midnight().is_dark());
++        assert!(Theme::opencode().is_dark());
+         assert!(!Theme::grokday().is_dark());
+     }
+ 
+@@ -1063,6 +1082,7 @@ mod tests {
+                 ThemeKind::TokyoNight => Theme::tokyonight(),
+                 ThemeKind::RosePineMoon => Theme::rosepine_moon(),
+                 ThemeKind::OscuraMidnight => Theme::oscura_midnight(),
++                ThemeKind::OpenCode => Theme::opencode(),
+                 ThemeKind::Auto => unreachable!("ALL excludes Auto"),
+             };
+             let track = lum(theme.scrollbar_bg, "scrollbar_bg", kind);
+@@ -1146,6 +1166,7 @@ mod tests {
+     #[test]
+     fn auto_does_not_require_truecolor() {
+         assert!(!ThemeKind::Auto.requires_truecolor());
++        assert!(!ThemeKind::OpenCode.requires_truecolor());
+     }
+ 
+     #[test]
+@@ -1211,6 +1232,7 @@ mod tests {
+             ThemeKind::from_name("oscura-midnight"),
+             Some(ThemeKind::OscuraMidnight)
+         );
++        assert_eq!(ThemeKind::from_name("opencode"), Some(ThemeKind::OpenCode));
+     }
+ 
+     /// `FromStr` agrees with `from_name` for all canonicals + aliases.
+@@ -1234,6 +1256,9 @@ mod tests {
+             ("rose-pine", ThemeKind::RosePineMoon),
+             ("rosepine-moon", ThemeKind::RosePineMoon),
+             ("rose-pine-moon", ThemeKind::RosePineMoon),
++            ("opencode", ThemeKind::OpenCode),
++            ("open-code", ThemeKind::OpenCode),
++            ("oc", ThemeKind::OpenCode),
+         ];
+         for (name, expected) in cases {
+             assert_eq!(
+diff --git a/crates/codegen/xai-grok-pager-render/src/theme/opencode.rs b/crates/codegen/xai-grok-pager-render/src/theme/opencode.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..17ea824d0aef27ba0419818556e3bae6bd093c13
+--- /dev/null
++++ b/crates/codegen/xai-grok-pager-render/src/theme/opencode.rs
+@@ -0,0 +1,254 @@
++//! OpenCode TUI 视觉主题。
++//!
++//! 本模块集中保存从 OpenCode 默认 TUI 移植的颜色和 Markdown 文字规则，
++//! 避免将下游定制散落到通用主题结构中，降低后续合并上游版本时的冲突面。
++
++use anstyle::{Ansi256Color, AnsiColor, Color as AnsiStyleColor, Style as AnsiStyle};
++use ratatui::style::{Color, Modifier};
++use xai_grok_markdown::MarkdownStyle;
++
++use super::Theme;
++
++/// 创建简洁的 RGB 颜色常量。
++const fn rgb(r: u8, g: u8, b: u8) -> Color {
++    Color::Rgb(r, g, b)
++}
++
++/// OpenCode 默认深色主题的原始颜色。
++mod palette {
++    use super::*;
++
++    pub const BACKGROUND: Color = rgb(0x0a, 0x0a, 0x0a);
++    pub const BACKGROUND_PANEL: Color = rgb(0x14, 0x14, 0x14);
++    pub const BACKGROUND_ELEMENT: Color = rgb(0x1e, 0x1e, 0x1e);
++    pub const BACKGROUND_HOVER: Color = rgb(0x28, 0x28, 0x28);
++    pub const BACKGROUND_SELECTED: Color = rgb(0x32, 0x32, 0x32);
++    pub const BORDER_SUBTLE: Color = rgb(0x3c, 0x3c, 0x3c);
++    pub const BORDER: Color = rgb(0x48, 0x48, 0x48);
++    pub const BORDER_ACTIVE: Color = rgb(0x60, 0x60, 0x60);
++    pub const TEXT: Color = rgb(0xee, 0xee, 0xee);
++    pub const TEXT_MUTED: Color = rgb(0x80, 0x80, 0x80);
++    pub const PRIMARY: Color = rgb(0xfa, 0xb2, 0x83);
++    pub const SECONDARY: Color = rgb(0x5c, 0x9c, 0xf5);
++    pub const ACCENT: Color = rgb(0x9d, 0x7c, 0xd8);
++    pub const ERROR: Color = rgb(0xe0, 0x6c, 0x75);
++    pub const WARNING: Color = rgb(0xf5, 0xa7, 0x42);
++    pub const SUCCESS: Color = rgb(0x7f, 0xd8, 0x8f);
++    pub const INFO: Color = rgb(0x56, 0xb6, 0xc2);
++    pub const MARKDOWN_YELLOW: Color = rgb(0xe5, 0xc0, 0x7b);
++    pub const DIFF_ADDED: Color = rgb(0x4f, 0xd6, 0xbe);
++    pub const DIFF_REMOVED: Color = rgb(0xc5, 0x3b, 0x53);
++    pub const DIFF_ADDED_BG: Color = rgb(0x20, 0x30, 0x3b);
++    pub const DIFF_REMOVED_BG: Color = rgb(0x37, 0x22, 0x2c);
++    pub const DIFF_CONTEXT: Color = rgb(0x82, 0x8b, 0xb8);
++    pub const DIFF_GUTTER: Color = rgb(0x8f, 0x8f, 0x8f);
++}
++
++use palette::*;
++
++/// 构建供 grok 通用渲染组件使用的 OpenCode 语义主题。
++pub(super) const fn theme() -> Theme {
++    Theme {
++        bg_base: BACKGROUND,
++        bg_light: BACKGROUND_PANEL,
++        bg_dark: BACKGROUND_ELEMENT,
++        bg_highlight: BACKGROUND_ELEMENT,
++        bg_hover: BACKGROUND_HOVER,
++        bg_terminal: BACKGROUND,
++
++        accent_user: SECONDARY,
++        accent_assistant: ACCENT,
++        accent_thinking: MARKDOWN_YELLOW,
++        accent_tool: TEXT_MUTED,
++        accent_system: INFO,
++        accent_error: ERROR,
++        accent_success: SUCCESS,
++        accent_running: ACCENT,
++        accent_skill: INFO,
++
++        text_primary: TEXT,
++        text_secondary: TEXT_MUTED,
++
++        gray_dim: BORDER_ACTIVE,
++        gray: TEXT_MUTED,
++        gray_bright: rgb(0xa0, 0xa0, 0xa0),
++
++        command: MARKDOWN_YELLOW,
++        path: PRIMARY,
++        running: INFO,
++        warning: WARNING,
++
++        fuzzy_accent: PRIMARY,
++        accent_plan: WARNING,
++        accent_verify: ACCENT,
++        accent_remember: SUCCESS,
++
++        selection_border: BORDER,
++        hover_border: BORDER_SUBTLE,
++        prompt_border: BORDER,
++        prompt_border_active: BORDER_ACTIVE,
++
++        accent_model: INFO,
++
++        scrollbar_bg: BACKGROUND_PANEL,
++        scrollbar_fg: BORDER_ACTIVE,
++
++        diff_delete_bg: DIFF_REMOVED_BG,
++        diff_delete_fg: DIFF_REMOVED,
++        diff_insert_bg: DIFF_ADDED_BG,
++        diff_insert_fg: DIFF_ADDED,
++        diff_equal_fg: DIFF_CONTEXT,
++        diff_gutter_fg: DIFF_GUTTER,
++
++        bg_visual: BACKGROUND_SELECTED,
++
++        paste_bg: BACKGROUND_ELEMENT,
++        paste_fg: WARNING,
++        paste_dim: TEXT_MUTED,
++
++        // 通用字段保留合理回退值；精确的 OpenCode Markdown 规则由
++        // `markdown_style` 独立生成，不扩张上游的 Theme 数据结构。
++        md_heading_h1: ACCENT,
++        md_heading_h1_mod: Modifier::BOLD,
++        md_heading_h2: ACCENT,
++        md_heading_h2_mod: Modifier::BOLD,
++        md_heading_h3: ACCENT,
++        md_heading_h3_mod: Modifier::BOLD,
++        md_heading_h4: ACCENT,
++        md_heading_h4_mod: Modifier::BOLD,
++        md_heading_h5: ACCENT,
++        md_heading_h5_mod: Modifier::BOLD,
++        md_heading_h6: ACCENT,
++        md_heading_h6_mod: Modifier::BOLD,
++        md_code: SUCCESS,
++        md_task_checked: SUCCESS,
++        md_task_unchecked: TEXT_MUTED,
++        md_muted: TEXT_MUTED,
++        md_code_bg: BACKGROUND_PANEL,
++        md_text: TEXT,
++        link_fg: INFO,
++    }
++}
++
++/// 将已按终端能力量化的 Ratatui 颜色转换为 Markdown 渲染器颜色。
++fn to_anstyle(color: Color) -> Option<AnsiStyleColor> {
++    Some(match color {
++        Color::Reset => return None,
++        Color::Rgb(r, g, b) => AnsiStyleColor::Rgb(anstyle::RgbColor(r, g, b)),
++        Color::Indexed(index) => AnsiStyleColor::Ansi256(Ansi256Color(index)),
++        Color::Black => AnsiStyleColor::Ansi(AnsiColor::Black),
++        Color::Red => AnsiStyleColor::Ansi(AnsiColor::Red),
++        Color::Green => AnsiStyleColor::Ansi(AnsiColor::Green),
++        Color::Yellow => AnsiStyleColor::Ansi(AnsiColor::Yellow),
++        Color::Blue => AnsiStyleColor::Ansi(AnsiColor::Blue),
++        Color::Magenta => AnsiStyleColor::Ansi(AnsiColor::Magenta),
++        Color::Cyan => AnsiStyleColor::Ansi(AnsiColor::Cyan),
++        Color::Gray => AnsiStyleColor::Ansi(AnsiColor::White),
++        Color::DarkGray => AnsiStyleColor::Ansi(AnsiColor::BrightBlack),
++        Color::LightRed => AnsiStyleColor::Ansi(AnsiColor::BrightRed),
++        Color::LightGreen => AnsiStyleColor::Ansi(AnsiColor::BrightGreen),
++        Color::LightYellow => AnsiStyleColor::Ansi(AnsiColor::BrightYellow),
++        Color::LightBlue => AnsiStyleColor::Ansi(AnsiColor::BrightBlue),
++        Color::LightMagenta => AnsiStyleColor::Ansi(AnsiColor::BrightMagenta),
++        Color::LightCyan => AnsiStyleColor::Ansi(AnsiColor::BrightCyan),
++        Color::White => AnsiStyleColor::Ansi(AnsiColor::BrightWhite),
++    })
++}
++
++/// 创建仅包含指定前景色的 Markdown 样式。
++fn fg(color: Color) -> AnsiStyle {
++    AnsiStyle::new().fg_color(to_anstyle(color))
++}
++
++/// 创建仅包含指定背景色的 Markdown 样式。
++fn bg(color: Color) -> AnsiStyle {
++    AnsiStyle::new().bg_color(to_anstyle(color))
++}
++
++/// 使用 OpenCode 的文字层级构建 Markdown 样式。
++///
++/// `theme` 必须来自 `Theme::current()`，因此这里使用的颜色已经过终端
++/// 真彩色、256 色或 ANSI-16 能力适配。
++pub(super) fn markdown_style(theme: &Theme) -> MarkdownStyle {
++    let heading = fg(theme.md_heading_h1).bold();
++    let headings = [
++        heading.underline(),
++        heading,
++        heading,
++        heading,
++        heading,
++        heading,
++    ];
++    let heading_outer = [
++        fg(theme.md_heading_h1).dimmed().hidden(),
++        fg(theme.md_heading_h2).dimmed().hidden(),
++        fg(theme.md_heading_h3).dimmed().hidden(),
++        fg(theme.md_heading_h4).dimmed().hidden(),
++        fg(theme.md_heading_h5).dimmed().hidden(),
++        fg(theme.md_heading_h6).dimmed().hidden(),
++    ];
++
++    MarkdownStyle {
++        heading_inner: headings,
++        heading_outer,
++        strong_inner: fg(theme.warning).bold(),
++        strong_outer: AnsiStyle::new().dimmed().hidden(),
++        emphasis_inner: fg(theme.command).italic(),
++        emphasis_outer: AnsiStyle::new().dimmed().hidden(),
++        strikethrough_inner: fg(theme.gray).strikethrough(),
++        strikethrough_outer: AnsiStyle::new().dimmed().hidden(),
++        inline_code_inner: fg(theme.md_code),
++        inline_code_outer: fg(theme.md_code).dimmed().hidden(),
++        blockquote_outer: fg(theme.command).italic(),
++        task_checked: fg(theme.md_task_checked),
++        task_unchecked: fg(theme.md_task_unchecked).dimmed(),
++        list_item: fg(theme.path),
++        rule: fg(theme.gray),
++        link_outer: fg(theme.path).underline(),
++        link_text: fg(theme.link_fg).underline(),
++        link_url: fg(theme.path).underline(),
++        link_title: fg(theme.gray),
++        code_outer: fg(theme.md_code).dimmed().hidden(),
++        code_language: fg(theme.gray).hidden(),
++        code_untagged: fg(theme.md_text),
++        code_background: bg(theme.md_code_bg),
++        table_outer: fg(theme.gray).hidden(),
++        text: fg(theme.md_text),
++        math: fg(theme.md_text).italic(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// 验证核心语义字段保留 OpenCode 默认深色配色。
++    #[test]
++    fn palette_matches_opencode_dark_defaults() {
++        let theme = theme();
++        assert_eq!(theme.bg_base, Color::Rgb(0x0a, 0x0a, 0x0a));
++        assert_eq!(theme.bg_light, Color::Rgb(0x14, 0x14, 0x14));
++        assert_eq!(theme.accent_user, Color::Rgb(0x5c, 0x9c, 0xf5));
++        assert_eq!(theme.text_primary, Color::Rgb(0xee, 0xee, 0xee));
++    }
++
++    /// 验证 Markdown 标题、粗体和行内代码的文字层级。
++    #[test]
++    fn markdown_preserves_opencode_emphasis_hierarchy() {
++        let theme = theme();
++        let style = markdown_style(&theme);
++        assert_eq!(style.heading_inner[0].get_fg_color(), to_anstyle(ACCENT));
++        assert!(
++            style.heading_inner[0]
++                .get_effects()
++                .contains(anstyle::Effects::BOLD)
++        );
++        assert!(
++            style.heading_inner[0]
++                .get_effects()
++                .contains(anstyle::Effects::UNDERLINE)
++        );
++        assert_eq!(style.strong_inner.get_fg_color(), to_anstyle(WARNING));
++        assert_eq!(style.inline_code_inner.get_fg_color(), to_anstyle(SUCCESS));
++    }
++}
+diff --git a/crates/codegen/xai-grok-pager-render/tests/opencode_theme.rs b/crates/codegen/xai-grok-pager-render/tests/opencode_theme.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..608508a728ea23c2cc5b8150c2d035fc4a87e61c
+--- /dev/null
++++ b/crates/codegen/xai-grok-pager-render/tests/opencode_theme.rs
+@@ -0,0 +1,55 @@
++use ratatui::style::Color;
++use xai_grok_pager_render::syntax::Syntect;
++use xai_grok_pager_render::theme::cache;
++use xai_grok_pager_render::theme::md_style;
++use xai_grok_pager_render::theme::{Theme, ThemeKind};
++
++/// 验证公开主题目录能够解析 OpenCode，并保留源主题的关键颜色。
++#[test]
++fn opencode_theme_public_contract() {
++    assert_eq!(ThemeKind::from_name("opencode"), Some(ThemeKind::OpenCode));
++
++    let theme = Theme::opencode();
++    assert_eq!(theme.bg_base, Color::Rgb(0x0a, 0x0a, 0x0a));
++    assert_eq!(theme.bg_light, Color::Rgb(0x14, 0x14, 0x14));
++    assert_eq!(theme.accent_user, Color::Rgb(0x5c, 0x9c, 0xf5));
++    assert_eq!(theme.text_primary, Color::Rgb(0xee, 0xee, 0xee));
++}
++
++/// 验证独立 TextMate 资源能够由生产语法高亮器加载。
++#[test]
++fn opencode_syntax_theme_loads() {
++    let syntect = Syntect::new(include_bytes!("../assets/opencode.tmTheme"));
++    assert!(syntect.syntax_set.find_syntax_by_token("rust").is_some());
++}
++
++/// 验证 Markdown 渲染入口会分派到 OpenCode 专属文字规则。
++#[test]
++fn opencode_markdown_dispatches_to_dedicated_style() {
++    cache::set(ThemeKind::OpenCode);
++    let style = md_style::style();
++    cache::set(ThemeKind::GrokNight);
++
++    assert!(
++        style.heading_inner[0]
++            .get_effects()
++            .contains(anstyle::Effects::BOLD)
++    );
++    assert!(
++        style.heading_inner[0]
++            .get_effects()
++            .contains(anstyle::Effects::UNDERLINE)
++    );
++    assert!(
++        style
++            .emphasis_inner
++            .get_effects()
++            .contains(anstyle::Effects::ITALIC)
++    );
++    assert!(
++        !style
++            .inline_code_inner
++            .get_effects()
++            .contains(anstyle::Effects::BOLD)
++    );
++}
+diff --git a/crates/codegen/xai-grok-pager/src/scrollback/blocks/mermaid_content.rs b/crates/codegen/xai-grok-pager/src/scrollback/blocks/mermaid_content.rs
+index f71cd80d349fd9301ea857499353bca0174def14..4000583c9d9f3d325c99dd22ea1d472e149d13db 100644
+--- a/crates/codegen/xai-grok-pager/src/scrollback/blocks/mermaid_content.rs
++++ b/crates/codegen/xai-grok-pager/src/scrollback/blocks/mermaid_content.rs
+@@ -835,6 +835,7 @@ mod tests {
+             ThemeKind::TokyoNight,
+             ThemeKind::RosePineMoon,
+             ThemeKind::OscuraMidnight,
++            ThemeKind::OpenCode,
+         ] {
+             assert!(theme_is_dark(dark), "{dark:?} should be dark");
+         }
+diff --git a/crates/codegen/xai-grok-pager/src/settings/defs.rs b/crates/codegen/xai-grok-pager/src/settings/defs.rs
+index a3714447d7fe57fa1bb06a572fabce89f76ca410..9e8c20bd12ea0517990d78d59ec688f2fd9199da 100644
+--- a/crates/codegen/xai-grok-pager/src/settings/defs.rs
++++ b/crates/codegen/xai-grok-pager/src/settings/defs.rs
+@@ -71,6 +71,11 @@ const THEME_CHOICES: &[EnumChoice] = &[
+         display: "Oscura Midnight",
+         description: "Deep dark with warm accents; needs truecolor.",
+     },
++    EnumChoice {
++        canonical: "opencode",
++        display: "OpenCode",
++        description: "OpenCode TUI typography and dark palette.",
++    },
+ ];
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
+index 747eab5c2a109c3d21f6ee76a857286b0f83212f..be4489a5f18d8c92e50cdde48a6622e2e75d48d3 100644
+--- a/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
++++ b/crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs
+@@ -7162,6 +7162,7 @@ fn max_thoughts_width_preview_title_styling_distinguishes_from_content() {
+         // Resolved via `Theme::current()` rather than a constructor
+         // because `theme::oscura` is a private module.
+         crate::theme::ThemeKind::OscuraMidnight => crate::theme::Theme::current(),
++        crate::theme::ThemeKind::OpenCode => crate::theme::Theme::opencode(),
+         crate::theme::ThemeKind::Auto => crate::theme::Theme::groknight(),
+     };
+     assert_ne!(
+diff --git a/docs/opencode-theme-源码合并指南.md b/docs/opencode-theme-源码合并指南.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..58340c8e1a6e6b2d3facc1e6b22514bb82abba3f
+--- /dev/null
++++ b/docs/opencode-theme-源码合并指南.md
+@@ -0,0 +1,197 @@
++# OpenCode Theme 源码合并指南
++
++## 适用范围
++
++本文用于将 `opencode-theme` 分支中的 OpenCode TUI 主题移植到更新后的 grok 源码，或者在 grok 上游更新后维护该功能。
++
++初始移植基线：
++
++- grok 基线提交：`e5fd481`
++- OpenCode 参考提交：`cc4b45612974f735ddec46009ede07729511fba4`
++- 功能分支：`opencode-theme`
++- 补丁文件：`patches/opencode-theme.diff`
++
++## 设计边界
++
++该功能采用“独立实现、薄层注册”的结构：
++
++- `theme/opencode.rs` 集中保存 OpenCode 配色与 Markdown 文字规则。
++- `assets/opencode.tmTheme` 集中保存代码语法高亮规则。
++- `tests/opencode_theme.rs` 独立验证公开主题契约、Markdown 分派和语法资源加载。
++- 通用代码只增加主题枚举、缓存解码、样式分派和设置目录等必要注册点。
++- 不扩张公共 `Theme` 结构，不改变现有主题，不改变默认主题。
++
++因此，上游合并时应优先保留三个独立文件，再逐一重放薄注册点。不要把 OpenCode 专属颜色拆散到通用渲染模块中。
++
++## 文件清单
++
++### 独立实现文件
++
++以下文件通常可以直接保留或复制到新版本：
++
++- `crates/codegen/xai-grok-pager-render/src/theme/opencode.rs`
++- `crates/codegen/xai-grok-pager-render/assets/opencode.tmTheme`
++- `crates/codegen/xai-grok-pager-render/tests/opencode_theme.rs`
++
++### 薄注册点
++
++以下文件可能随上游调整而产生冲突：
++
++- `crates/codegen/xai-grok-pager-render/src/theme/mod.rs`
++- `crates/codegen/xai-grok-pager-render/src/theme/cache.rs`
++- `crates/codegen/xai-grok-pager-render/src/theme/md_style.rs`
++- `crates/codegen/xai-grok-pager-render/src/syntax.rs`
++- `crates/codegen/xai-grok-pager/src/settings/defs.rs`
++- `crates/codegen/xai-grok-pager/src/scrollback/blocks/mermaid_content.rs`
++- `crates/codegen/xai-grok-pager/src/views/settings_modal/tests.rs`
++
++### 说明文档
++
++- `docs/opencode-tui-theme-port.md`
++- `docs/opencode-theme-源码合并指南.md`
++
++## 推荐合并流程
++
++### 方法一：合并功能分支
++
++适用于本仓库仍保留 `opencode-theme` 分支的情况：
++
++```powershell
++git switch opencode-theme
++git merge main
++```
++
++发生冲突时，不要整文件选择任一侧。先保留上游对通用主题系统的结构调整，再按照下文“冲突处理检查表”重新接入 OpenCode 注册点。
++
++合并与验证完成后，将功能分支合入目标分支：
++
++```powershell
++git switch <目标分支>
++git merge --no-ff opencode-theme
++```
++
++### 方法二：应用补丁
++
++适用于把该功能迁移到另一份同源源码：
++
++```powershell
++git apply --check patches/opencode-theme.diff
++git apply --3way patches/opencode-theme.diff
++```
++
++如果 `--check` 失败，使用下方文件清单手工接入。补丁基于 `e5fd481` 生成，上游距离该基线越远，薄注册点越可能需要人工处理。
++
++## 冲突处理检查表
++
++### 1. 主题枚举和构造
++
++在 `theme/mod.rs` 中确认：
++
++1. `ThemeKind` 包含唯一判别值的 `OpenCode`。
++2. `ThemeKind::ALL` 包含 `OpenCode`。
++3. `available()` 的非真彩色目录包含 `OpenCode`。
++4. `display_name()` 返回规范名 `opencode`。
++5. `from_name()` 至少接受 `opencode`，并保留 `open-code`、`oc` 别名。
++6. `requires_truecolor()` 对 OpenCode 返回 `false`。
++7. `Theme::opencode()` 调用独立模块构造器。
++8. `Theme::current()` 能将 `ThemeKind::OpenCode` 分派到该构造器。
++
++如果上游新增了主题，应为 `OpenCode` 重新选择未占用的判别值；不要改动已有已发布判别值，否则缓存中的数值含义可能变化。
++
++### 2. 内存缓存
++
++在 `theme/cache.rs` 的 `theme_kind_from_u8()` 中保留 `OpenCode` 解码分支。若上游改为序列化枚举或其他缓存结构，应按新的统一机制注册，不要保留重复解码路径。
++
++### 3. Markdown 文字规则
++
++在 `theme/md_style.rs` 中，OpenCode 必须分派到 `opencode::markdown_style()`。这一步负责还原下列 OpenCode 文字特征：
++
++- 标题为紫色粗体，一级标题额外添加下划线。
++- 粗体为橙色粗体。
++- 强调为黄色斜体。
++- 行内代码为绿色且不额外加粗。
++- 引用为黄色斜体。
++- 链接使用橙色与青色下划线。
++
++如果上游把 Markdown 样式改成主题字段驱动，应优先让 OpenCode 独立模块实现新的样式接口，避免把专属规则加入所有主题共享的数据结构。
++
++### 4. 代码语法高亮
++
++在 `syntax.rs` 中确认：
++
++- 存在独立的 `SYNTECT_OPENCODE` 缓存。
++- `ThemeKind::OpenCode` 加载 `assets/opencode.tmTheme`。
++- 终端原生锁定模式仍按上游逻辑工作，不强制加载 OpenCode RGB 主题。
++
++### 5. 设置与持久化
++
++在 `settings/defs.rs` 的主题目录中保留：
++
++```text
++canonical: opencode
++display: OpenCode
++```
++
++规范名必须与 `ThemeKind::display_name()` 完全一致。主题持久化沿用现有通用设置链路，不应增加 OpenCode 专属配置文件或 setter。
++
++### 6. 下游穷举分支
++
++编译器通常会指出遗漏的 `ThemeKind` 穷举匹配。重点复核：
++
++- Mermaid 的深色主题判断。
++- 设置预览测试中的主题构造匹配。
++- 上游新增的主题诊断、选择器或快照测试。
++
++OpenCode 是深色主题。
++
++## 同步 OpenCode 上游视觉规则
++
++更新 OpenCode 版本时，对比以下源文件：
++
++- `packages/tui/src/theme/assets/opencode.json`
++- `packages/tui/src/theme/index.ts`
++
++若只是颜色值变化，更新 `theme/opencode.rs` 与 `assets/opencode.tmTheme`。若 Markdown scope 或字体效果变化，同时更新 `markdown_style()` 与对应测试。终端字体家族由用户终端控制，本功能只移植终端能够表达的颜色、粗体、斜体、下划线和文字层级。
++
++## 验证
++
++至少执行：
++
++```powershell
++cargo fmt --all -- --check
++cargo check -p xai-grok-pager-render
++cargo check -p xai-grok-pager
++cargo test -p xai-grok-pager-render --test opencode_theme
++```
++
++Release 构建入口：
++
++```powershell
++cargo build -p xai-grok-pager-bin --release
++```
++
++Windows 是上游声明的 best-effort 构建环境。当前仓库的 `xai-proto-build` 使用 `/dev/stdout` 和 `/dev/null` 生成 proto 依赖信息，原生 Windows `protoc` 无法直接处理这些路径；若遇到该问题，应在隔离环境中使用兼容转接程序，或者在 macOS/Linux 上执行正式构建。不要为了主题移植修改 proto 构建系统。
++
++验证界面时，通过设置页选择 `OpenCode`，或执行：
++
++```text
++/theme opencode
++```
++
++重点检查普通正文、六级标题、粗体、斜体、引用、链接、行内代码、代码块、Diff、用户消息背景和工具状态颜色。
++
++## 更新补丁文件
++
++功能提交变化后，从共同基线重新生成补丁，确保补丁不包含自身：
++
++```powershell
++git diff --binary --full-index main...HEAD --output=patches/opencode-theme.diff -- . ":(exclude)patches/**"
++```
++
++随后验证：
++
++```powershell
++git apply --check --reverse patches/opencode-theme.diff
++```
++
++`--reverse` 检查用于确认补丁与当前已应用状态一致。若目标是干净的基线工作树，则去掉 `--reverse`。
+diff --git a/docs/opencode-tui-theme-port.md b/docs/opencode-tui-theme-port.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce2349ca9110ec89f032518dc3fc7be883c23c3b
+--- /dev/null
++++ b/docs/opencode-tui-theme-port.md
+@@ -0,0 +1,42 @@
++# OpenCode TUI 主题移植计划
++
++## 目标
++
++将 OpenCode 默认 TUI 的配色、Markdown 文字层级和代码语法高亮移植为 grok 的独立 `OpenCode` 主题，同时尽量降低后续合并上游版本时的冲突成本。
++
++本次颜色和文字规则基于 OpenCode 提交 `cc4b45612974f735ddec46009ede07729511fba4`，主要参考：
++
++- `packages/tui/src/theme/assets/opencode.json`
++- `packages/tui/src/theme/index.ts`
++
++## 低侵入原则
++
++1. 不修改通用 `Theme` 结构，不为 OpenCode 专属样式增加公共字段。
++2. OpenCode 的颜色构造和 Markdown 映射集中在 `theme/opencode.rs`。
++3. OpenCode 的代码语法配色集中在独立的 `assets/opencode.tmTheme`。
++4. 现有模块只添加必要的枚举注册、缓存解码、样式分派和设置项。
++5. 不覆盖现有主题，也不改变默认主题。
++
++## 实现步骤
++
++1. 新增 `ThemeKind::OpenCode`，接入名称解析、主题列表、持久化和终端色彩能力筛选。
++2. 在独立模块中实现 OpenCode 深色配色及专属 Markdown 样式。
++3. 新增 OpenCode Syntect 主题，并按当前主题选择对应语法高亮。
++4. 在设置界面和 `/theme` 选择器中公开 `opencode`。
++5. 补充主题解析、颜色映射、Markdown 样式和语法主题测试。
++6. 运行格式化、渲染层测试和 pager 相关检查。
++
++## 预期上游冲突面
++
++长期维护时，主要关注以下薄注册点：
++
++- `theme/mod.rs`：主题枚举及构造分派。
++- `theme/cache.rs`：枚举的原子缓存解码。
++- `syntax.rs`：代码语法主题分派。
++- `settings/defs.rs`：设置界面的主题目录。
++
++OpenCode 的具体视觉实现位于独立文件中，通常不会与上游主题调整发生内容冲突。
++
++## 后续同步
++
++更新 OpenCode 版本时，优先对比上述两个源文件；若只是颜色值或 Markdown 规则变化，通常只需修改 `theme/opencode.rs` 和 `assets/opencode.tmTheme`。若 grok 上游调整了主题枚举或设置目录，再复核四个薄注册点即可。

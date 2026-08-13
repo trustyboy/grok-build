@@ -185,7 +185,7 @@ Windows 是上游声明的 best-effort 构建环境。当前仓库的 `xai-proto
 功能提交变化后，从共同基线重新生成补丁，确保补丁不包含自身：
 
 ```powershell
-git diff --binary --full-index main...HEAD --output=patches/opencode-theme.diff -- . ":(exclude)patches/opencode-theme.diff"
+git diff --binary --full-index main...HEAD --output=patches/opencode-theme.diff -- . ":(exclude)patches/**"
 ```
 
 随后验证：
