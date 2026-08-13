@@ -23,6 +23,12 @@ pub enum AuthScheme {
     XApiKey,
 }
 
+/// Serde default for opt-out bool fields (e.g. `supports_vision`) that
+/// default to `true` so old configs keep today's behavior.
+fn default_true() -> bool {
+    true
+}
+
 /// All knobs that control a single sampling request.
 ///
 /// The session typically owns one `SamplerConfig` per active model
@@ -114,6 +120,14 @@ pub struct SamplerConfig {
     #[serde(default)]
     pub supports_backend_search: bool,
 
+    /// Whether the endpoint accepts image content blocks (`image_url` /
+    /// base64 data URIs) in request bodies. When `false`, the sampler strips
+    /// image parts from outgoing requests (text and `<image_files>` path
+    /// blocks survive), so text-only proxies (e.g. the CPA adapter) accept
+    /// the request instead of rejecting it with a 400 deserialize error.
+    #[serde(default = "default_true")]
+    pub supports_vision: bool,
+
     /// Per-model config for the `x-compactions-remaining` header; `None` disables it.
     #[serde(default)]
     pub compactions_remaining: Option<CompactionsRemaining>,
@@ -167,6 +181,7 @@ impl Default for SamplerConfig {
             attribution_callback: None,
             bearer_resolver: None,
             supports_backend_search: false,
+            supports_vision: true,
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,

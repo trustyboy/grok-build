@@ -25,6 +25,8 @@ pub struct RunContext<'a> {
 pub enum HookRunnerResult {
     Decision(HookDecision),
     Stop(StopHookOutcome),
+    /// Message-transform hook replaced the outgoing text with this value.
+    Transformed(String),
     Success,
     /// Failed: the caller fails open.
     Failed(String),
@@ -64,6 +66,22 @@ pub(crate) fn gate_json_to_decision(
             "unknown decision value '{other}' from hook '{hook_name}'"
         )),
     }
+}
+
+/// JSON from `UserPromptTransform` gate hooks: `{"text": "…"}`.
+/// The `text` replaces the outgoing user message; empty or absent keeps it.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct TransformHookJson {
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// Interpret a [`TransformHookJson`]: a non-empty, trimmed `text` replaces the
+/// user message; otherwise the message is kept as-is.
+pub(crate) fn transform_json_to_text(json: TransformHookJson) -> Option<String> {
+    json.text
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 /// JSON from `Stop`/`SubagentStop` gate hooks. All fields optional; one output
@@ -138,5 +156,28 @@ pub async fn run_hook(
             (result, elapsed, None)
         }
         crate::config::HandlerType::Http => http::run_http_hook(spec, envelope, ctx, mode).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transform_json_to_text_returns_trimmed_text() {
+        let json = TransformHookJson {
+            text: Some("  hint text  ".to_string()),
+        };
+        assert_eq!(
+            transform_json_to_text(json).as_deref(),
+            Some("hint text")
+        );
+    }
+
+    #[test]
+    fn transform_json_to_text_none_when_empty_or_whitespace() {
+        for text in [None, Some("".to_string()), Some("   \n  ".to_string())] {
+            assert_eq!(transform_json_to_text(TransformHookJson { text }), None);
+        }
     }
 }

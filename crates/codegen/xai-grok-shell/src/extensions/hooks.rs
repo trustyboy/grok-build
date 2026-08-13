@@ -37,6 +37,7 @@ pub(crate) fn hook_spec_to_info(spec: &xai_grok_hooks::config::HookSpec) -> Hook
         HookEventName::PermissionDenied => HookEvent::PermissionDenied,
         // User / notification
         HookEventName::UserPromptSubmit => HookEvent::UserPromptSubmit,
+        HookEventName::UserPromptTransform => HookEvent::UserPromptTransform,
         HookEventName::Notification => HookEvent::Notification,
         // Subagent
         HookEventName::SubagentStart => HookEvent::SubagentStart,

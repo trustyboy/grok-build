@@ -583,6 +583,18 @@ impl ModelsManager {
             .unwrap_or(false)
     }
 
+    /// Whether `model_id` accepts image content blocks. Unknown ids default
+    /// to `true` (vision-capable), matching the pre-`supports_vision` behavior.
+    pub(crate) fn model_supports_vision(&self, model_id: &str) -> bool {
+        self.inner
+            .catalog
+            .read()
+            .models
+            .get(model_id)
+            .map(|e| e.info().supports_vision)
+            .unwrap_or(true)
+    }
+
     pub(crate) fn model_compactions_remaining(
         &self,
         model_id: &str,

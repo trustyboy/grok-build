@@ -94,6 +94,8 @@ pub enum HookEvent {
     PermissionDenied,
     // User / notification
     UserPromptSubmit,
+    /// Message-transform gate: a hook may replace the outgoing user message.
+    UserPromptTransform,
     Notification,
     // Subagent
     SubagentStart,
@@ -115,6 +117,7 @@ impl std::fmt::Display for HookEvent {
             Self::StopFailure => write!(f, "Stop Failure"),
             Self::Notification => write!(f, "Notification"),
             Self::UserPromptSubmit => write!(f, "Prompt Submit"),
+            Self::UserPromptTransform => write!(f, "Prompt Transform"),
             Self::PermissionDenied => write!(f, "Permission Denied"),
             Self::SubagentStart => write!(f, "Subagent Start"),
             Self::SubagentStop => write!(f, "Subagent Stop"),

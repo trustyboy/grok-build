@@ -507,20 +507,25 @@ pub(crate) fn render_image_user_message(
 ///
 /// Used by other harnesses that still pass images inline as
 /// multimodal parts — persistence is independent of vision describe.
+///
+/// Returns the assembled message text together with the persisted image
+/// paths (in input order), so the caller can hand structured paths to the
+/// `UserPromptTransform` hook payload.
 pub(crate) fn persist_and_prepend_image_files(
     session_dir: &Path,
     images: &[ImageContent],
     original_user_message: &str,
-) -> std::io::Result<String> {
+) -> std::io::Result<(String, Vec<String>)> {
     let persisted = persist_user_images(session_dir, images)?;
     let image_paths: Vec<String> = persisted
         .iter()
         .map(|p| p.path.to_string_lossy().into_owned())
         .collect();
-    Ok(match render_image_files_block(&image_paths) {
+    let message = match render_image_files_block(&image_paths) {
         Some(files_block) => format!("{files_block}\n\n{original_user_message}"),
         None => original_user_message.to_owned(),
-    })
+    };
+    Ok((message, image_paths))
 }
 #[cfg(test)]
 mod tests {
@@ -537,10 +542,13 @@ mod tests {
             0xd4, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ]);
         let img = ImageContent::new(png, "image/png");
-        let msg = persist_and_prepend_image_files(dir.path(), &[img], "hello").unwrap();
+        let (msg, paths) = persist_and_prepend_image_files(dir.path(), &[img], "hello").unwrap();
         assert!(msg.contains("<image_files>"));
         assert!(msg.contains("/assets/image-"));
         assert!(msg.ends_with("hello") || msg.contains("\n\nhello"));
+        // 结构化路径与 <image_files> 块一一对应（输入顺序），供钩子载荷使用。
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].contains("/assets/image-"));
         let assets = std::fs::read_dir(dir.path().join("assets")).unwrap();
         assert_eq!(assets.count(), 1);
     }

@@ -1162,7 +1162,7 @@ pub(crate) async fn spawn_session_actor(
                 false,
             );
             let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd_path).ok();
-            let (registry, errors) = crate::util::hooks::discover_hooks(
+            let (mut registry, errors) = crate::util::hooks::discover_hooks(
                 git_root.as_deref(),
                 &rebuild_spec.compat,
                 project_trusted,
@@ -1171,6 +1171,19 @@ pub(crate) async fn spawn_session_actor(
                 tracing::warn!(error = ?e, "hook loading error");
             }
             hook_discovery_errors = errors;
+            // 合并插件钩子：随会话启动同步注册。此前插件钩子只在信任授予 /
+            // 手动 `/hooks reload` / 插件变更等事件后才进入注册表，导致会话
+            // 启动后插件钩子（如 vision-bridge 的 UserPromptTransform）不生效。
+            let plugin_hook_count = super::hooks_plugins::append_plugin_hooks_to(
+                &mut registry,
+                plugin_registry.as_deref(),
+            );
+            if plugin_hook_count > 0 {
+                tracing::info!(
+                    plugin_hook_count,
+                    "plugin hooks registered at session startup"
+                );
+            }
             if registry.is_empty() {
                 None
             } else {

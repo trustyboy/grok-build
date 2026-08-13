@@ -97,6 +97,16 @@ hook_events! {
         aliases: ["UserPromptSubmit", "user_prompt_submit", "beforeSubmitPrompt"],
         traits: (Observe, Ignored, true),
     },
+    /// Fires after the user message is fully assembled (images persisted,
+    /// `<image_files>` block injected) and before it is written to the
+    /// conversation: a hook may replace the outgoing text via
+    /// `{"text": "..."}` on stdout. Fail-open — any failure keeps the
+    /// original message.
+    UserPromptTransform {
+        display: "user_prompt_transform",
+        aliases: ["UserPromptTransform", "user_prompt_transform", "userPromptTransform"],
+        traits: (Transform, Ignored, true),
+    },
     PreToolUse {
         display: "pre_tool_use",
         aliases: [
@@ -193,6 +203,9 @@ pub enum GateKind {
     Tool,
     /// Stop decision control (`block`, `continue: false`, `additionalContext`).
     Stop,
+    /// Message-transform control: a hook may replace the outgoing user
+    /// message with the `{"text": "..."}` written to stdout.
+    Transform,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,6 +467,21 @@ pub enum HookPayload {
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
     },
+    UserPromptTransform {
+        /// The fully-assembled user message text (including any injected
+        /// `<image_files>` block), exactly as it would be sent to the model.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        /// Structured metadata for the images in this message, when the
+        /// host persisted or collected any. Lets vision-bridge-style hooks
+        /// react without re-parsing `<image_files>` text.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<UserPromptImage>>,
+        /// Whether the current backend model accepts image content blocks
+        /// (`model_supports_vision`). Hooks use it to skip prompt injection
+        /// for multimodal models, which can see the images directly.
+        supports_vision: bool,
+    },
     Notification {
         #[serde(rename = "notificationType")]
         notification_type: String,
@@ -500,6 +528,24 @@ pub enum HookPayload {
     },
 }
 
+/// Lightweight per-image metadata carried in `UserPromptTransform` payloads.
+/// Deliberately excludes base64 `data` (too large for the hook envelope);
+/// the on-disk `path` / original `uri` let a vision-bridge hook hand the
+/// image to an external vision MCP tool.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPromptImage {
+    /// On-disk path of the persisted copy, as listed in the `<image_files>`
+    /// block (populated by non-`cursor` harnesses that persist attachments).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// MIME type of the image, e.g. `image/png`.
+    pub mime_type: String,
+    /// Original data URI or URL when the attachment carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
 impl HookPayload {
     /// The value a [`MatcherPolicy::Tested`] matcher is tested against, or `None` when
     /// the payload carries nothing selectable (matchers then fire-all, the fail-open default).
@@ -521,7 +567,9 @@ impl HookPayload {
             // Always a non-empty name, unlike the free-text arms above.
             Self::StopFailure { error, .. } => return Some(error.as_str()),
             // Ignored events listed explicitly so a new Tested event can't silently return None.
-            Self::Stop { .. } | Self::UserPromptSubmit { .. } => return None,
+            Self::Stop { .. }
+            | Self::UserPromptSubmit { .. }
+            | Self::UserPromptTransform { .. } => return None,
         };
         Some(value.as_str()).filter(|v| !v.is_empty())
     }
@@ -572,6 +620,11 @@ mod tests {
                 HookEventName::UserPromptSubmit,
             ),
             (
+                "UserPromptTransform",
+                "user_prompt_transform",
+                HookEventName::UserPromptTransform,
+            ),
+            (
                 "PermissionDenied",
                 "permission_denied",
                 HookEventName::PermissionDenied,
@@ -612,6 +665,10 @@ mod tests {
             (HookEventName::StopFailure, "stop_failure"),
             (HookEventName::Notification, "notification"),
             (HookEventName::UserPromptSubmit, "user_prompt_submit"),
+            (
+                HookEventName::UserPromptTransform,
+                "user_prompt_transform",
+            ),
             (HookEventName::PermissionDenied, "permission_denied"),
             (HookEventName::SubagentStart, "subagent_start"),
             (HookEventName::SubagentStop, "subagent_stop"),

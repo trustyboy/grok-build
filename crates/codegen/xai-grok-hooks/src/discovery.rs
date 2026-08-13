@@ -397,6 +397,7 @@ mod tests {
             HookEventName::PreToolUse,
             HookEventName::Stop,
             HookEventName::SubagentStop,
+            HookEventName::UserPromptTransform,
         ]
         .into_iter()
         .collect();

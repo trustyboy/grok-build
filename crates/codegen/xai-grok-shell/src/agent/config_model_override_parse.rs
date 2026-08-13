@@ -722,6 +722,7 @@ mod tests {
                 default: true,
             }],
             supports_backend_search: Some(false),
+            supports_vision: Some(false),
             compactions_remaining: Some(CompactionsRemaining::Fixed(1)),
             compaction_at_tokens: Some(CompactionAtTokens::Fixed(100_000)),
             show_model_fingerprint: Some(true),
@@ -756,6 +757,21 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         let reparsed = toml::Value::try_from(models.get("m").unwrap()).unwrap();
         assert_eq!(reparsed, serialized, "round-trip must be lossless");
+    }
+
+    /// `supports_vision = false` must survive TOML parsing (text-only
+    /// endpoints like the CPA adapter strip image blocks before send).
+    #[test]
+    fn parses_supports_vision_false() {
+        let mut entry = toml::map::Map::new();
+        entry.insert(
+            "supports_vision".to_owned(),
+            toml::Value::Boolean(false),
+        );
+        let (models, warnings) = parse_single_entry(entry);
+        assert_eq!(warnings, Vec::new());
+        let parsed = models.get("m").unwrap();
+        assert_eq!(parsed.supports_vision, Some(false));
     }
 
     /// `auth_provider` alongside `api_key`/`env_key` warns (static keys

@@ -965,6 +965,12 @@ pub(crate) fn parse_remote_model_value(
             .get("streamToolCalls")
             .or_else(|| obj.get("stream_tool_calls"))
             .and_then(|v| v.as_bool()),
+        supports_vision: obj
+            .get("supportsVision")
+            .or_else(|| obj.get("supports_vision"))
+            .or_else(|| meta.and_then(|m| m.get("supportsVision")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
         laziness_detector: get_object(obj, "lazinessDetector")
             .or_else(|| get_object(obj, "laziness_detector"))
             .or_else(|| meta.and_then(|m| get_object(m, "lazinessDetector")))

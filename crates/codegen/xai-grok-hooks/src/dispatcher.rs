@@ -144,7 +144,9 @@ pub async fn dispatch_pre_tool_use(
                     http_info,
                 });
             }
-            HookRunnerResult::Success | HookRunnerResult::Stop(_) => {
+            HookRunnerResult::Success
+            | HookRunnerResult::Stop(_)
+            | HookRunnerResult::Transformed(_) => {
                 tracing::info!(
                     hook_name = %spec.name,
                     elapsed_ms = elapsed.as_millis() as u64,
@@ -345,7 +347,9 @@ pub async fn dispatch_stop(
                     http_info,
                 });
             }
-            HookRunnerResult::Success | HookRunnerResult::Decision(_) => {
+            HookRunnerResult::Success
+            | HookRunnerResult::Decision(_)
+            | HookRunnerResult::Transformed(_) => {
                 out.results.push(HookRunResult::Success {
                     hook_name: spec.name.clone(),
                     elapsed,
@@ -437,12 +441,148 @@ pub async fn dispatch_non_blocking(
                     http_info,
                 });
             }
+            HookRunnerResult::Transformed(_) => {
+                tracing::info!(
+                    hook_name = %spec.name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "hook completed"
+                );
+                results.push(HookRunResult::Success {
+                    hook_name: spec.name.clone(),
+                    elapsed,
+                    http_info,
+                });
+            }
         }
     }
 
     record_dispatch_counts(&span, &results);
 
     results
+}
+
+/// Dispatch a `user_prompt_transform` event against all matching hooks,
+/// chaining their outputs: each hook receives the current text and may replace
+/// it with the `{"text": "…"}` written to its stdout. Fail-open throughout —
+/// a failing hook (nonzero exit, timeout, malformed output, empty `text`)
+/// keeps the current text, matching grok's hook safety philosophy.
+///
+/// Returns the final text when at least one hook replaced the message, or
+/// `None` when nothing matched or nothing changed.
+pub async fn dispatch_user_prompt_transform(
+    registry: &HookRegistry,
+    envelope: &HookEventEnvelope,
+    ctx: &RunContext<'_>,
+) -> Option<String> {
+    let hooks = registry.hooks_for(HookEventName::UserPromptTransform);
+    if hooks.is_empty() {
+        return None;
+    }
+
+    let span = dispatch_span(HookEventName::UserPromptTransform, hooks.len());
+    let _enter = span.enter();
+
+    // 以信封携带的原始 prompt 为起点；每个后续钩子看到前序钩子的输出。
+    // images / supports_vision 从原始信封透传，链式重建时不丢失。
+    let (images, supports_vision) = match &envelope.payload {
+        crate::event::HookPayload::UserPromptTransform {
+            images,
+            supports_vision,
+            ..
+        } => (images.clone(), *supports_vision),
+        _ => (None, true),
+    };
+    let mut current = match &envelope.payload {
+        crate::event::HookPayload::UserPromptTransform { prompt, .. } => {
+            prompt.clone().unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+    let mut changed = false;
+    let mut run_results: Vec<HookRunResult> = Vec::with_capacity(hooks.len());
+
+    for spec in hooks {
+        if !eligible_or_record_skip(spec, None, &mut run_results) {
+            continue;
+        }
+
+        let _hook_span = tracing::info_span!(
+            "hook.run",
+            hook_name = %spec.name,
+            hook_event = %HookEventName::UserPromptTransform,
+        )
+        .entered();
+
+        // 重建携带当前文本的信封，实现链式变换；保留原始 images/supports_vision。
+        let mut current_envelope = envelope.clone();
+        current_envelope.payload = crate::event::HookPayload::UserPromptTransform {
+            prompt: Some(current.clone()),
+            images: images.clone(),
+            supports_vision,
+        };
+
+        let (result, elapsed, http_info) =
+            runner::run_hook(spec, &current_envelope, ctx, GateKind::Transform).await;
+
+        match result {
+            HookRunnerResult::Transformed(text) => {
+                tracing::info!(
+                    hook_name = %spec.name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "transform hook replaced user message"
+                );
+                current = text;
+                changed = true;
+                run_results.push(HookRunResult::Success {
+                    hook_name: spec.name.clone(),
+                    elapsed,
+                    http_info,
+                });
+            }
+            HookRunnerResult::Success => {
+                tracing::info!(
+                    hook_name = %spec.name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "transform hook completed (message unchanged)"
+                );
+                run_results.push(HookRunResult::Success {
+                    hook_name: spec.name.clone(),
+                    elapsed,
+                    http_info,
+                });
+            }
+            HookRunnerResult::Failed(err) => {
+                tracing::warn!(
+                    hook_name = %spec.name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    hook_failure = %err,
+                    "transform hook failed; keeping current message"
+                );
+                run_results.push(HookRunResult::Failed {
+                    hook_name: spec.name.clone(),
+                    error: err,
+                    elapsed,
+                    http_info,
+                });
+            }
+            HookRunnerResult::Decision(_) | HookRunnerResult::Stop(_) => {
+                tracing::info!(
+                    hook_name = %spec.name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "transform hook completed"
+                );
+                run_results.push(HookRunResult::Success {
+                    hook_name: spec.name.clone(),
+                    elapsed,
+                    http_info,
+                });
+            }
+        }
+    }
+
+    record_dispatch_counts(&span, &run_results);
+
+    changed.then_some(current)
 }
 
 fn record_dispatch_counts(span: &tracing::Span, results: &[HookRunResult]) {
@@ -1124,6 +1264,10 @@ mod tests {
             ),
             (HookEventName::PermissionDenied, "hook.permission_denied"),
             (HookEventName::UserPromptSubmit, "hook.user_prompt_submit"),
+            (
+                HookEventName::UserPromptTransform,
+                "hook.user_prompt_transform",
+            ),
             (HookEventName::Notification, "hook.notification"),
             (HookEventName::SubagentStart, "hook.subagent_start"),
             (HookEventName::SubagentStop, "hook.subagent_stop"),
@@ -1145,12 +1289,13 @@ mod tests {
                 | HookEventName::PostToolUseFailure
                 | HookEventName::PermissionDenied
                 | HookEventName::UserPromptSubmit
+                | HookEventName::UserPromptTransform
                 | HookEventName::Notification
                 | HookEventName::SubagentStart
                 | HookEventName::SubagentStop
                 | HookEventName::SubagentEnd
                 | HookEventName::PreCompact
-                | HookEventName::PostCompact => 15,
+                | HookEventName::PostCompact => 16,
             }
         };
         assert_eq!(

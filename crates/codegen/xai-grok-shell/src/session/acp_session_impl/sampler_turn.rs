@@ -523,6 +523,9 @@ impl SessionActor {
                 None
             },
             supports_backend_search: self.supports_backend_search.get(),
+            supports_vision: self
+                .models_manager
+                .model_supports_vision(self.models_manager.current_model_id().0.as_ref()),
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,

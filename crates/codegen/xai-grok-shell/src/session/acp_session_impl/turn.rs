@@ -711,11 +711,14 @@ impl SessionActor {
         }
         self.drain_between_turn_completions().await;
         self.inject_workflow_status_reminder().await;
-        let user_message = if user_images.is_empty() {
-            user_message
+        let (user_message, image_paths) = if user_images.is_empty() {
+            (user_message, Vec::new())
         } else if self.is_cursor_harness() {
-            self.transcribe_user_images(user_message, &user_images)
-                .await?
+            (
+                self.transcribe_user_images(user_message, &user_images)
+                    .await?,
+                Vec::new(),
+            )
         } else {
             let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
                 &crate::session::info::Info {
@@ -736,6 +739,22 @@ impl SessionActor {
                     .data(format!("failed to save user images to assets dir: {e}"))
             })?
         };
+        // 消息写入会话之前，允许 UserPromptTransform 钩子链替换用户消息文本
+        // （如注入"请调用 vision 工具"提示；任何失败保持原消息，fail-open）。
+        // supports_vision 表示当前后端模型是否多模态：多模态模型可直接看图，
+        // 钩子应据此跳过桥接提示注入。
+        let supports_vision = self
+            .models_manager
+            .model_supports_vision(self.models_manager.current_model_id().0.as_ref());
+        let user_message = self
+            .dispatch_user_prompt_transform(
+                user_message,
+                Some(prompt_id),
+                &user_images,
+                &image_paths,
+                supports_vision,
+            )
+            .await;
         let attached_image_refs = if self.is_cursor_harness() {
             Vec::new()
         } else {

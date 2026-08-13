@@ -28,7 +28,7 @@ use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
     ResponseModelMetadata, Result, SamplingError, SentCredential, build_messages_request,
-    is_check_event, messages, rs,
+    conversation::{ContentPart, ConversationItem}, is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
@@ -377,6 +377,9 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    /// Whether the endpoint accepts image content blocks; `false` strips
+    /// image parts from outgoing conversation requests.
+    supports_vision: bool,
 }
 
 /// Endpoint URL builder, resolved once at client construction so each request
@@ -686,6 +689,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
+            supports_vision: config.supports_vision,
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
@@ -1861,7 +1865,65 @@ impl SamplingClient {
     // =========================================================================
 
     /// Apply default configuration to a ConversationRequest.
+    /// Replace image content parts with text placeholders when the model
+    /// endpoint is text-only (`supports_vision = false`). Base64 payloads
+    /// are dropped — they never enter model-visible text; remote URLs
+    /// survive as a bracketed reference a vision bridge can still use.
+    fn strip_images_for_text_only_model(items: &mut Vec<ConversationItem>) {
+        for item in items.iter_mut() {
+            match item {
+                ConversationItem::User(u) => {
+                    u.content = std::mem::take(&mut u.content)
+                        .into_iter()
+                        .map(|part| match part {
+                            ContentPart::Image { url } => ContentPart::Text {
+                                text: std::sync::Arc::<str>::from(Self::image_part_placeholder(
+                                    &url,
+                                )),
+                            },
+                            other => other,
+                        })
+                        .collect();
+                }
+                ConversationItem::ToolResult(t) => {
+                    if !t.images.is_empty() {
+                        let count = t.images.len();
+                        t.images.clear();
+                        let mut content = t.content.to_string();
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&format!(
+                            "[{count} image(s) omitted: the model does not accept image input]"
+                        ));
+                        t.content = std::sync::Arc::<str>::from(content);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `[image: <url>]` for remote URLs; data URIs carry no readable location
+    /// so they become a bare marker (the `<image_files>` path block already
+    /// in the text is what vision tools consume).
+    fn image_part_placeholder(url: &str) -> String {
+        if url.starts_with("data:") {
+            "[image attached (base64); see the <image_files> path list if present]".to_string()
+        } else {
+            format!("[image: {url}]")
+        }
+    }
+
     fn apply_conversation_defaults(&self, request: &mut ConversationRequest) -> Result<()> {
+        // Text-only endpoints (`supports_vision = false`) reject image
+        // content blocks outright (400 deserialize failure), so strip them
+        // before any backend conversion. Text — including the `<image_files>`
+        // path block — survives for vision-bridge hooks and tools.
+        if !self.defaults.supports_vision {
+            Self::strip_images_for_text_only_model(&mut request.items);
+        }
+
         if request.model.is_none() {
             request.model = Some(self.defaults.model.clone());
         }
@@ -2200,11 +2262,85 @@ mod tests {
             attribution_callback: None,
             bearer_resolver: None,
             supports_backend_search: false,
+            supports_vision: true,
             compactions_remaining: None,
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
         }
+    }
+
+    fn user_item(parts: Vec<ContentPart>) -> ConversationItem {
+        ConversationItem::User(xai_grok_sampling_types::conversation::UserItem {
+            content: parts,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn strip_images_for_text_only_model_replaces_image_parts() {
+        let mut items = vec![
+            user_item(vec![
+                ContentPart::Text {
+                    text: std::sync::Arc::<str>::from("hello"),
+                },
+                ContentPart::Image {
+                    url: std::sync::Arc::<str>::from("data:image/png;base64,AAAA"),
+                },
+                ContentPart::Image {
+                    url: std::sync::Arc::<str>::from("https://example.com/a.png"),
+                },
+            ]),
+            user_item(vec![ContentPart::Text {
+                text: std::sync::Arc::<str>::from("plain"),
+            }]),
+        ];
+        SamplingClient::strip_images_for_text_only_model(&mut items);
+
+        let ConversationItem::User(first) = &items[0] else {
+            panic!("expected user item");
+        };
+        assert_eq!(first.content.len(), 3);
+        let ContentPart::Text { text } = &first.content[0] else {
+            panic!("expected text part");
+        };
+        assert_eq!(text.as_ref(), "hello");
+        // Base64 payload must never leak into model-visible text.
+        let ContentPart::Text { text } = &first.content[1] else {
+            panic!("expected text placeholder for data URI");
+        };
+        assert!(!text.contains("AAAA"), "base64 must not leak");
+        assert!(text.contains("<image_files>"));
+        let ContentPart::Text { text } = &first.content[2] else {
+            panic!("expected text placeholder for remote URL");
+        };
+        assert_eq!(text.as_ref(), "[image: https://example.com/a.png]");
+
+        let ConversationItem::User(second) = &items[1] else {
+            panic!("expected user item");
+        };
+        assert_eq!(second.content.len(), 1);
+    }
+
+    #[test]
+    fn strip_images_for_text_only_model_clears_tool_result_images() {
+        let mut items = vec![ConversationItem::ToolResult(
+            xai_grok_sampling_types::conversation::ToolResultItem {
+                tool_call_id: "call_1".to_string(),
+                content: std::sync::Arc::<str>::from("result text"),
+                images: vec![ContentPart::Image {
+                    url: std::sync::Arc::<str>::from("data:image/png;base64,BBBB"),
+                }],
+            },
+        )];
+        SamplingClient::strip_images_for_text_only_model(&mut items);
+
+        let ConversationItem::ToolResult(t) = &items[0] else {
+            panic!("expected tool result");
+        };
+        assert!(t.images.is_empty());
+        assert!(t.content.starts_with("result text"));
+        assert!(t.content.contains("omitted"));
     }
 
     /// Verify the serialized shape of StreamingChatRequest matches the

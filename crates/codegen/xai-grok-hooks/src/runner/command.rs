@@ -9,8 +9,8 @@ use crate::event::HookEventEnvelope;
 use crate::result::{HookDecision, StopHookOutcome};
 
 use super::{
-    GateHookJson, GateKind, HookRunnerResult, RunContext, StopHookJson, gate_json_to_decision,
-    stop_json_to_outcome,
+    GateHookJson, GateKind, HookRunnerResult, RunContext, StopHookJson, TransformHookJson,
+    gate_json_to_decision, stop_json_to_outcome, transform_json_to_text,
 };
 
 /// Maximum bytes to capture from hook stdout or stderr (64 KB).
@@ -297,6 +297,9 @@ pub async fn run_command_hook(
                 GateKind::Stop => {
                     parse_stop_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
                 }
+                GateKind::Transform => {
+                    parse_transform_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
+                }
             }
         }
     }
@@ -575,6 +578,44 @@ fn parse_blocking_result(
             )),
             elapsed,
         ),
+    }
+}
+
+/// Parse the result of a `UserPromptTransform` hook from stdout, stderr, and
+/// exit code. Fail-open: any failure (nonzero exit, malformed JSON, empty or
+/// absent `text`) keeps the original message.
+fn parse_transform_result(
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+    hook_name: &str,
+    elapsed: Duration,
+) -> (HookRunnerResult, Duration) {
+    if exit_code != 0 {
+        return (
+            HookRunnerResult::Failed(append_stderr_line(
+                &format!("hook '{hook_name}' failed with exit code {exit_code}"),
+                stderr,
+            )),
+            elapsed,
+        );
+    }
+    if stdout.trim().is_empty() {
+        return (HookRunnerResult::Success, elapsed);
+    }
+    match serde_json::from_str::<TransformHookJson>(stdout.trim()) {
+        Ok(json) => match transform_json_to_text(json) {
+            Some(text) => (HookRunnerResult::Transformed(text), elapsed),
+            None => (HookRunnerResult::Success, elapsed),
+        },
+        Err(e) => {
+            tracing::warn!(
+                hook_name,
+                error = %e,
+                "could not parse transform hook output JSON, keeping original message"
+            );
+            (HookRunnerResult::Success, elapsed)
+        }
     }
 }
 

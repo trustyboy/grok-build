@@ -1,5 +1,54 @@
 use super::*;
 
+/// Append hook specs contributed by `plugins`' active plugins to `hooks`
+/// (file-based `hooks/hooks.json` plus manifest inline hooks). Returns the
+/// number of specs appended.
+///
+/// Shared by session-startup (`spawn.rs`) and mid-session reload paths so
+/// plugin hooks register identically everywhere. Callers that replace plugin
+/// hooks in place clear the prior plugin specs first (`remove_by_prefix`); this
+/// function only appends and never touches non-plugin hooks.
+pub(crate) fn append_plugin_hooks_to(
+    hooks: &mut xai_grok_hooks::discovery::HookRegistry,
+    plugins: Option<&xai_grok_agent::plugins::PluginRegistry>,
+) -> usize {
+    let Some(plugins) = plugins else {
+        return 0;
+    };
+    let mut count = 0usize;
+    for plugin in plugins.active_plugins() {
+        if let Some(ref hooks_path) = plugin.hooks_path {
+            let (specs, warnings) =
+                xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks(
+                    hooks_path,
+                    &plugin.name,
+                    &plugin.root_str(),
+                    &plugin.data_dir_str(),
+                );
+            for w in &warnings {
+                tracing::warn!("{w}");
+            }
+            count += specs.len();
+            hooks.append_specs(specs);
+        }
+        if let Some(ref inline_value) = plugin.inline_hooks {
+            let (specs, warnings) =
+                xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks_from_value(
+                    inline_value,
+                    &plugin.name,
+                    &plugin.root_str(),
+                    &plugin.data_dir_str(),
+                );
+            for w in &warnings {
+                tracing::warn!("{w}");
+            }
+            count += specs.len();
+            hooks.append_specs(specs);
+        }
+    }
+    count
+}
+
 impl SessionActor {
     // ── Shared hook/plugin operation functions ────────────────────────
 
@@ -650,34 +699,7 @@ impl SessionActor {
         // Clone the Arc out of the RefCell so the borrow is dropped immediately.
         let plugin_registry_snapshot = self.plugin_registry.borrow().clone();
         if let Some(ref pr) = plugin_registry_snapshot {
-            for plugin in pr.active_plugins() {
-                if let Some(ref hooks_path) = plugin.hooks_path {
-                    let (specs, warnings) =
-                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks(
-                            hooks_path,
-                            &plugin.name,
-                            &plugin.root_str(),
-                            &plugin.data_dir_str(),
-                        );
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    registry.append_specs(specs);
-                }
-                if let Some(ref inline_value) = plugin.inline_hooks {
-                    let (specs, warnings) =
-                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks_from_value(
-                            inline_value,
-                            &plugin.name,
-                            &plugin.root_str(),
-                            &plugin.data_dir_str(),
-                        );
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    registry.append_specs(specs);
-                }
-            }
+            append_plugin_hooks_to(&mut registry, Some(pr));
         }
         let hook_count = registry.len();
         {

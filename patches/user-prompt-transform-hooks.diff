@@ -1,0 +1,584 @@
+diff --git a/crates/codegen/xai-grok-hooks/src/discovery.rs b/crates/codegen/xai-grok-hooks/src/discovery.rs
+index d3c437c..bc909fd 100644
+--- a/crates/codegen/xai-grok-hooks/src/discovery.rs
++++ b/crates/codegen/xai-grok-hooks/src/discovery.rs
+@@ -397,6 +397,7 @@ mod tests {
+             HookEventName::PreToolUse,
+             HookEventName::Stop,
+             HookEventName::SubagentStop,
++            HookEventName::UserPromptTransform,
+         ]
+         .into_iter()
+         .collect();
+diff --git a/crates/codegen/xai-grok-hooks/src/dispatcher.rs b/crates/codegen/xai-grok-hooks/src/dispatcher.rs
+index 74fb171..daeb34b 100644
+--- a/crates/codegen/xai-grok-hooks/src/dispatcher.rs
++++ b/crates/codegen/xai-grok-hooks/src/dispatcher.rs
+@@ -144,7 +144,9 @@ pub async fn dispatch_pre_tool_use(
+                     http_info,
+                 });
+             }
+-            HookRunnerResult::Success | HookRunnerResult::Stop(_) => {
++            HookRunnerResult::Success
++            | HookRunnerResult::Stop(_)
++            | HookRunnerResult::Transformed(_) => {
+                 tracing::info!(
+                     hook_name = %spec.name,
+                     elapsed_ms = elapsed.as_millis() as u64,
+@@ -345,7 +347,9 @@ pub async fn dispatch_stop(
+                     http_info,
+                 });
+             }
+-            HookRunnerResult::Success | HookRunnerResult::Decision(_) => {
++            HookRunnerResult::Success
++            | HookRunnerResult::Decision(_)
++            | HookRunnerResult::Transformed(_) => {
+                 out.results.push(HookRunResult::Success {
+                     hook_name: spec.name.clone(),
+                     elapsed,
+@@ -437,6 +441,18 @@ pub async fn dispatch_non_blocking(
+                     http_info,
+                 });
+             }
++            HookRunnerResult::Transformed(_) => {
++                tracing::info!(
++                    hook_name = %spec.name,
++                    elapsed_ms = elapsed.as_millis() as u64,
++                    "hook completed"
++                );
++                results.push(HookRunResult::Success {
++                    hook_name: spec.name.clone(),
++                    elapsed,
++                    http_info,
++                });
++            }
+         }
+     }
+ 
+@@ -445,6 +461,119 @@ pub async fn dispatch_non_blocking(
+     results
+ }
+ 
++/// Dispatch a `user_prompt_transform` event against all matching hooks,
++/// chaining their outputs: each hook receives the current text and may replace
++/// it with the `{"text": "…"}` written to its stdout. Fail-open throughout —
++/// a failing hook (nonzero exit, timeout, malformed output, empty `text`)
++/// keeps the current text, matching grok's hook safety philosophy.
++///
++/// Returns the final text when at least one hook replaced the message, or
++/// `None` when nothing matched or nothing changed.
++pub async fn dispatch_user_prompt_transform(
++    registry: &HookRegistry,
++    envelope: &HookEventEnvelope,
++    ctx: &RunContext<'_>,
++) -> Option<String> {
++    let hooks = registry.hooks_for(HookEventName::UserPromptTransform);
++    if hooks.is_empty() {
++        return None;
++    }
++
++    let span = dispatch_span(HookEventName::UserPromptTransform, hooks.len());
++    let _enter = span.enter();
++
++    // 以信封携带的原始 prompt 为起点；每个后续钩子看到前序钩子的输出。
++    let mut current = match &envelope.payload {
++        crate::event::HookPayload::UserPromptTransform { prompt } => {
++            prompt.clone().unwrap_or_default()
++        }
++        _ => String::new(),
++    };
++    let mut changed = false;
++    let mut run_results: Vec<HookRunResult> = Vec::with_capacity(hooks.len());
++
++    for spec in hooks {
++        if !eligible_or_record_skip(spec, None, &mut run_results) {
++            continue;
++        }
++
++        let _hook_span = tracing::info_span!(
++            "hook.run",
++            hook_name = %spec.name,
++            hook_event = %HookEventName::UserPromptTransform,
++        )
++        .entered();
++
++        // 重建携带当前文本的信封，实现链式变换。
++        let mut current_envelope = envelope.clone();
++        current_envelope.payload = crate::event::HookPayload::UserPromptTransform {
++            prompt: Some(current.clone()),
++        };
++
++        let (result, elapsed, http_info) =
++            runner::run_hook(spec, &current_envelope, ctx, GateKind::Transform).await;
++
++        match result {
++            HookRunnerResult::Transformed(text) => {
++                tracing::info!(
++                    hook_name = %spec.name,
++                    elapsed_ms = elapsed.as_millis() as u64,
++                    "transform hook replaced user message"
++                );
++                current = text;
++                changed = true;
++                run_results.push(HookRunResult::Success {
++                    hook_name: spec.name.clone(),
++                    elapsed,
++                    http_info,
++                });
++            }
++            HookRunnerResult::Success => {
++                tracing::info!(
++                    hook_name = %spec.name,
++                    elapsed_ms = elapsed.as_millis() as u64,
++                    "transform hook completed (message unchanged)"
++                );
++                run_results.push(HookRunResult::Success {
++                    hook_name: spec.name.clone(),
++                    elapsed,
++                    http_info,
++                });
++            }
++            HookRunnerResult::Failed(err) => {
++                tracing::warn!(
++                    hook_name = %spec.name,
++                    elapsed_ms = elapsed.as_millis() as u64,
++                    hook_failure = %err,
++                    "transform hook failed; keeping current message"
++                );
++                run_results.push(HookRunResult::Failed {
++                    hook_name: spec.name.clone(),
++                    error: err,
++                    elapsed,
++                    http_info,
++                });
++            }
++            HookRunnerResult::Decision(_) | HookRunnerResult::Stop(_) => {
++                tracing::info!(
++                    hook_name = %spec.name,
++                    elapsed_ms = elapsed.as_millis() as u64,
++                    "transform hook completed"
++                );
++                run_results.push(HookRunResult::Success {
++                    hook_name: spec.name.clone(),
++                    elapsed,
++                    http_info,
++                });
++            }
++        }
++    }
++
++    record_dispatch_counts(&span, &run_results);
++
++    changed.then_some(current)
++}
++
+ fn record_dispatch_counts(span: &tracing::Span, results: &[HookRunResult]) {
+     let mut num_success = 0i64;
+     let mut num_failed = 0i64;
+@@ -1124,6 +1253,10 @@ mod tests {
+             ),
+             (HookEventName::PermissionDenied, "hook.permission_denied"),
+             (HookEventName::UserPromptSubmit, "hook.user_prompt_submit"),
++            (
++                HookEventName::UserPromptTransform,
++                "hook.user_prompt_transform",
++            ),
+             (HookEventName::Notification, "hook.notification"),
+             (HookEventName::SubagentStart, "hook.subagent_start"),
+             (HookEventName::SubagentStop, "hook.subagent_stop"),
+@@ -1145,12 +1278,13 @@ mod tests {
+                 | HookEventName::PostToolUseFailure
+                 | HookEventName::PermissionDenied
+                 | HookEventName::UserPromptSubmit
++                | HookEventName::UserPromptTransform
+                 | HookEventName::Notification
+                 | HookEventName::SubagentStart
+                 | HookEventName::SubagentStop
+                 | HookEventName::SubagentEnd
+                 | HookEventName::PreCompact
+-                | HookEventName::PostCompact => 15,
++                | HookEventName::PostCompact => 16,
+             }
+         };
+         assert_eq!(
+diff --git a/crates/codegen/xai-grok-hooks/src/event.rs b/crates/codegen/xai-grok-hooks/src/event.rs
+index d6d46a7..0dcbeb6 100644
+--- a/crates/codegen/xai-grok-hooks/src/event.rs
++++ b/crates/codegen/xai-grok-hooks/src/event.rs
+@@ -97,6 +97,16 @@ hook_events! {
+         aliases: ["UserPromptSubmit", "user_prompt_submit", "beforeSubmitPrompt"],
+         traits: (Observe, Ignored, true),
+     },
++    /// Fires after the user message is fully assembled (images persisted,
++    /// `<image_files>` block injected) and before it is written to the
++    /// conversation: a hook may replace the outgoing text via
++    /// `{"text": "..."}` on stdout. Fail-open — any failure keeps the
++    /// original message.
++    UserPromptTransform {
++        display: "user_prompt_transform",
++        aliases: ["UserPromptTransform", "user_prompt_transform", "userPromptTransform"],
++        traits: (Transform, Ignored, true),
++    },
+     PreToolUse {
+         display: "pre_tool_use",
+         aliases: [
+@@ -193,6 +203,9 @@ pub enum GateKind {
+     Tool,
+     /// Stop decision control (`block`, `continue: false`, `additionalContext`).
+     Stop,
++    /// Message-transform control: a hook may replace the outgoing user
++    /// message with the `{"text": "..."}` written to stdout.
++    Transform,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -454,6 +467,12 @@ pub enum HookPayload {
+         #[serde(skip_serializing_if = "Option::is_none")]
+         prompt: Option<String>,
+     },
++    UserPromptTransform {
++        /// The fully-assembled user message text (including any injected
++        /// `<image_files>` block), exactly as it would be sent to the model.
++        #[serde(skip_serializing_if = "Option::is_none")]
++        prompt: Option<String>,
++    },
+     Notification {
+         #[serde(rename = "notificationType")]
+         notification_type: String,
+@@ -521,7 +540,9 @@ impl HookPayload {
+             // Always a non-empty name, unlike the free-text arms above.
+             Self::StopFailure { error, .. } => return Some(error.as_str()),
+             // Ignored events listed explicitly so a new Tested event can't silently return None.
+-            Self::Stop { .. } | Self::UserPromptSubmit { .. } => return None,
++            Self::Stop { .. }
++            | Self::UserPromptSubmit { .. }
++            | Self::UserPromptTransform { .. } => return None,
+         };
+         Some(value.as_str()).filter(|v| !v.is_empty())
+     }
+@@ -571,6 +592,11 @@ mod tests {
+                 "user_prompt_submit",
+                 HookEventName::UserPromptSubmit,
+             ),
++            (
++                "UserPromptTransform",
++                "user_prompt_transform",
++                HookEventName::UserPromptTransform,
++            ),
+             (
+                 "PermissionDenied",
+                 "permission_denied",
+@@ -612,6 +638,10 @@ mod tests {
+             (HookEventName::StopFailure, "stop_failure"),
+             (HookEventName::Notification, "notification"),
+             (HookEventName::UserPromptSubmit, "user_prompt_submit"),
++            (
++                HookEventName::UserPromptTransform,
++                "user_prompt_transform",
++            ),
+             (HookEventName::PermissionDenied, "permission_denied"),
+             (HookEventName::SubagentStart, "subagent_start"),
+             (HookEventName::SubagentStop, "subagent_stop"),
+diff --git a/crates/codegen/xai-grok-hooks/src/runner/command.rs b/crates/codegen/xai-grok-hooks/src/runner/command.rs
+index 657903a..517bb1b 100644
+--- a/crates/codegen/xai-grok-hooks/src/runner/command.rs
++++ b/crates/codegen/xai-grok-hooks/src/runner/command.rs
+@@ -9,8 +9,8 @@ use crate::event::HookEventEnvelope;
+ use crate::result::{HookDecision, StopHookOutcome};
+ 
+ use super::{
+-    GateHookJson, GateKind, HookRunnerResult, RunContext, StopHookJson, gate_json_to_decision,
+-    stop_json_to_outcome,
++    GateHookJson, GateKind, HookRunnerResult, RunContext, StopHookJson, TransformHookJson,
++    gate_json_to_decision, stop_json_to_outcome, transform_json_to_text,
+ };
+ 
+ /// Maximum bytes to capture from hook stdout or stderr (64 KB).
+@@ -297,6 +297,9 @@ pub async fn run_command_hook(
+                 GateKind::Stop => {
+                     parse_stop_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
+                 }
++                GateKind::Transform => {
++                    parse_transform_result(&stdout, &stderr, exit_code, &spec.name, elapsed)
++                }
+             }
+         }
+     }
+@@ -578,6 +581,44 @@ fn parse_blocking_result(
+     }
+ }
+ 
++/// Parse the result of a `UserPromptTransform` hook from stdout, stderr, and
++/// exit code. Fail-open: any failure (nonzero exit, malformed JSON, empty or
++/// absent `text`) keeps the original message.
++fn parse_transform_result(
++    stdout: &str,
++    stderr: &str,
++    exit_code: i32,
++    hook_name: &str,
++    elapsed: Duration,
++) -> (HookRunnerResult, Duration) {
++    if exit_code != 0 {
++        return (
++            HookRunnerResult::Failed(append_stderr_line(
++                &format!("hook '{hook_name}' failed with exit code {exit_code}"),
++                stderr,
++            )),
++            elapsed,
++        );
++    }
++    if stdout.trim().is_empty() {
++        return (HookRunnerResult::Success, elapsed);
++    }
++    match serde_json::from_str::<TransformHookJson>(stdout.trim()) {
++        Ok(json) => match transform_json_to_text(json) {
++            Some(text) => (HookRunnerResult::Transformed(text), elapsed),
++            None => (HookRunnerResult::Success, elapsed),
++        },
++        Err(e) => {
++            tracing::warn!(
++                hook_name,
++                error = %e,
++                "could not parse transform hook output JSON, keeping original message"
++            );
++            (HookRunnerResult::Success, elapsed)
++        }
++    }
++}
++
+ /// Parse the result of a `Stop`/`SubagentStop` gate hook from stdout, stderr,
+ /// and exit code:
+ ///
+diff --git a/crates/codegen/xai-grok-hooks/src/runner/http.rs b/crates/codegen/xai-grok-hooks/src/runner/http.rs
+index e35e103..ad8e398 100644
+--- a/crates/codegen/xai-grok-hooks/src/runner/http.rs
++++ b/crates/codegen/xai-grok-hooks/src/runner/http.rs
+@@ -285,6 +285,7 @@ pub async fn run_http_hook(
+     let result = match mode {
+         GateKind::Tool => parse_http_blocking_result(&response_text, status, &spec.name),
+         GateKind::Stop => parse_http_stop_result(&response_text, status, &spec.name),
++        GateKind::Transform => parse_http_transform_result(&response_text, status, &spec.name),
+         GateKind::Observe => HookRunnerResult::Success,
+     };
+     (result, elapsed, http_info)
+@@ -321,6 +322,37 @@ fn parse_http_stop_result(
+     }
+ }
+ 
++/// HTTP analogue of `command::parse_transform_result`: a 2xx JSON body
++/// `{"text": "…"}` replaces the user message; an empty or non-JSON body keeps
++/// it; a non-2xx response is a failure (callers fail open).
++fn parse_http_transform_result(
++    response_text: &str,
++    status: reqwest::StatusCode,
++    hook_name: &str,
++) -> HookRunnerResult {
++    if !status.is_success() {
++        return HookRunnerResult::Failed(format!("HTTP status {status}"));
++    }
++    let trimmed = response_text.trim();
++    if trimmed.is_empty() {
++        return HookRunnerResult::Success;
++    }
++    match serde_json::from_str::<super::TransformHookJson>(trimmed) {
++        Ok(json) => match super::transform_json_to_text(json) {
++            Some(text) => HookRunnerResult::Transformed(text),
++            None => HookRunnerResult::Success,
++        },
++        Err(e) => {
++            tracing::warn!(
++                hook_name = %hook_name,
++                error = %e,
++                "could not parse HTTP transform hook response JSON, keeping original message"
++            );
++            HookRunnerResult::Success
++        }
++    }
++}
++
+ /// Parse an HTTP blocking hook response, the analogue of
+ /// `command::parse_blocking_result`.
+ fn parse_http_blocking_result(
+diff --git a/crates/codegen/xai-grok-hooks/src/runner/mod.rs b/crates/codegen/xai-grok-hooks/src/runner/mod.rs
+index 6abec33..6cc2a4c 100644
+--- a/crates/codegen/xai-grok-hooks/src/runner/mod.rs
++++ b/crates/codegen/xai-grok-hooks/src/runner/mod.rs
+@@ -25,6 +25,8 @@ pub struct RunContext<'a> {
+ pub enum HookRunnerResult {
+     Decision(HookDecision),
+     Stop(StopHookOutcome),
++    /// Message-transform hook replaced the outgoing text with this value.
++    Transformed(String),
+     Success,
+     /// Failed: the caller fails open.
+     Failed(String),
+@@ -66,6 +68,22 @@ pub(crate) fn gate_json_to_decision(
+     }
+ }
+ 
++/// JSON from `UserPromptTransform` gate hooks: `{"text": "…"}`.
++/// The `text` replaces the outgoing user message; empty or absent keeps it.
++#[derive(Debug, Default, Deserialize)]
++pub(crate) struct TransformHookJson {
++    #[serde(default)]
++    pub text: Option<String>,
++}
++
++/// Interpret a [`TransformHookJson`]: a non-empty, trimmed `text` replaces the
++/// user message; otherwise the message is kept as-is.
++pub(crate) fn transform_json_to_text(json: TransformHookJson) -> Option<String> {
++    json.text
++        .map(|text| text.trim().to_string())
++        .filter(|text| !text.is_empty())
++}
++
+ /// JSON from `Stop`/`SubagentStop` gate hooks. All fields optional; one output
+ /// can combine several signals.
+ #[derive(Debug, Default, Deserialize)]
+@@ -140,3 +158,26 @@ pub async fn run_hook(
+         crate::config::HandlerType::Http => http::run_http_hook(spec, envelope, ctx, mode).await,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn transform_json_to_text_returns_trimmed_text() {
++        let json = TransformHookJson {
++            text: Some("  hint text  ".to_string()),
++        };
++        assert_eq!(
++            transform_json_to_text(json).as_deref(),
++            Some("hint text")
++        );
++    }
++
++    #[test]
++    fn transform_json_to_text_none_when_empty_or_whitespace() {
++        for text in [None, Some("".to_string()), Some("   \n  ".to_string())] {
++            assert_eq!(transform_json_to_text(TransformHookJson { text }), None);
++        }
++    }
++}
+diff --git a/crates/codegen/xai-grok-shell/src/extensions/hooks.rs b/crates/codegen/xai-grok-shell/src/extensions/hooks.rs
+index 5674df3..662016c 100644
+--- a/crates/codegen/xai-grok-shell/src/extensions/hooks.rs
++++ b/crates/codegen/xai-grok-shell/src/extensions/hooks.rs
+@@ -37,6 +37,7 @@ pub(crate) fn hook_spec_to_info(spec: &xai_grok_hooks::config::HookSpec) -> Hook
+         HookEventName::PermissionDenied => HookEvent::PermissionDenied,
+         // User / notification
+         HookEventName::UserPromptSubmit => HookEvent::UserPromptSubmit,
++        HookEventName::UserPromptTransform => HookEvent::UserPromptTransform,
+         HookEventName::Notification => HookEvent::Notification,
+         // Subagent
+         HookEventName::SubagentStart => HookEvent::SubagentStart,
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session.rs b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
+index f705e9e..2ffdd6f 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session.rs
+@@ -174,6 +174,9 @@ pub(crate) use goal_support::*;
+ #[path = "acp_session_impl/hook_dispatch.rs"]
+ mod hook_dispatch;
+ use hook_dispatch::*;
++#[path = "acp_session_impl/user_prompt_transform.rs"]
++mod user_prompt_transform;
++use user_prompt_transform::*;
+ #[path = "acp_session_impl/stop_gate.rs"]
+ mod stop_gate;
+ pub use stop_gate::MAX_STOP_HOOK_CONTINUATIONS_PER_TURN;
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
+index a1fd82b..e091d62 100644
+--- a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs
+@@ -736,6 +736,11 @@ impl SessionActor {
+                     .data(format!("failed to save user images to assets dir: {e}"))
+             })?
+         };
++        // 消息写入会话之前，允许 UserPromptTransform 钩子链替换用户消息文本
++        // （如注入"请调用 vision 工具"提示；任何失败保持原消息，fail-open）。
++        let user_message = self
++            .dispatch_user_prompt_transform(user_message, Some(prompt_id))
++            .await;
+         let attached_image_refs = if self.is_cursor_harness() {
+             Vec::new()
+         } else {
+diff --git a/crates/codegen/xai-grok-shell/src/session/acp_session_impl/user_prompt_transform.rs b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/user_prompt_transform.rs
+new file mode 100644
+index 0000000..28815d9
+--- /dev/null
++++ b/crates/codegen/xai-grok-shell/src/session/acp_session_impl/user_prompt_transform.rs
+@@ -0,0 +1,51 @@
++//! `UserPromptTransform` 消息变换钩子的派发入口。
++//!
++//! 在用户消息组装完成（图片已持久化、`<image_files>` 块已注入）之后、
++//! 消息写入会话之前调用。把完整用户消息文本交给所有匹配的
++//! `UserPromptTransform` 钩子，钩子可通过 stdout 输出 `{"text": "..."}`
++//! 替换该消息（多个钩子链式应用）。任何失败都保持原消息（fail-open），
++//! 与 grok 其余 hooks 的安全语义一致。
++//!
++//! 对应 opencode 插件的 `experimental.chat.messages.transform` 钩子，
++//! 让"消息发送前强制注入"类插件（如 vision-attachment-bridge）可以
++//! 以 grok 插件（hooks/hooks.json + 任意语言脚本）的方式实现。
++
++use xai_grok_hooks::event::{HookEventName, HookPayload};
++
++use super::SessionActor;
++
++impl SessionActor {
++    /// 运行 `UserPromptTransform` 钩子链并返回（可能被替换的）用户消息文本。
++    ///
++    /// - 无匹配钩子 / 全部钩子未变换：原样返回 `prompt`。
++    /// - 钩子失败（超时、崩溃、输出非法）：fail-open，保持当前文本。
++    pub(super) async fn dispatch_user_prompt_transform(
++        &self,
++        prompt: String,
++        prompt_id: Option<&str>,
++    ) -> String {
++        if !self.hook_event_active(HookEventName::UserPromptTransform) {
++            return prompt;
++        }
++        // 先通知 client（observe-only），再运行磁盘注册表上的钩子链。
++        let envelope = self.fire_hook(
++            HookEventName::UserPromptTransform,
++            prompt_id.map(|s| s.to_string()),
++            HookPayload::UserPromptTransform {
++                prompt: Some(prompt.clone()),
++            },
++        );
++        let Some(registry) = self.hook_registry.borrow().clone() else {
++            return prompt;
++        };
++        let ctx = self.hook_run_ctx();
++        match xai_grok_hooks::dispatcher::dispatch_user_prompt_transform(
++            &registry, &envelope, &ctx,
++        )
++        .await
++        {
++            Some(transformed) => transformed,
++            None => prompt,
++        }
++    }
++}
+diff --git a/crates/codegen/xai-hooks-plugins-types/src/lib.rs b/crates/codegen/xai-hooks-plugins-types/src/lib.rs
+index 44cf24f..7e8adbe 100644
+--- a/crates/codegen/xai-hooks-plugins-types/src/lib.rs
++++ b/crates/codegen/xai-hooks-plugins-types/src/lib.rs
+@@ -94,6 +94,8 @@ pub enum HookEvent {
+     PermissionDenied,
+     // User / notification
+     UserPromptSubmit,
++    /// Message-transform gate: a hook may replace the outgoing user message.
++    UserPromptTransform,
+     Notification,
+     // Subagent
+     SubagentStart,
+@@ -115,6 +117,7 @@ impl std::fmt::Display for HookEvent {
+             Self::StopFailure => write!(f, "Stop Failure"),
+             Self::Notification => write!(f, "Notification"),
+             Self::UserPromptSubmit => write!(f, "Prompt Submit"),
++            Self::UserPromptTransform => write!(f, "Prompt Transform"),
+             Self::PermissionDenied => write!(f, "Permission Denied"),
+             Self::SubagentStart => write!(f, "Subagent Start"),
+             Self::SubagentStop => write!(f, "Subagent Stop"),

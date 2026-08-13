@@ -3752,6 +3752,9 @@ struct DefaultModelJson {
     supported_in_api: bool,
     #[serde(default)]
     supports_backend_search: bool,
+    /// Whether the model accepts image content blocks; defaults to `true`.
+    #[serde(default = "default_true")]
+    supports_vision: bool,
     #[serde(default)]
     compactions_remaining: Option<CompactionsRemaining>,
     #[serde(default)]
@@ -3820,6 +3823,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 compaction_at_tokens: m.compaction_at_tokens,
                 show_model_fingerprint: m.show_model_fingerprint,
                 stream_tool_calls: None,
+                supports_vision: m.supports_vision,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3940,6 +3944,14 @@ pub struct ModelEntryConfig {
     /// flag should leave this unset to avoid request errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Whether the model endpoint accepts image content blocks
+    /// (`image_url` / base64 data URIs). When `false`, the sampler strips
+    /// image parts from requests to this model (text-only proxies like the
+    /// CPA adapter reject them with a 400 deserialize error); text and
+    /// `<image_files>` path blocks survive for vision-bridge hooks/tools.
+    /// Defaults to `true` — omit for vision-capable models.
+    #[serde(default = "default_true")]
+    pub supports_vision: bool,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to
     /// the all-disabled state via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "is_default_laziness_detector")]
@@ -4011,6 +4023,10 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    /// When `false`, the sampler strips image content blocks from requests
+    /// to this model (text-only endpoints like the CPA adapter reject
+    /// `image_url` with a 400 deserialize error). Defaults to `true`.
+    pub supports_vision: Option<bool>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -4105,6 +4121,9 @@ impl ConfigModelOverride {
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
         }
+        if let Some(v) = self.supports_vision {
+            entry.info.supports_vision = v;
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4192,6 +4211,11 @@ pub struct ModelInfo {
     pub show_model_fingerprint: bool,
     /// When `Some(true)`, the sampler injects `stream_tool_calls: true`
     pub stream_tool_calls: Option<bool>,
+    /// Whether the model endpoint accepts image content blocks. `false`
+    /// makes the sampler strip image parts from outgoing requests (see
+    /// `SamplerConfig::supports_vision`). Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub supports_vision: bool,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to
     /// the all-disabled state — the feature is per-model opt-in with a
     /// second-step `max_nudges_per_session > 0` opt-in for actually
@@ -4235,6 +4259,7 @@ impl ModelInfo {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            supports_vision: true,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -4272,6 +4297,7 @@ impl ModelInfo {
             compaction_at_tokens: entry.compaction_at_tokens,
             show_model_fingerprint: entry.show_model_fingerprint,
             stream_tool_calls: entry.stream_tool_calls,
+            supports_vision: entry.supports_vision,
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -5028,6 +5054,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
+                supports_vision: true,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             api_key: Some(bearer),
@@ -5185,6 +5212,7 @@ pub(crate) fn sampling_config_for_model(
         attribution_callback: None,
         bearer_resolver: None,
         supports_backend_search: info.supports_backend_search,
+        supports_vision: info.supports_vision,
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,
@@ -5264,6 +5292,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            supports_vision: true,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         api_key: None,

@@ -285,6 +285,7 @@ pub async fn run_http_hook(
     let result = match mode {
         GateKind::Tool => parse_http_blocking_result(&response_text, status, &spec.name),
         GateKind::Stop => parse_http_stop_result(&response_text, status, &spec.name),
+        GateKind::Transform => parse_http_transform_result(&response_text, status, &spec.name),
         GateKind::Observe => HookRunnerResult::Success,
     };
     (result, elapsed, http_info)
@@ -317,6 +318,37 @@ fn parse_http_stop_result(
                 "could not parse HTTP stop hook response JSON, treating as allow-stop"
             );
             HookRunnerResult::Stop(StopHookOutcome::default())
+        }
+    }
+}
+
+/// HTTP analogue of `command::parse_transform_result`: a 2xx JSON body
+/// `{"text": "…"}` replaces the user message; an empty or non-JSON body keeps
+/// it; a non-2xx response is a failure (callers fail open).
+fn parse_http_transform_result(
+    response_text: &str,
+    status: reqwest::StatusCode,
+    hook_name: &str,
+) -> HookRunnerResult {
+    if !status.is_success() {
+        return HookRunnerResult::Failed(format!("HTTP status {status}"));
+    }
+    let trimmed = response_text.trim();
+    if trimmed.is_empty() {
+        return HookRunnerResult::Success;
+    }
+    match serde_json::from_str::<super::TransformHookJson>(trimmed) {
+        Ok(json) => match super::transform_json_to_text(json) {
+            Some(text) => HookRunnerResult::Transformed(text),
+            None => HookRunnerResult::Success,
+        },
+        Err(e) => {
+            tracing::warn!(
+                hook_name = %hook_name,
+                error = %e,
+                "could not parse HTTP transform hook response JSON, keeping original message"
+            );
+            HookRunnerResult::Success
         }
     }
 }

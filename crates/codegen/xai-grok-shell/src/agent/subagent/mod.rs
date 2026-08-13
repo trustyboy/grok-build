@@ -792,6 +792,9 @@ async fn read_parent_sampling_config(
             let supports_backend_search = ctx
                 .models_manager
                 .model_supports_backend_search(catalog_model_id.0.as_ref());
+            let supports_vision = ctx
+                .models_manager
+                .model_supports_vision(catalog_model_id.0.as_ref());
             let extra_response_includes = crate::agent::config::response_include_extensions(
                 supports_backend_search,
                 &cfg.api_backend,
@@ -828,6 +831,7 @@ async fn read_parent_sampling_config(
                     inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url)
                 },
                 supports_backend_search,
+                supports_vision,
                 compactions_remaining: ctx
                     .models_manager
                     .model_compactions_remaining(catalog_model_id.0.as_ref()),
