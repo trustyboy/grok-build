@@ -16,12 +16,18 @@ fn resolve_bundled_rg() -> std::io::Result<PathBuf> {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    let p = crate::util::grok_home().join("vendor").join(concat!(
+    let file_name = concat!(
         "rg-",
         env!("GROK_TOOLS_RG_VER"),
         "-",
         env!("GROK_TOOLS_RG_TARGET")
-    ));
+    );
+    // Windows 的 CreateProcessW 不会为显式程序路径补扩展名，解出的文件必须自带
+    // `.exe` 才能执行；缺了它只会得到「program not found」，且无从分辨是没打包
+    // 还是没装 ripgrep。Unix 侧靠 mode 0o755 赋予执行权限，无需扩展名。
+    #[cfg(windows)]
+    let file_name = format!("{file_name}.exe");
+    let p = crate::util::grok_home().join("vendor").join(file_name);
     if !p.exists() {
         fs::create_dir_all(p.parent().unwrap())?;
         fs::write(&p, RG_BYTES)?;

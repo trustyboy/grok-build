@@ -1,0 +1,154 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index e0a21982d49a1cda2b2e9689d2b1d0e0277e4eff..0f7baf1329b34f69c482883ceb5e4cc5e11d2952 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -39,6 +39,21 @@
+ - 不要修改 `crates/build/xai-proto-build` 来处理 Windows 的 `/dev/stdout` 与 `/dev/null` 问题；兼容逻辑应保持在独立的 `tools/windows-protoc` 模块内，以降低合并上游版本时的冲突。
+ - 构建脚本只在子进程期间设置 `PROTOC`，执行完成后会恢复原来的环境变量。
+ 
++## Windows ripgrep 打包
++
++- `grep` 工具外挂 ripgrep 子进程。Windows 上 `build.rs` 不会自动打包（官方只发 `.zip`，无解压路径），产物默认依赖目标机器 PATH 中的 `rg`，缺失时只报 `program not found`，表现为「搜索永远无结果」。
++- `build-release.ps1` 会自动发现本机 `rg` 并通过 `GROK_TOOLS_BUNDLE_RG_PATH` 打包进产物，使 exe 自包含、可直接复制到其他 Windows 机器。构建机需先 `winget install BurntSushi.ripgrep.MSVC`；找不到时只警告不阻断构建。
++- winget 的 `rg.exe` 是 0 字节符号链接，必须解析到真实文件后再打包。
++- `resolve_bundled_rg()` 在 Windows 下必须给解出的文件补 `.exe` 后缀，否则 `CreateProcessW` 无法执行。
++- 排查 grep 异常时，先看会话 `updates.jsonl` 中 `rawOutput.stderr` 的字节数组 —— 解出 `program not found` 即为此问题。
++
++## 文件编码
++
++- 非 UTF-8 文本文件（GBK/Big5 等）的读写由 `computer/transcoding_fs.rs` 的装饰器在 fs 抽象层统一处理，工具层无需感知。设计见 `docs/非UTF8文件编码支持实现计划.md`，合并见同名合并指南。
++- 生产接入点只有 `registry/types.rs` 一处，若被改回 `FileSystem(ctx.fs)`，功能会**静默失效**（不报错、不崩溃，只是退回乱码行为）。
++- 弱样本（非 ASCII 字节 < 64）时按 `GROK_FILE_ENCODING` 或系统 ANSI 代码页判定编码，可用该环境变量覆盖。
++- 排查文件乱码用 `cargo test --release -p xai-text-codec --test diagnose -- --nocapture`（需设 `DIAG_FILE`）。
++
+ ## 上游合并
+ 
+ - Windows 构建辅助模块应与业务代码和主题移植保持独立。
+diff --git a/crates/codegen/xai-grok-tools/src/implementations/grok_build/grep/ripgrep.rs b/crates/codegen/xai-grok-tools/src/implementations/grok_build/grep/ripgrep.rs
+index eecb8dceb2e1851680f6b5720a049cbc16da96ee..230b954ad311cb972fe51123d440f747a7158c0d 100644
+--- a/crates/codegen/xai-grok-tools/src/implementations/grok_build/grep/ripgrep.rs
++++ b/crates/codegen/xai-grok-tools/src/implementations/grok_build/grep/ripgrep.rs
+@@ -16,12 +16,18 @@ fn resolve_bundled_rg() -> std::io::Result<PathBuf> {
+     use std::fs;
+     #[cfg(unix)]
+     use std::os::unix::fs::PermissionsExt;
+-    let p = crate::util::grok_home().join("vendor").join(concat!(
++    let file_name = concat!(
+         "rg-",
+         env!("GROK_TOOLS_RG_VER"),
+         "-",
+         env!("GROK_TOOLS_RG_TARGET")
+-    ));
++    );
++    // Windows 的 CreateProcessW 不会为显式程序路径补扩展名，解出的文件必须自带
++    // `.exe` 才能执行；缺了它只会得到「program not found」，且无从分辨是没打包
++    // 还是没装 ripgrep。Unix 侧靠 mode 0o755 赋予执行权限，无需扩展名。
++    #[cfg(windows)]
++    let file_name = format!("{file_name}.exe");
++    let p = crate::util::grok_home().join("vendor").join(file_name);
+     if !p.exists() {
+         fs::create_dir_all(p.parent().unwrap())?;
+         fs::write(&p, RG_BYTES)?;
+diff --git a/tools/windows-protoc/README.md b/tools/windows-protoc/README.md
+index 36d79a93b295d5d0505e1538030aeca0812d7b74..4caefe1dd0861b959a8315641a5477871b12eb39 100644
+--- a/tools/windows-protoc/README.md
++++ b/tools/windows-protoc/README.md
+@@ -44,6 +44,34 @@
+ 
+ 脚本只在构建进程期间设置 `PROTOC`，完成后恢复调用前的环境变量。持久目录中的压缩包、官方编译器、include 文件和 Wrapper 均不会删除。
+ 
++## ripgrep 打包
++
++`build-release.ps1` 还会自动发现本机 ripgrep 并打包进产物，使 `grep` 工具自包含。
++
++### 为什么需要
++
++grok 的 `grep` 工具是外挂 ripgrep 子进程实现的。Linux/macOS 上 `build.rs` 会自动下载 ripgrep 的 `.tar.gz` 并嵌入二进制，用户无感；但 ripgrep 官方在 Windows 上只发 `.zip`，构建脚本没有解压路径，因此 `build.rs` 直接跳过打包（见其中 `Skip auto-bundling on Windows` 注释），产物退化为依赖目标机器 PATH 中的 `rg`。
++
++缺失时 grep 只会返回 `program not found`，模型看到的是「搜索无结果」，排查成本很高。
++
++### 行为
++
++脚本在构建前查找 `rg`，找到就设 `GROK_TOOLS_BUNDLE_RG_PATH`（`build.rs` 在显式指定该变量时**不会**跳过 Windows 打包），并在构建结束后恢复环境变量。
++
++winget 安装的 `rg.exe` 是长度为 0 的命令别名符号链接，脚本会 `ResolveLinkTarget` 解析到真实可执行文件 —— 否则打包进去的会是一个空文件。
++
++找不到 ripgrep 时**不会阻断构建**，只打印警告，产物仍可用但 grep 依赖目标机器 PATH。安装：
++
++```powershell
++winget install BurntSushi.ripgrep.MSVC
++```
++
++### 配套的运行时修复
++
++`implementations/grok_build/grep/ripgrep.rs` 的 `resolve_bundled_rg()` 原本把嵌入的二进制解到 `~/.grok/vendor/rg-<版本>-<目标>`，**没有 `.exe` 后缀**。Windows 的 `CreateProcessW` 不会为显式程序路径补扩展名，这样解出的文件无法执行。该函数已用 `#[cfg(windows)]` 补上后缀，Unix 侧行为不变（仍靠 mode 0o755）。
++
++打包生效后，产物 exe 复制到任何 Windows 机器都能直接使用 grep，无需逐台安装 ripgrep。体积增加约 4 MB。
++
+ ## 手动使用
+ 
+ 需要运行其他 Cargo 命令时，可以在当前 PowerShell 会话中设置：
+diff --git a/tools/windows-protoc/build-release.ps1 b/tools/windows-protoc/build-release.ps1
+index 2982446e4c963e2178e1d6b04660016546da2daa..767569cae726498c4486ef8e9444cd96d4bbe574 100644
+--- a/tools/windows-protoc/build-release.ps1
++++ b/tools/windows-protoc/build-release.ps1
+@@ -7,9 +7,33 @@ param(
+ $ErrorActionPreference = 'Stop'
+ Set-StrictMode -Version Latest
+ 
++# 定位可打包进二进制的 ripgrep。
++#
++# Windows 上 build.rs 不会自动下载 ripgrep（官方只发 .zip，构建脚本没有解压路径），
++# 只有显式提供 GROK_TOOLS_BUNDLE_RG_PATH 才会打包。不打包时 grep 工具退化为依赖
++# 目标机器 PATH 中的 rg，缺失时只报 "program not found"，排查成本很高。
++#
++# 因此这里自动发现本机 ripgrep 并打包，让产物自包含：构建一次，exe 复制到任何
++# Windows 机器都能用 grep，无需逐台安装 ripgrep。
++function Resolve-RipgrepPath {
++    $command = Get-Command 'rg' -CommandType Application -ErrorAction SilentlyContinue |
++        Select-Object -First 1
++    if (-not $command) { return $null }
++
++    $item = Get-Item -LiteralPath $command.Source
++    # winget 安装的 rg 是「命令别名」符号链接（长度为 0），必须解析到真实可执行文件，
++    # 否则打包进去的会是一个空文件。
++    if ($item.LinkType) {
++        $target = $item.ResolveLinkTarget($true)
++        if ($target) { return $target.FullName }
++    }
++    return $item.FullName
++}
++
+ $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+ $SetupScript = Join-Path $PSScriptRoot 'setup.ps1'
+ $PreviousProtoc = [Environment]::GetEnvironmentVariable('PROTOC', 'Process')
++$PreviousBundleRg = [Environment]::GetEnvironmentVariable('GROK_TOOLS_BUNDLE_RG_PATH', 'Process')
+ $WrapperPath = (& $SetupScript | Select-Object -Last 1)
+ 
+ if (-not (Test-Path -LiteralPath $WrapperPath -PathType Leaf)) {
+@@ -18,6 +42,18 @@ if (-not (Test-Path -LiteralPath $WrapperPath -PathType Leaf)) {
+ 
+ try {
+     [Environment]::SetEnvironmentVariable('PROTOC', $WrapperPath, 'Process')
++
++    # 找不到 ripgrep 不阻断构建，只是产物会退回依赖目标机器 PATH。
++    $RipgrepPath = Resolve-RipgrepPath
++    if ($RipgrepPath) {
++        [Environment]::SetEnvironmentVariable('GROK_TOOLS_BUNDLE_RG_PATH', $RipgrepPath, 'Process')
++        Write-Host "将打包 ripgrep：$RipgrepPath"
++    }
++    else {
++        Write-Warning '未找到 ripgrep，产物的 grep 工具将依赖目标机器 PATH 中的 rg。'
++        Write-Warning '建议先安装后再构建：winget install BurntSushi.ripgrep.MSVC'
++    }
++
+     Push-Location -LiteralPath $RepositoryRoot
+     try {
+         & cargo build -p xai-grok-pager-bin --release @CargoArguments
+@@ -31,5 +67,6 @@ try {
+ }
+ finally {
+     [Environment]::SetEnvironmentVariable('PROTOC', $PreviousProtoc, 'Process')
++    [Environment]::SetEnvironmentVariable('GROK_TOOLS_BUNDLE_RG_PATH', $PreviousBundleRg, 'Process')
+ }
+ 
