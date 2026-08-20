@@ -1,0 +1,14 @@
+[package]
+license = "Apache-2.0"
+name = "xai-text-codec"
+version = "0.1.0"
+edition.workspace = true
+description = "Character encoding detection and lossless transcoding for non-UTF-8 text files (GBK, Big5, Shift_JIS, ...)."
+
+[dependencies]
+chardetng = { workspace = true }
+encoding_rs = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -688,6 +688,27 @@ enum GrepStep {
     Early(GrepSearchOutput),
 }
 
+/// 若搜索目标是单个非 UTF-8 文本文件，返回它对应的 ripgrep `--encoding` 标签。
+///
+/// ripgrep 的 `--encoding` 对本次搜索的**所有**文件生效（"on all files searched"），
+/// 因此只有在目标明确是单个文件时才能安全指定：对目录使用会把其中的 UTF-8 文件也
+/// 按该编码解释，反而制造新的乱码。
+///
+/// 目录搜索的混合编码是 ripgrep 的固有限制，此处保持默认行为 —— 文件路径与命中
+/// 判断仍然准确，只有匹配行的内容对非 UTF-8 文件可能显示为乱码。
+///
+/// 目标是目录时只付出一次 `metadata` 调用的代价，不读取任何文件内容。
+async fn single_file_encoding_label(path: &std::path::Path) -> Option<String> {
+    if !tokio::fs::metadata(path).await.ok()?.is_file() {
+        return None;
+    }
+    let bytes = tokio::fs::read(path).await.ok()?;
+    let decoded = xai_text_codec::decode(&bytes).ok()?;
+    // 名称需转成 WHATWG 小写 label（GBK → gbk、Shift_JIS → shift_jis）供 ripgrep 识别。
+    (decoded.encoding != encoding_rs::UTF_8)
+        .then(|| decoded.encoding.name().to_ascii_lowercase())
+}
+
 /// Resolve resources, build the ripgrep command, and spawn it; `Early` for
 /// pre-read short-circuits. Shared by `run` and `execute`.
 async fn prepare_grep(
@@ -825,6 +846,11 @@ async fn prepare_grep(
     cmd.arg("-e").arg(&input.pattern);
     cmd.arg(workdir.to_string_lossy().as_ref());
     cmd.arg("--max-filesize").arg("5M");
+
+    // 单文件搜索时透传原文件编码，使匹配结果与 read_file 看到的内容保持一致。
+    if let Some(label) = single_file_encoding_label(&workdir).await {
+        cmd.arg("--encoding").arg(label);
+    }
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     crate::util::detach_search_command(&mut cmd);

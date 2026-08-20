@@ -995,7 +995,11 @@ impl ToolRegistryBuilder {
         let mut tools = Vec::new();
         let mut resources = Resources::new();
         resources.insert(crate::types::resources::Terminal(ctx.backend));
-        resources.insert(crate::types::resources::FileSystem(ctx.fs));
+        // 包一层转码装饰器，让所有工具集透明地支持 GBK 等非 UTF-8 文本文件。
+        // 详见 `computer::transcoding_fs`：非文本或无法可靠判定编码的内容一律原样透传。
+        resources.insert(crate::types::resources::FileSystem(std::sync::Arc::new(
+            crate::computer::transcoding_fs::TranscodingFs::new(ctx.fs),
+        )));
         let cwd = ctx.cwd;
         resources.insert(crate::types::resources::Cwd(cwd.clone()));
         resources.insert(crate::types::resources::SessionFolder(ctx.session_folder));

@@ -77,6 +77,7 @@ members = [
     "crates/codegen/xai-ratatui-textarea",
     "crates/codegen/xai-sqlite-journal",
     "crates/codegen/xai-system-power",
+    "crates/codegen/xai-text-codec",
     "crates/codegen/xai-token-estimation",
     "crates/codegen/xai-tracing-macros",
     "crates/codegen/xai-tty-utils",
@@ -128,6 +129,7 @@ base64 = "0.22"
 blake3 = "1"
 bytes = { version = "1", features = ["serde"] }
 camino = "1.1.10"
+chardetng = "1.0.0"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = { version = "4" }
@@ -348,6 +350,7 @@ xai-ratatui-textarea = { path = "crates/codegen/xai-ratatui-textarea" }
 xai-sqlite-journal = { path = "crates/codegen/xai-sqlite-journal" }
 xai-system-power = { path = "crates/codegen/xai-system-power" }
 xai-test-utils = { path = "crates/common/xai-test-utils" }
+xai-text-codec = { path = "crates/codegen/xai-text-codec" }
 xai-token-estimation = { path = "crates/codegen/xai-token-estimation" }
 xai-tool-protocol = { path = "crates/common/xai-tool-protocol" }
 xai-tool-runtime = { path = "crates/common/xai-tool-runtime" }
