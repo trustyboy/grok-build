@@ -1,32 +1,34 @@
-//! Test-only helpers shared across `xai-grok-hooks` unit + integration tests.
-//!
-//! This module is gated on `#[cfg(test)]` and is exported as `pub(crate)`
-//! so any in-crate `#[cfg(test)] mod tests` can use it. Integration tests
-//! under `tests/` cannot reach it; for those, copy or re-implement the
-//! handful of functions here that they need (the only one currently used
-//! by integration tests is unrelated).
+//! This module is gated on `#[cfg(test)]` and is exported as `pub(crate)` so any in-crate `#[cfg(test)] mod tests` can use it.
+//! Integration tests under `tests/` cannot reach it; for those, copy or re-implement the handful of functions here that they need.
 
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-/// Run `f` with the env var `name` set to `value` (or unset if `value`
-/// is `None`), restoring the previous value on return.
-///
-/// Uses `catch_unwind` so a panic inside `f` does not leak the env var
-/// into the rest of the test process.
-///
-/// `cargo test` runs tests in parallel by default. Process env vars are
-/// process-global, so callers should pick uniquely-named vars to avoid
-/// inter-test races. The lifecycle here (save -> set -> run -> restore)
-/// is panic-safe but not race-safe.
-///
-/// **FOLLOW-UP**: the helper does not
-/// enforce the unique-name discipline -- a future contributor passing
-/// a common name like `HOME` could trigger flaky tests. The standard
-/// fix is to add `serial_test` as a dev-dep and decorate every
-/// env-touching test with `#[serial(env_var)]` so the test runner
-/// serialises them. For now the unique-name
-/// convention plus `catch_unwind` restoration is sufficient for the
-/// tests that ship today.
+/// 返回当前平台真实存在的临时目录，避免原生 Windows 的测试在 `/tmp` 启动失败。
+pub(crate) fn workspace_root() -> &'static str {
+    static ROOT: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| std::env::temp_dir().to_string_lossy().into_owned());
+    ROOT.as_str()
+}
+
+/// 按实际测试 shell 选择脚本，保持 POSIX 与 PowerShell 下的断言行为一致。
+pub(crate) fn shell_script(posix: &'static str, powershell: &'static str) -> &'static str {
+    #[cfg(not(unix))]
+    {
+        use xai_grok_config::shell::{WindowsShell, detect_windows_shell};
+        if matches!(
+            detect_windows_shell(),
+            WindowsShell::Pwsh | WindowsShell::PowerShell
+        ) {
+            return powershell;
+        }
+    }
+    #[cfg(unix)]
+    let _ = powershell;
+    posix
+}
+
+/// Run `f` with the env var `name` set to `value` (or unset if `value` is `None`), restoring the previous value on return.
+/// Process env vars are process-global, so callers should pick uniquely-named vars to avoid inter-test races; nothing here enforces that.
 pub(crate) fn with_env_var<R>(name: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
     let previous = std::env::var_os(name);
     // SAFETY: env-var writes are not thread-safe. Callers use uniquely

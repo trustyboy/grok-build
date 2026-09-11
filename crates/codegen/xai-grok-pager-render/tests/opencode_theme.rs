@@ -8,6 +8,11 @@ use xai_grok_pager_render::theme::{Theme, ThemeKind};
 #[test]
 fn opencode_theme_public_contract() {
     assert_eq!(ThemeKind::from_name("opencode"), Some(ThemeKind::OpenCode));
+    assert_eq!(ThemeKind::from_name("open-code"), Some(ThemeKind::OpenCode));
+    assert_eq!(ThemeKind::from_name("oc"), Some(ThemeKind::OpenCode));
+    assert!(ThemeKind::selectable().contains(&ThemeKind::OpenCode));
+    assert!(ThemeKind::available().contains(&ThemeKind::OpenCode));
+    assert_ne!(ThemeKind::OpenCode as u8, ThemeKind::Terminal as u8);
 
     let theme = Theme::opencode();
     assert_eq!(theme.bg_base, Color::Rgb(0x0a, 0x0a, 0x0a));
@@ -27,6 +32,7 @@ fn opencode_syntax_theme_loads() {
 #[test]
 fn opencode_markdown_dispatches_to_dedicated_style() {
     cache::set(ThemeKind::OpenCode);
+    assert_eq!(cache::current_kind(), ThemeKind::OpenCode);
     let style = md_style::style();
     cache::set(ThemeKind::GrokNight);
 

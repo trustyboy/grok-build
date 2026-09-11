@@ -33,7 +33,7 @@ impl SessionActor {
         image_paths: &[String],
         supports_vision: bool,
     ) -> String {
-        if !self.hook_event_active(HookEventName::UserPromptTransform) {
+        if !self.may_have_hooks_for(HookEventName::UserPromptTransform) {
             return prompt;
         }
         let images = (!user_images.is_empty()).then(|| {
@@ -61,10 +61,8 @@ impl SessionActor {
             return prompt;
         };
         let ctx = self.hook_run_ctx();
-        match xai_grok_hooks::dispatcher::dispatch_user_prompt_transform(
-            &registry, &envelope, &ctx,
-        )
-        .await
+        match xai_grok_hooks::dispatcher::dispatch_user_prompt_transform(&registry, &envelope, &ctx)
+            .await
         {
             Some(transformed) => transformed,
             None => prompt,
