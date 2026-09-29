@@ -11,6 +11,29 @@ use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
 use xai_grok_shell::session::unified_list::SessionKind;
+/// 请求发出时的会话与模型快照，防止旧回包覆盖新状态。
+#[derive(Debug, Clone)]
+pub struct ModelRequestContext {
+    /// 发起请求的界面。
+    pub agent_id: AgentId,
+    /// 请求绑定的会话。
+    pub session_id: acp::SessionId,
+    /// 服务端提交前必须仍为此模型。
+    pub expected_model_id: acp::ModelId,
+    /// 用指针身份区分请求，重连后不会重复。
+    pub token: std::sync::Arc<()>,
+}
+
+/// 服务端返回的有效视觉状态。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportVisionState {
+    /// 状态所属的模型。
+    pub model_id: String,
+    /// 下一轮是否启用原生视觉。
+    pub enabled: bool,
+}
+
 /// Typed error for model switch failures.
 /// Replaces the raw `String` in `TaskResult::SwitchModelComplete` so dispatch can match on the variant instead of parsing strings.
 #[derive(Debug, Clone)]
@@ -387,6 +410,14 @@ pub enum Action {
     SwitchModel {
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
+    },
+    /// 精确发现未知模型并切换，不保存默认模型。
+    DiscoverAndSwitchModel {
+        model_id: acp::ModelId,
+    },
+    /// 查询或修改当前会话当前模型的视觉输入能力。
+    SupportVision {
+        enabled: Option<bool>,
     },
     /// Cancel the currently running turn.
     CancelTurn,
@@ -1564,6 +1595,16 @@ pub enum Effect {
         /// Threaded through to `SwitchModelComplete` so `IncompatibleAgent` can roll back.
         prev_model_id: Option<acp::ModelId>,
     },
+    /// 异步发现并切换精确模型 ID。
+    DiscoverAndSwitchModel {
+        request: ModelRequestContext,
+        model_id: acp::ModelId,
+    },
+    /// 查询或修改服务端的会话视觉覆盖值。
+    SupportVision {
+        request: ModelRequestContext,
+        enabled: Option<bool>,
+    },
     /// Fetch changelog from CDN (both markdown and structured JSON).
     /// Runs off the render path via `spawn_blocking`.
     /// Result is cached on `AppView` so `/release-notes` and the welcome screen share it.
@@ -2564,6 +2605,17 @@ pub enum TaskResult {
         result: Result<(), SwitchModelError>,
         /// Forwarded from `Effect::SwitchModel.prev_model_id` for rollback on `IncompatibleAgent`.
         prev_model_id: Option<acp::ModelId>,
+    },
+    /// 发现请求完成；成功响应包含最新目录和当前模型。
+    DiscoverAndSwitchModelComplete {
+        request: ModelRequestContext,
+        model_id: acp::ModelId,
+        result: Result<acp::SessionModelState, String>,
+    },
+    /// 视觉查询或修改完成。
+    SupportVisionComplete {
+        request: ModelRequestContext,
+        result: Result<SupportVisionState, String>,
     },
     /// Changelog fetched from CDN (both formats).
     ChangelogFetched {

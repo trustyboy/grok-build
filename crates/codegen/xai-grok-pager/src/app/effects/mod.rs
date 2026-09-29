@@ -2,6 +2,7 @@
 //! This module takes [`Effect`] values produced by [`super::dispatch`] and spawns them as async tasks on a [`JoinSet`].
 //! When tasks complete, the event loop converts their output into [`TaskResult`] and feeds it back through dispatch.
 mod helpers;
+mod model_requests;
 mod session_list;
 use super::actions;
 use super::worktree_session;
@@ -1858,6 +1859,20 @@ pub(crate) fn execute(
                     }
                     TaskResult::CancelComplete
                 });
+        }
+        Effect::DiscoverAndSwitchModel { request, model_id } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let result = model_requests::discover_and_switch(&request, &model_id, &tx).await;
+                TaskResult::DiscoverAndSwitchModelComplete { request, model_id, result }
+            });
+        }
+        Effect::SupportVision { request, enabled } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let result = model_requests::support_vision(&request, enabled, &tx).await;
+                TaskResult::SupportVisionComplete { request, result }
+            });
         }
         Effect::SwitchModel {
             agent_id,

@@ -394,6 +394,31 @@ fn model_offers_reasoning_effort(info: &config::ModelInfo, effort: ReasoningEffo
     }
 }
 
+/// 临时目录复用现有权限规则，非法过滤条件一律拒绝。
+pub(crate) fn validate_runtime_selection(
+    cfg: &config::Config,
+    key: &str,
+    entry: &ModelEntry,
+    is_session_auth: bool,
+) -> Result<(), String> {
+    for (patterns, reason) in [
+        (cfg.models.disabled_models.as_deref(), "已禁用"),
+        (cfg.models.hidden_models.as_deref(), "已隐藏"),
+    ] {
+        let filter = ModelGlobSet::compile(patterns).map_err(|_| "模型过滤规则无效".to_owned())?;
+        if filter.is_some_and(|set| set.matches(key, &entry.model)) {
+            return Err(format!("模型 {key} {reason}"));
+        }
+    }
+    if !model_is_allowlisted(cfg, key, &entry.model) || !entry.info.user_selectable {
+        return Err(allowlist_denied_message(cfg).to_owned());
+    }
+    if !entry.info.visible_for_auth(is_session_auth) {
+        return Err(format!("模型 {key} 当前不可见"));
+    }
+    Ok(())
+}
+
 /// True when an active `allowed_models` allowlist leaves no selectable model.
 pub(crate) fn allowlist_matches_nothing(
     cfg: &config::Config,

@@ -58,6 +58,16 @@ impl ModelState {
         self.available.is_empty()
     }
 
+    /// 运行时发现的模型不能保存为用户默认值。
+    pub fn is_runtime_discovered(&self, id: &acp::ModelId) -> bool {
+        self.available
+            .get(id)
+            .and_then(|info| info.meta.as_ref())
+            .and_then(|meta| meta.get("runtimeDiscovered"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }
+
     /// Display name for the current model.
     pub fn current_model_name(&self) -> Option<String> {
         let current = self.current.as_ref()?;

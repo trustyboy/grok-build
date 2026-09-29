@@ -941,6 +941,14 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::CompactComplete { agent_id, result } => {
             handle_compact_complete(app, agent_id, result)
         }
+        TaskResult::DiscoverAndSwitchModelComplete {
+            request,
+            model_id,
+            result,
+        } => super::model_requests::discover_complete(app, request, model_id, result),
+        TaskResult::SupportVisionComplete { request, result } => {
+            super::model_requests::support_vision_complete(app, request, result)
+        }
         TaskResult::SwitchModelComplete {
             agent_id,
             model_id,

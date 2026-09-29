@@ -932,6 +932,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 enabled,
             }]
         }
+        Action::DiscoverAndSwitchModel { model_id } => {
+            super::model_requests::discover_and_switch(app, model_id)
+        }
+        Action::SupportVision { enabled } => super::model_requests::support_vision(app, enabled),
         Action::NextModel => vec![],
         Action::SwitchModel { model_id, effort } => {
             let ActiveView::Agent(id) = app.active_view else {
@@ -940,7 +944,15 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             let Some(agent) = app.agents.get_mut(&id) else {
                 return vec![];
             };
+            if agent.session.model_switch_pending {
+                agent.show_toast("模型设置请求正在处理中，请完成后重试。");
+                return vec![];
+            }
             let Some(session_id) = agent.session.session_id.clone() else {
+                if agent.session.models.is_runtime_discovered(&model_id) {
+                    agent.show_toast("请先进入已就绪的会话，再选择临时模型。");
+                    return vec![];
+                }
                 let prev_model = agent.session.models.current.clone();
                 let prev_effort = agent.session.models.reasoning_effort;
                 agent.session.models.set_current(model_id.clone(), effort);

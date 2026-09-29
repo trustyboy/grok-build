@@ -1964,6 +1964,12 @@ impl acp::Agent for MvpAgent {
             "x.ai/models/list" => {
                 crate::agent::handlers::models::handle(self, &args).await
             }
+            "x.ai/models/discover_and_switch" => {
+                crate::agent::handlers::model_discovery::handle(self, &args).await
+            }
+            "x.ai/session/support_vision" => {
+                crate::agent::handlers::support_vision::handle(self, &args).await
+            }
             "x.ai/session/updates" => {
                 crate::extensions::session_updates::handle(&args, &self.gateway).await
             }

@@ -4681,6 +4681,14 @@ pub(crate) fn try_resolve_model_credentials(
     model_id: &str,
     session_key: Option<&str>,
 ) -> Option<ResolvedCredentials> {
+    match super::remote_config::lookup_runtime_model(model_id) {
+        Ok(Some(entry)) => return Some(resolve_credentials(&entry, session_key)),
+        Err(error) => {
+            tracing::warn!(model = %model_id, %error, "临时模型鉴权解析失败");
+            return None;
+        }
+        Ok(None) => {}
+    }
     let raw = crate::config::load_effective_config()
         .map_err(|e| tracing::warn!(error = %e, "config load failed for credential resolution"))
         .ok()?;
@@ -4709,6 +4717,11 @@ pub(crate) struct ModelAuthFacts {
 pub(crate) fn resolve_model_auth_facts_and_provider(
     model_id: &str,
 ) -> (ModelAuthFacts, Option<xai_grok_login::AuthProviderRef>) {
+    match super::remote_config::lookup_runtime_model(model_id) {
+        Ok(Some(entry)) => return model_entry_auth_facts_and_provider(&entry),
+        Err(_) => return unavailable_runtime_model_auth(),
+        Ok(None) => {}
+    }
     if model_id.is_empty() {
         return (
             ModelAuthFacts {
@@ -4733,6 +4746,35 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
         (facts, provider)
     })
 }
+/// 运行时与磁盘模型共用凭据分类，不持有已解析 token。
+pub(crate) fn model_entry_auth_facts_and_provider(
+    entry: &ModelEntry,
+) -> (ModelAuthFacts, Option<xai_grok_login::AuthProviderRef>) {
+    (
+        ModelAuthFacts {
+            byok: if entry.has_own_credentials() {
+                ModelByok::Byok
+            } else {
+                ModelByok::NotByok
+            },
+            auth_scheme: entry.info.auth_scheme,
+        },
+        entry.effective_auth_provider().cloned(),
+    )
+}
+
+/// 来源失效必须关闭 session token 入口，不能退回 Unknown 的兼容分支。
+pub(crate) fn unavailable_runtime_model_auth(
+) -> (ModelAuthFacts, Option<xai_grok_login::AuthProviderRef>) {
+    (
+        ModelAuthFacts {
+            byok: ModelByok::Byok,
+            auth_scheme: AuthScheme::default(),
+        },
+        None,
+    )
+}
+
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
     match lookup {
         ModelLookup::ConfigUnavailable => ModelByok::Unknown,
@@ -4775,7 +4817,12 @@ pub(crate) fn resolve_aux_model_sampling_config(
     alpha_test_key: Option<String>,
     client_version: Option<String>,
 ) -> Option<SamplerConfig> {
-    let catalog_entry = find_model_by_id(models, model_id).cloned();
+    let runtime_entry = match super::remote_config::lookup_runtime_model(model_id) {
+        Ok(entry) => entry,
+        Err(_) => return None,
+    };
+    let is_runtime = runtime_entry.is_some();
+    let catalog_entry = runtime_entry.or_else(|| find_model_by_id(models, model_id).cloned());
     if let Some(entry) = &catalog_entry {
         let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
         let sampler = sampling_config_for_model(
@@ -4788,6 +4835,9 @@ pub(crate) fn resolve_aux_model_sampling_config(
         );
         if sampler.api_key.is_some() {
             return Some(sampler);
+        }
+        if is_runtime {
+            return None;
         }
         if entry.effective_auth_provider().is_some() {
             tracing::warn!(
@@ -4917,6 +4967,9 @@ pub(crate) fn resolve_chat_state_auth_type(
     session_key: Option<&str>,
     fallback: xai_chat_state::AuthType,
 ) -> xai_chat_state::AuthType {
+    if super::remote_config::lookup_runtime_model(model_id).is_err() {
+        return xai_chat_state::AuthType::ApiKey;
+    }
     try_resolve_model_credentials(model_id, session_key)
         .map(|r| r.auth_type)
         .unwrap_or(fallback)
@@ -5141,6 +5194,9 @@ pub(crate) fn to_acp_model_info(
             let total_context_tokens = info.context_window.get();
             let meta = {
                 let mut map = serde_json::Map::new();
+                if super::remote_config::runtime_entry_metadata(key) {
+                    map.insert("runtimeDiscovered".to_owned(), serde_json::Value::Bool(true));
+                }
                 map.insert(
                     "totalContextTokens".to_string(),
                     serde_json::Value::Number(total_context_tokens.into()),

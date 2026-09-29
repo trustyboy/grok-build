@@ -1416,6 +1416,8 @@ pub struct AgentView {
     pub(crate) loading_placeholder_id: Option<EntryId>,
     /// Entry ID of the in-flight manual `/recap` loading block (rendered with the animated "running" sidebar). Set when `/recap` is dispatched and taken by the `SessionRecap` handler, which fills the block with the summary and stops the animation. `None` when no manual recap is pending (auto recaps never show a loading block).
     pub(crate) pending_recap_entry: Option<EntryId>,
+    /// 模型扩展请求的唯一标识；重连后丢弃旧回包。
+    pub(crate) pending_model_request: Option<std::sync::Arc<()>>,
     /// The manually-chosen session title (`/rename` or the dashboard rename flow), as distinct from the auto-generated
     /// `generated_session_title` below. Set optimistically at dispatch, persisted by the shell as `Summary.title_is_manual`, and restored from disk on resume (`TaskResult::SessionMetaFromDisk`). Drives the prompt-border inline title and wins precedence for the dashboard modal label and the OSC terminal title. The on-disk write is best-effort (failure surfaces a system block through the existing
     /// `RenameSessionFailed` arm).

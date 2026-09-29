@@ -1741,6 +1741,9 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
     prev_model_id: Option<acp::ModelId>,
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        if agent.pending_model_request.is_some() {
+            return vec![];
+        }
         agent.session.model_switch_pending = false;
         let mut effects = match result {
             Ok(()) => {
@@ -1766,7 +1769,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     };
                     agent.scrollback.push_block(RenderBlock::system(msg));
                 }
-                if unchanged {
+                if unchanged || agent.session.models.is_runtime_discovered(&model_id) {
                     vec![]
                 } else {
                     vec![Effect::PersistPreferredModel {

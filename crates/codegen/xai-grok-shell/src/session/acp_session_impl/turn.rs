@@ -488,7 +488,13 @@ impl SessionActor {
         if let Some(ref tp) = request.traceparent {
             xai_grok_otel::link_span_to_meta(&span, &serde_json::json!({ "traceparent": tp }));
         }
-        self.handle_turn_input_inner(request).instrument(span).await
+        let snapshot = self.capture_turn_sampling_state().await;
+        sampler_turn::TURN_SAMPLING_STATE
+            .scope(
+                snapshot,
+                self.handle_turn_input_inner(request).instrument(span),
+            )
+            .await
     }
     async fn handle_turn_input_inner(
         self: &Arc<Self>,
@@ -1157,9 +1163,8 @@ impl SessionActor {
                 .inspect_err(|err| turn_completion_emitter.emit_error(err))?
             };
             // 图片持久化后、消息写入前执行变换；沿用上游的完成通知和错误处理流程。
-            let supports_vision = self
-                .models_manager
-                .model_supports_vision(self.models_manager.current_model_id().0.as_ref());
+            let supports_vision =
+                sampler_turn::TURN_SAMPLING_STATE.with(|state| state.supports_vision);
             let user_message = self
                 .dispatch_user_prompt_transform(
                     user_message,
@@ -2845,6 +2850,12 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
+            // chat-state 可已切换模型，本轮请求仍跟随 hook 的快照。
+            if let Ok(Some(model)) = sampler_turn::TURN_SAMPLING_STATE
+                .try_with(|state| state.config.as_ref().map(|config| config.model.clone()))
+            {
+                request.model = Some(model);
+            }
             request.x_grok_session_id = Some(self.session_info.id.to_string());
             request.x_grok_turn_idx =
                 Some(self.chat_state_handle.get_prompt_index().await.to_string());

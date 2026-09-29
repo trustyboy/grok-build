@@ -60,6 +60,13 @@
 - 合并上游版本后，先检查仓库 `bin/protoc` 使用的版本；只有上游版本变化时，才同步更新 `tools/windows-protoc/setup.ps1` 中的版本、下载地址和 SHA-256。
 - 不得使用 Git 还原用户已有改动。发现无关的未提交文件时，应保留并绕开这些改动。
 
+## 运行时模型与视觉
+
+- `/model <未知ID>` 通过显式请求查询当前上游；临时模型不写配置或默认模型，能力默认为视觉关闭、256000 上下文、无思考参数。
+- 临时目录在 `agent/remote_config/manager/runtime.rs` 保存来源引用；鉴权路径必须识别临时模型，不能只从磁盘查找后误判为登录认证。
+- `/support_vision [on|off]` 的覆盖只属于当前会话和模型；hook 与 sampler 使用 `session/acp_session_impl/sampler_turn.rs` 的同一轮次快照，禁止改回读取共享 `current_model_id`。
+- 本地端到端验证：先完成 Release 构建，再运行 `python tools/test-model-discovery.py`。脚本使用临时配置和本地假上游，不需要真实凭据。
+
 ## 插件系统（vision-bridge）
 
 - 功能：主模型不支持视觉时，`UserPromptTransform` 钩子在用户消息发送前注入提示词，引导模型调用 vision MCP 工具识别图片（如 `opencode-vision-lite` 的 `vision_analyze`）；模型 `supports_vision=true` 时插件放行不注入。

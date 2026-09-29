@@ -37,6 +37,18 @@ pub(crate) async fn apply(
         Some(serde_json::json!({"model": args.model_id.0.as_ref()})),
     );
     tracing::debug!("session_session_model::mvp_agent: {:?}", &args);
+    let expected_model = args
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("expectedModelId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let discovery_source = args.meta.as_ref().and_then(|meta| {
+        Some((
+            meta.get("discoverySourceId")?.as_str()?.to_owned(),
+            meta.get("discoverySourceFingerprint")?.as_str()?.to_owned(),
+        ))
+    });
     let acp::SetSessionModelRequest {
         session_id,
         model_id,
@@ -48,7 +60,27 @@ pub(crate) async fn apply(
         .ok_or_else(|| acp::Error::invalid_params().data("unknown session id"))?;
     let _config_guard = agent.config_mutation_lock(&session_id).lock_owned().await;
     let handle = agent.resident_handle(&session_id).unwrap_or(handle);
+    // 远程发现期间用户可能已切换模型，旧查询不得覆盖较新的选择。
+    if expected_model
+        .as_deref()
+        .is_some_and(|id| id != handle.model_id.0.as_ref())
+    {
+        return Err(acp::Error::invalid_params().data("模型查询期间当前模型已改变，请重新执行命令"));
+    }
+    if let Some((source_id, expected_fingerprint)) = discovery_source {
+        let source = agent.resolve_model_id(&acp::ModelId::new(source_id))?;
+        if super::model_discovery::source_fingerprint(&source)?
+            .to_hex()
+            .as_str()
+            != expected_fingerprint
+        {
+            return Err(acp::Error::invalid_params().data("上游连接在提交切换前已改变，请重新发现"));
+        }
+    }
     let model = agent.resolve_model_id(&model_id)?;
+    if expected_model.is_some() && !model.info.user_selectable {
+        return Err(acp::Error::invalid_params().data("目标模型已被策略禁止"));
+    }
     let use_concise = model.info().use_concise;
     let session_default = handle
         .session_default_agent_profile
@@ -262,7 +294,14 @@ pub(crate) async fn apply(
         required_agent_type: Some(required_agent_type.clone()),
         current_agent_type: None,
     });
-    if agent.cfg.borrow().mode != config::AgentMode::Leader {
+    if agent.cfg.borrow().mode != config::AgentMode::Leader
+        && !matches!(
+            agent
+                .models_manager
+                .runtime_model_entry(model_id.0.as_ref()),
+            Ok(Some(_))
+        )
+    {
         agent.models_manager.set_current_model_id(model_id.clone());
         agent
             .models_manager

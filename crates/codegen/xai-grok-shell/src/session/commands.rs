@@ -288,6 +288,16 @@ impl From<SkillUpdateKind> for AdvertiseTrigger {
         }
     }
 }
+/// 当前会话模型的视觉状态，不参与持久化。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportVisionState {
+    /// 会话实际使用的模型 ID。
+    pub model_id: String,
+    /// 下一轮是否发送原生图片内容。
+    pub enabled: bool,
+}
+
 pub enum SessionCommand {
     Initialize {
         system_prompt: String,
@@ -393,6 +403,12 @@ pub enum SessionCommand {
     SetReasoningEffort {
         effort: xai_grok_sampling_types::ReasoningEffort,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
+    },
+    /// 查询或修改当前模型的会话内视觉覆盖，从下一轮生效。
+    SupportVision {
+        enabled: Option<bool>,
+        expected_model_id: Option<String>,
+        responds_to: oneshot::Sender<Result<SupportVisionState, acp::Error>>,
     },
     /// Zero-turn harness rebuild: build a brand-new `Agent` from the session's `AgentRebuildSpec` and the new `AgentDefinition`.
     /// Re-register MCP tools, swap the live `Agent`, and rewrite the system message in the conversation.

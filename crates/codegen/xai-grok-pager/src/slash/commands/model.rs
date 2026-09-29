@@ -40,6 +40,7 @@ impl SlashCommand for ModelCommand {
         Some(build_model_items(ctx.models))
     }
 
+    /// 已知目录优先解析，未知单个 ID 才进入异步发现。
     fn run(&self, ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
         let trimmed = args.trim();
         if trimmed.is_empty() {
@@ -49,7 +50,14 @@ impl SlashCommand for ModelCommand {
         // Prefer an exact full-string catalog match first. Model display names often contain spaces ("Grok 4.5").
         // If we split on the last token first, a shorter catalog entry ("Grok") would steal the prefix and treat "4.5" as an effort level
         if let Some(id) = ctx.models.resolve_by_name_or_id(trimmed) {
-            return CommandResult::Action(Action::SetDefaultModel(id));
+            return CommandResult::Action(if ctx.models.is_runtime_discovered(&id) {
+                Action::SwitchModel {
+                    model_id: id,
+                    effort: None,
+                }
+            } else {
+                Action::SetDefaultModel(id)
+            });
         }
 
         // A trailing effort token on a reasoning model makes a session-scoped switch (not persisted as default)
@@ -71,6 +79,17 @@ impl SlashCommand for ModelCommand {
                 }),
                 Err(err) => CommandResult::Error(err.message()),
             };
+        }
+
+        if !trimmed.chars().any(char::is_whitespace) {
+            if ctx.session_id.is_none() {
+                return CommandResult::Error(format!(
+                    "未知模型 {trimmed}：请先进入会话，再发现并切换模型。"
+                ));
+            }
+            return CommandResult::Action(Action::DiscoverAndSwitchModel {
+                model_id: acp::ModelId::new(trimmed.to_owned()),
+            });
         }
 
         CommandResult::Error(format!("Unknown model: {trimmed}"))
@@ -221,6 +240,55 @@ mod tests {
                 ..crate::settings::PagerLocalSnapshot::default()
             },
         }
+    }
+
+    /// 未知 ID 保留大小写，只允许精确单 token 发现。
+    #[test]
+    fn run_discovers_only_unknown_exact_id() {
+        let state = ModelState::default();
+        let sid = acp::SessionId::new("test");
+        let mut ctx = dummy_exec_ctx(&state);
+        ctx.session_id = Some(&sid);
+        assert!(matches!(ModelCommand.run(&mut ctx, " Vendor/Model-X "),
+            CommandResult::Action(Action::DiscoverAndSwitchModel { model_id })
+                if model_id.0.as_ref() == "Vendor/Model-X"));
+        for input in ["", "unknown high", "unknown\tbad-effort", "Unknown Model"] {
+            assert!(matches!(
+                ModelCommand.run(&mut ctx, input),
+                CommandResult::Error(_)
+            ));
+        }
+        ctx.session_id = None;
+        assert!(matches!(ModelCommand.run(&mut ctx, "unknown"),
+            CommandResult::Error(message) if message.contains("先进入会话")));
+    }
+
+    /// 临时目录条目的名称与 ID 都不得走默认模型持久化。
+    #[test]
+    fn run_runtime_model_is_session_scoped() {
+        let mut state = ModelState::default();
+        let (id, mut info) = plain_model("temporary", "Temporary Model");
+        info.meta =
+            Some(serde_json::from_value(serde_json::json!({"runtimeDiscovered": true})).unwrap());
+        state.available.insert(id.clone(), info);
+        let mut ctx = dummy_exec_ctx(&state);
+        for input in ["temporary", "Temporary Model"] {
+            assert!(matches!(ModelCommand.run(&mut ctx, input),
+                CommandResult::Action(Action::SwitchModel { model_id, effort: None }) if model_id == id));
+        }
+    }
+
+    /// 已知模型的未知 effort 不能误作远端模型 ID。
+    #[test]
+    fn run_unknown_effort_never_discovers() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_reasoning("reasoning-x", "Reasoning X");
+        state.available.insert(id, info);
+        let sid = acp::SessionId::new("test");
+        let mut ctx = dummy_exec_ctx(&state);
+        ctx.session_id = Some(&sid);
+        assert!(matches!(ModelCommand.run(&mut ctx, "reasoning-x invalid"),
+            CommandResult::Error(message) if message.contains("unknown effort")));
     }
 
     #[test]

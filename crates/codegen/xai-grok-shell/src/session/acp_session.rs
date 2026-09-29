@@ -765,6 +765,8 @@ pub(crate) struct SessionActor {
     /// Resolved at spawn as `is_telemetry_enabled() && !is_zdr()`; ZDR teams always have this false.
     pub(crate) telemetry_enabled: bool,
     pub(crate) supports_backend_search: std::cell::Cell<bool>,
+    /// 按目录模型保存的会话内视觉覆盖，不写入配置或会话存档。
+    pub(crate) vision_overrides: std::cell::RefCell<HashMap<String, bool>>,
     /// Per-turn override, set at promotion. Not persisted; a reload reverts to the definition seed.
     pub(crate) tool_overrides: std::cell::RefCell<Option<xai_grok_sampling_types::ToolOverrides>>,
     pub(crate) resolved_tool_overrides:

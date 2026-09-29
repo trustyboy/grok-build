@@ -1,7 +1,7 @@
 //! Individual setting setters with persistence effects and toasts.
 
 use super::ui::{refresh_open_settings_modals, save_success_toast};
-use crate::app::actions::Effect;
+use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
 use agent_client_protocol as acp;
 
@@ -1622,6 +1622,22 @@ pub(in crate::app::dispatch) fn set_default_model(
         );
         return vec![];
     };
+
+    if let Some(agent) = app.agents.get_mut(&aid) {
+        if agent.session.model_switch_pending {
+            agent.show_toast("模型设置请求正在处理中，请完成后重试。");
+            return vec![];
+        }
+        if agent.session.models.is_runtime_discovered(&new_id) {
+            return crate::app::dispatch::dispatch(
+                Action::SwitchModel {
+                    model_id: new_id,
+                    effort: None,
+                },
+                app,
+            );
+        }
+    }
 
     // Snapshot the previous id and display name from the active agent's session (the same source `set_default_model_inner` mutates and the modal reads)
     let (prev_id, session_id, available_has_new, new_display) = {

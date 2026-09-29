@@ -1897,6 +1897,12 @@ impl MvpAgent {
         requested: &acp::ModelId,
     ) -> Result<ModelEntry, acp::Error> {
         let requested_str = requested.0.as_ref();
+        // 临时来源失效必须显式报错，不能退回其他同名模型。
+        match self.models_manager.runtime_model_entry(requested_str) {
+            Ok(Some(entry)) => return Ok(entry),
+            Err(error) => return Err(acp::Error::invalid_params().data(error)),
+            Ok(None) => {}
+        }
         let models = self.models_manager.models();
         let Some(catalog_key) = resolve_catalog_key(&models, requested) else {
             tracing::debug!(

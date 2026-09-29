@@ -1,7 +1,67 @@
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
+
+#[cfg(test)]
+#[path = "support_vision_tests.rs"]
+mod support_vision_tests;
 impl SessionActor {
+    /// 目录 key 与路由 slug 共用覆盖，未知模型保持原有默认能力。
+    pub(super) fn session_vision_state(
+        &self,
+        model_id: &str,
+    ) -> crate::session::SupportVisionState {
+        let models = self.models_manager.models();
+        let key =
+            crate::agent::remote_config::resolve_catalog_key(&models, &acp::ModelId::new(model_id));
+        let key = key.as_ref().map_or(model_id, |key| key.0.as_ref());
+        let enabled = self
+            .vision_overrides
+            .borrow()
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| {
+                models
+                    .get(key)
+                    .is_none_or(|entry| entry.info().supports_vision)
+            });
+        crate::session::SupportVisionState {
+            model_id: model_id.to_owned(),
+            enabled,
+        }
+    }
+
+    /// 校验与写入在 actor 命令内完成，回复反映下一轮的实际设置。
+    pub(super) async fn handle_support_vision(
+        &self,
+        enabled: Option<bool>,
+        expected_model_id: Option<&str>,
+    ) -> Result<crate::session::SupportVisionState, acp::Error> {
+        let cfg = self
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("session has no sampling config"))?;
+        let models = self.models_manager.models();
+        let current = acp::ModelId::new(cfg.model.clone());
+        let key =
+            crate::agent::remote_config::resolve_catalog_key(&models, &current).unwrap_or(current);
+        if let Some(expected) = expected_model_id {
+            let expected = acp::ModelId::new(expected);
+            let expected_key = crate::agent::remote_config::resolve_catalog_key(&models, &expected)
+                .unwrap_or(expected);
+            if expected_key != key {
+                return Err(acp::Error::invalid_params().data("当前模型已变化，请重新查询视觉状态"));
+            }
+        }
+        if let Some(enabled) = enabled {
+            self.vision_overrides
+                .borrow_mut()
+                .insert(key.0.to_string(), enabled);
+        }
+        Ok(self.session_vision_state(&cfg.model))
+    }
+
     pub(super) async fn handle_set_session_model(
         self: &std::sync::Arc<Self>,
         sampling_config: xai_grok_sampler::SamplerConfig,

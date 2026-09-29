@@ -97,6 +97,28 @@ pub fn resolve_remote_fetch_enabled() -> bool {
     }
 }
 
+/// 显式查询用户上游不启动后台获取，但仍服从管理层的禁止联网策略。
+pub(crate) fn explicit_model_discovery_allowed() -> bool {
+    let Ok(layers) = crate::config::ConfigLayers::load() else {
+        return false;
+    };
+    explicit_model_discovery_from_layers(&layers)
+}
+
+fn explicit_model_discovery_from_layers(layers: &crate::config::ConfigLayers) -> bool {
+    [
+        layers.mdm_requirements.as_ref(),
+        layers.system_requirements.as_ref(),
+        layers.user_requirements.as_ref(),
+        Some(&layers.managed),
+        Some(&layers.system_managed),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(remote_fetch_value)
+    .unwrap_or(true)
+}
+
 pub const REMOTE_FETCH_CONFIG_PATH: &str = "features.remote_fetch";
 
 /// Keys whose dedicated resolver walks managed before user `config.toml`.
@@ -170,6 +192,20 @@ mod tests {
 
     fn features_remote_fetch(v: bool) -> TomlValue {
         toml::from_str(&format!("[features]\nremote_fetch = {v}\n")).unwrap()
+    }
+
+    #[test]
+    fn explicit_discovery_respects_management_without_enabling_background_fetch() {
+        let mut layers = empty_layers();
+        layers.user = features_remote_fetch(false);
+        assert!(explicit_model_discovery_from_layers(&layers));
+        assert!(!remote_fetch_enabled_from_layers(&layers));
+        layers.managed = features_remote_fetch(false);
+        assert!(!explicit_model_discovery_from_layers(&layers));
+        layers.user_requirements = Some(features_remote_fetch(true));
+        assert!(explicit_model_discovery_from_layers(&layers));
+        layers.mdm_requirements = Some(features_remote_fetch(false));
+        assert!(!explicit_model_discovery_from_layers(&layers));
     }
 
     #[test]

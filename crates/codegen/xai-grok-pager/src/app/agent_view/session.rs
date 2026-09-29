@@ -33,6 +33,9 @@ impl AgentView {
     pub(crate) fn bind_session_id(&mut self, session_id: agent_client_protocol::SessionId) {
         if self.session.session_id.as_ref() != Some(&session_id) {
             self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
+            if self.pending_model_request.take().is_some() {
+                self.session.model_switch_pending = false;
+            }
             self.last_seen_event_id = None;
             self.last_seen_event_seq = None;
             self.last_applied_event_seq = None;
@@ -379,6 +382,7 @@ impl AgentView {
             pending_fork_banner: None,
             loading_placeholder_id: None,
             pending_recap_entry: None,
+            pending_model_request: None,
             display_name: None,
             generated_session_title: None,
             title_unpin_committed: false,
@@ -619,6 +623,7 @@ impl AgentView {
             self.scrollback.remove_entry(rid);
         }
         self.session.model_switch_pending = false;
+        self.pending_model_request = None;
         self.release_hook_block_hold();
         self.pending_adoption_updates.clear();
         let stash = self.take_replay_rebuilt_state();

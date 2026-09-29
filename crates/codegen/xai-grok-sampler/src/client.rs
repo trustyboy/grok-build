@@ -498,6 +498,18 @@ fn auth_rejected(message: String, sent_bearer: Option<&str>) -> SamplingError {
     }
 }
 
+/// 仅信任列表中的精确 ID；名称、地址、密钥和能力字段不参与发现。
+fn parse_discovered_model_ids(body: &[u8]) -> std::result::Result<Vec<String>, String> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| "上游模型列表不是有效 JSON".to_owned())?;
+    let data = value.get("data").and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "上游模型列表缺少 data 数组".to_owned())?;
+    Ok(data.iter().filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_whitespace)
+            && !id.chars().any(char::is_control))
+        .map(str::to_owned).collect())
+}
+
 // =============================================================================
 // SamplingClient
 // =============================================================================
@@ -672,6 +684,54 @@ impl SamplingClient {
 
     pub fn api_backend(&self) -> ApiBackend {
         self.defaults.api_backend.clone()
+    }
+
+    /// 使用推理连接的认证与查询参数读取模型 ID，不接受远端路由配置。
+    pub async fn discover_model_ids(config: SamplerConfig) -> std::result::Result<Vec<String>, String> {
+        const MAX_BYTES: usize = 4 * 1024 * 1024;
+        let cert_dir = config.mtls_cert_dir.clone();
+        let mut client = Self::new(config)
+            .map_err(|_| "无法构建上游模型查询连接，请检查认证和证书配置".to_owned())?;
+        // 普通推理客户端允许重定向；模型查询禁止向重定向地址转发自定义认证头。
+        client.http = if let Some(cert_dir) = cert_dir {
+            crate::shared_http::mtls_client(&cert_dir, false)
+                .map_err(|_| "无法加载上游模型查询的客户端证书".to_owned())?
+        } else {
+            xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder.redirect(reqwest::redirect::Policy::none())
+            })
+            .map_err(|_| "无法创建上游模型查询连接".to_owned())?
+        };
+        let url = reqwest::Url::parse(&client.endpoint.url_for_path("models"))
+            .map_err(|_| "上游模型查询地址无效".to_owned())?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("上游模型查询地址必须是无内嵌凭据的 HTTP(S) 地址".to_owned());
+        }
+        let mut response = client.http.get(url)
+            .headers(client.default_headers.clone())
+            .timeout(std::time::Duration::from_secs(8))
+            .send().await
+            .map_err(|_| "上游模型查询失败或超时".to_owned())?;
+        if !response.status().is_success() {
+            return Err(format!("上游模型列表返回 HTTP {}，当前模型未改变", response.status().as_u16()));
+        }
+        if response.content_length().is_some_and(|size| size > MAX_BYTES as u64) {
+            return Err("上游模型列表超过大小限制".to_owned());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await
+            .map_err(|_| "读取上游模型列表失败".to_owned())?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_BYTES {
+                return Err("上游模型列表超过大小限制".to_owned());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        parse_discovered_model_ids(&body)
     }
 
     /// Give the bearer resolver its pre-send hook before [`Self::post`] reads it.

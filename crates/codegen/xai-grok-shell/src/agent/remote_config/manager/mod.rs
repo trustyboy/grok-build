@@ -1,5 +1,8 @@
 //! In-memory model catalog: fetch, refresh, resolution, and selection.
 
+mod runtime;
+pub(crate) use runtime::{lookup_runtime_model, runtime_entry_metadata};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -37,6 +40,10 @@ enum CatalogProgress {
 struct CatalogState {
     prefetched: Option<IndexMap<String, ModelEntry>>,
     models: IndexMap<String, ModelEntry>,
+    /// 临时能力与来源引用不进入远端缓存。
+    runtime: IndexMap<String, runtime::RuntimeModel>,
+    /// 热更新被拒绝时，临时目录不能继续使用旧权限。
+    runtime_error: Option<String>,
     etag: Option<String>,
     /// Gates whether the apply path reselects the default (first real catalog)
     has_fetched_real_catalog: bool,
@@ -310,6 +317,7 @@ impl ModelsManager {
     /// Swap config, rebuild catalog, and reselect the model.
     pub(crate) fn apply_config(&self, new_config: config::Config) {
         if let Err(e) = new_config.validate_model_filters() {
+            self.inner.catalog.write().runtime_error = Some(e.clone());
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
             return;
         }
@@ -317,6 +325,7 @@ impl ModelsManager {
         let new_catalog = resolve_model_catalog(&new_config, prefetched);
         let has_real_catalog = self.inner.catalog.read().has_fetched_real_catalog;
         if has_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
+            self.inner.catalog.write().runtime_error = Some(e.clone());
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
             return;
         }
@@ -332,9 +341,12 @@ impl ModelsManager {
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         *self.inner.fetch_auth.write() =
             ModelFetchAuth::resolve(&new_config.endpoints, has_session);
-        *self.inner.cfg.write() = new_config.clone();
         {
+            let mut cfg = self.inner.cfg.write();
             let mut cat = self.inner.catalog.write();
+            *cfg = new_config.clone();
+            cat.generation += 1;
+            cat.runtime_error = None;
             if has_real_catalog {
                 cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &new_catalog);
             }
@@ -353,6 +365,12 @@ impl ModelsManager {
         }
         let campaign_only_flip =
             is_campaign_only_flip(&old_preferred, &new_preferred, &campaign_defaults);
+        let current_runtime = self
+            .inner
+            .catalog
+            .read()
+            .runtime
+            .contains_key(self.current_model_id().0.as_ref());
         let current_still_ok = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
@@ -361,7 +379,7 @@ impl ModelsManager {
                 .get(cur.0.as_ref())
                 .is_some_and(|e| e.info.user_selectable)
         };
-        if preferred_changed && !(campaign_only_flip && current_still_ok) {
+        if preferred_changed && !current_runtime && !(campaign_only_flip && current_still_ok) {
             self.reselect_default_model(&new_config);
         } else {
             self.reselect_current_model_if_missing(&new_config);
@@ -378,11 +396,14 @@ impl ModelsManager {
     }
 
     pub fn models(&self) -> IndexMap<String, ModelEntry> {
-        self.inner.catalog.read().models.clone()
+        self.models_with_runtime()
     }
 
     /// One name without cloning the catalog, for callers on a hot path.
     pub fn display_name(&self, id: &str) -> Option<String> {
+        if let Ok(Some(entry)) = self.runtime_model_entry(id) {
+            return Some(entry.info.name.unwrap_or(entry.info.model));
+        }
         self.inner
             .catalog
             .read()
@@ -405,11 +426,7 @@ impl ModelsManager {
 
     /// ACP-visible (non-hidden) projection of the catalog.
     pub fn available(&self) -> IndexMap<acp::ModelId, acp::ModelInfo> {
-        let snapshot = {
-            let cat = self.inner.catalog.read();
-            let models = &cat.models;
-            models.clone()
-        };
+        let snapshot = self.models();
 
         let selectable: IndexMap<_, _> = snapshot
             .into_iter()
@@ -420,10 +437,11 @@ impl ModelsManager {
     }
 
     pub(crate) fn task_model_error(&self, requested: &str) -> Option<String> {
-        let is_session_auth = self.is_session_auth();
-        let cat = self.inner.catalog.read();
-        let models = &cat.models;
-        task_model_error_for_catalog(requested, models, is_session_auth)
+        if let Err(error) = self.runtime_model_entry(requested) {
+            return Some(error);
+        }
+        let models = self.models();
+        task_model_error_for_catalog(requested, &models, self.is_session_auth())
     }
 
     pub fn current_model_id(&self) -> acp::ModelId {
@@ -480,6 +498,11 @@ impl ModelsManager {
 
     /// Run `f` on the [`ModelEntry`] for `model_id` (catalog key or wire name); `None` if absent.
     fn with_catalog_entry<T>(&self, model_id: &str, f: impl FnOnce(&ModelEntry) -> T) -> Option<T> {
+        match self.runtime_model_entry(model_id) {
+            Ok(Some(entry)) => return Some(f(&entry)),
+            Err(_) => return None,
+            Ok(None) => {}
+        }
         let cat = self.inner.catalog.read();
         let models = &cat.models;
         let key = resolve_catalog_key(models, &acp::ModelId::new(model_id))?;
@@ -543,6 +566,11 @@ impl ModelsManager {
     /// Whether `model_id` accepts image content blocks. Unknown ids default
     /// to `true` (vision-capable), matching the pre-`supports_vision` behavior.
     pub(crate) fn model_supports_vision(&self, model_id: &str) -> bool {
+        match self.runtime_model_entry(model_id) {
+            Ok(Some(entry)) => return entry.info.supports_vision,
+            Err(_) => return false,
+            Ok(None) => {}
+        }
         self.inner
             .catalog
             .read()
@@ -588,6 +616,11 @@ impl ModelsManager {
 
     /// Whether `model_id` resolves in the current catalog, as a config key or a routing slug.
     pub(crate) fn model_in_catalog(&self, model_id: &str) -> bool {
+        match self.runtime_model_entry(model_id) {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) => {}
+        }
         let cat = self.inner.catalog.read();
         let models = &cat.models;
         resolve_catalog_key(models, &acp::ModelId::new(model_id)).is_some()
@@ -950,7 +983,11 @@ impl ModelsManager {
         {
             let mut cat = self.inner.catalog.write();
             let generation = cat.generation + 1;
+            let runtime = std::mem::take(&mut cat.runtime);
+            let runtime_error = cat.runtime_error.take();
             *cat = CatalogState::default();
+            cat.runtime = runtime;
+            cat.runtime_error = runtime_error;
             cat.generation = generation;
             self.inner
                 .catalog_progress
@@ -969,16 +1006,26 @@ impl ModelsManager {
         let current_model_id = self.current_model_id();
         let all_models = self.models();
         let fallback;
-        let current_model = match all_models
-            .get(current_model_id.0.as_ref())
-            .or_else(|| all_models.values().next())
+        let unavailable_runtime;
+        let current_model = if self
+            .runtime_model_entry(current_model_id.0.as_ref())
+            .is_err()
         {
-            Some(m) => m,
-            None => {
-                tracing::warn!("no models available in catalog; defaulting to bundled model");
-                let default_id = crate::models::default_model().to_string();
-                fallback = ModelEntry::fallback(&default_id, &config.endpoints);
-                &fallback
+            // 不可用来源不能触发首项或默认模型回退。
+            unavailable_runtime = runtime::unavailable_entry(current_model_id.0.as_ref());
+            &unavailable_runtime
+        } else {
+            match all_models
+                .get(current_model_id.0.as_ref())
+                .or_else(|| all_models.values().next())
+            {
+                Some(m) => m,
+                None => {
+                    tracing::warn!("no models available in catalog; defaulting to bundled model");
+                    let default_id = crate::models::default_model().to_string();
+                    fallback = ModelEntry::fallback(&default_id, &config.endpoints);
+                    &fallback
+                }
             }
         };
 
@@ -1158,6 +1205,7 @@ impl ModelsManager {
         new_etag: Option<String>,
         generation: Option<u64>,
     ) -> bool {
+        let live_cfg = self.inner.cfg.read();
         let (first_real_catalog, excludes_all) = {
             let mut cat = self.inner.catalog.write();
             if let Some(generation) = generation
@@ -1178,6 +1226,8 @@ impl ModelsManager {
                 .send_replace(CatalogProgress::Ready);
             (first_real_catalog, cat.allowlist_excludes_all)
         };
+        let cfg = cfg.clone();
+        drop(live_cfg);
         if excludes_all {
             tracing::error!("allowed_models excludes all fetched models; prompts will be blocked");
         }
@@ -1185,9 +1235,9 @@ impl ModelsManager {
         // Respect an explicit pre-catalog `/model` pick: auto-select the default on the first catalog only when the user hasn't chosen
         // Either way a now-invalid selection is replaced.
         if first_real_catalog && !self.inner.user_selected_model.load(Ordering::Relaxed) {
-            self.reselect_default_model(cfg);
+            self.reselect_default_model(&cfg);
         } else {
-            self.reselect_current_model_if_missing(cfg);
+            self.reselect_current_model_if_missing(&cfg);
         }
         true
     }
@@ -1245,6 +1295,16 @@ impl ModelsManager {
     /// Re-pick the default when the current model is gone or unselectable; auth visibility never evicts an explicit user pick.
     fn reselect_current_model_if_missing(&self, config: &config::Config) {
         let current = self.inner.current_model_id.read().clone();
+        // 失效临时选择留给会话报错，不静默换用默认路由。
+        if self
+            .inner
+            .catalog
+            .read()
+            .runtime
+            .contains_key(current.0.as_ref())
+        {
+            return;
+        }
         let user_selected = self.inner.user_selected_model.load(Ordering::Relaxed);
         let needs_reselection = {
             let cat = self.inner.catalog.read();

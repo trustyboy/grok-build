@@ -3022,6 +3022,8 @@ fn dashboard_slash_command_error_gets_error_glyph_prefix() {
         toast.contains("nonexistent"),
         "the command's own message must be preserved, got: {toast:?}",
     );
+    assert!(toast.contains("先进入会话"));
+    assert!(app.dashboard.as_ref().unwrap().pending_model.is_none());
 }
 /// `/plan` on the dashboard toggles plan mode on/off.
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]

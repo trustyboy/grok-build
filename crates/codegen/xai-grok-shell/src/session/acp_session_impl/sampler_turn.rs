@@ -6,6 +6,22 @@ use xai_grok_login::backend::{ActiveAuthBackend, AuthBackend};
 use xai_grok_telemetry::region;
 use xai_grok_telemetry::region::Parent;
 
+/// 本轮模型、视觉与凭据归属，避免切换后混用另一模型的密钥。
+#[derive(Clone)]
+pub(super) struct TurnSamplingState {
+    /// 不含密钥的模型配置快照。
+    pub(super) config: Option<xai_grok_sampling_types::SamplingConfig>,
+    /// 切换模型后仍使用原轮次的凭据。
+    pub(super) credentials: xai_chat_state::Credentials,
+    /// 本轮 hook 与采样器共同使用的视觉值。
+    pub(super) supports_vision: bool,
+}
+
+tokio::task_local! {
+    /// 生命周期限定在当前轮次，取消和结束时自动释放。
+    pub(super) static TURN_SAMPLING_STATE: TurnSamplingState;
+}
+
 const CLASSIFIER_REQUEST_TOKEN_RESERVE: u64 = 16_384;
 
 fn classifier_request_fits_context(input_tokens: u64, context_window: u64) -> bool {
@@ -459,6 +475,14 @@ impl SessionActor {
     ) {
         use crate::agent::auth_method::ModelByok;
         use crate::session::acp_session::ModelAuthMemo;
+        // 临时来源每轮重查，不能沿用旧来源的鉴权 memo。
+        match self.models_manager.runtime_model_entry(model_id) {
+            Ok(Some(entry)) => {
+                return crate::agent::config::model_entry_auth_facts_and_provider(&entry);
+            }
+            Err(_) => return crate::agent::config::unavailable_runtime_model_auth(),
+            Ok(None) => {}
+        }
         if let Some(memo) = self.model_auth_memo.borrow().as_ref()
             && memo.model_id == model_id
             && memo.facts.byok != ModelByok::Unknown
@@ -481,6 +505,41 @@ impl SessionActor {
             provider: provider.clone(),
         });
         (fresh, provider)
+    }
+
+    /// 临时来源的路由与凭据同步刷新，失效时在发送前拒绝。
+    async fn refresh_runtime_model_auth(&self) -> Result<(), acp::Error> {
+        let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return Ok(());
+        };
+        let entry = self
+            .models_manager
+            .runtime_model_entry(&cfg.model)
+            .map_err(|error| acp::Error::invalid_params().data(error))?;
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        let session_auth = self
+            .auth_manager
+            .as_ref()
+            .and_then(|am| am.current_or_expired());
+        let resolved = crate::agent::config::resolve_credentials(
+            &entry,
+            session_auth.as_ref().map(|auth| auth.key.as_str()),
+        );
+        let mut credentials = self.chat_state_handle.get_credentials().await;
+        credentials.api_key = resolved.api_key;
+        credentials.auth_type = resolved.auth_type;
+        cfg.base_url = resolved.base_url;
+        cfg.mtls_cert_dir = entry.mtls_cert_dir.clone();
+        cfg.api_backend = entry.info.api_backend.clone();
+        cfg.extra_headers = entry.info.extra_headers.clone();
+        cfg.query_params = entry.info.query_params.clone();
+        cfg.env_http_headers = entry.info.env_http_headers.clone();
+        self.chat_state_handle.update_sampling_config(cfg);
+        self.chat_state_handle.update_credentials(credentials);
+        self.invalidate_model_auth_memo();
+        Ok(())
     }
 
     /// The single writer of a provider mint/rotation into chat-state credentials.
@@ -610,6 +669,28 @@ impl SessionActor {
         }
     }
 
+    /// 固定轮次模型与视觉值；读取期间若模型已切换则重试。
+    pub(super) async fn capture_turn_sampling_state(&self) -> TurnSamplingState {
+        loop {
+            let config = self.chat_state_handle.get_sampling_config().await;
+            let supports_vision = self
+                .session_vision_state(config.as_ref().map_or("", |config| config.model.as_str()))
+                .enabled;
+            let credentials = self.chat_state_handle.get_credentials().await;
+            let current = self.chat_state_handle.get_sampling_config().await;
+            let identity = |cfg: &xai_grok_sampling_types::SamplingConfig| {
+                (cfg.model.clone(), cfg.base_url.clone())
+            };
+            if config.as_ref().map(identity) == current.as_ref().map(identity) {
+                return TurnSamplingState {
+                    config,
+                    credentials,
+                    supports_vision,
+                };
+            }
+        }
+    }
+
     /// Reconstruct a full `SamplerConfig` (with credentials) by combining the actor's `SamplingConfig` and `Credentials`.
     /// Folds in the URL-derived headers (cli-chat-proxy auth, the staging auth header) so the sampler crate stays URL-agnostic.
     pub(super) async fn reconstruct_full_config(&self) -> SamplingConfig {
@@ -626,29 +707,77 @@ impl SessionActor {
             }
         }
 
-        let cfg = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .unwrap_or_else(|| xai_grok_sampling_types::SamplingConfig {
-                base_url: String::new(),
-                mtls_cert_dir: None,
-                model: String::new(),
-                max_completion_tokens: None,
-                temperature: None,
-                top_p: None,
-                max_retries: None,
-                rate_limit_retry_threshold: None,
-                api_backend: Default::default(),
-                extra_headers: Default::default(),
-                conversation_group_id: None,
-                query_params: Default::default(),
-                env_http_headers: Default::default(),
-                context_window: std::num::NonZeroU64::new(256_000).unwrap(),
-                reasoning_effort: None,
-                stream_tool_calls: None,
-            });
-        let creds = self.chat_state_handle.get_credentials().await;
+        let snapshot = TURN_SAMPLING_STATE.try_with(Clone::clone).ok();
+        let current_config = self.chat_state_handle.get_sampling_config().await;
+        let cfg = match snapshot.as_ref() {
+            // 同一模型保留本轮压缩、限额修正等更新；只有跨模型时固定旧轮次归属。
+            Some(state) if state.config.as_ref().map(|cfg| (&cfg.model, &cfg.base_url))
+                != current_config.as_ref().map(|cfg| (&cfg.model, &cfg.base_url)) => state.config.clone(),
+            _ => current_config.clone(),
+        }
+        .unwrap_or_else(|| xai_grok_sampling_types::SamplingConfig {
+            base_url: String::new(),
+            mtls_cert_dir: None,
+            model: String::new(),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            max_retries: None,
+            rate_limit_retry_threshold: None,
+            api_backend: Default::default(),
+            extra_headers: Default::default(),
+            conversation_group_id: None,
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
+            context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+            reasoning_effort: None,
+            stream_tool_calls: None,
+        });
+        let supports_vision = snapshot.as_ref().map_or_else(
+            || self.session_vision_state(&cfg.model).enabled,
+            |state| state.supports_vision,
+        );
+        let mut creds = match snapshot.as_ref() {
+            Some(state)
+                if current_config.as_ref().is_none_or(|current| {
+                    current.model != cfg.model || current.base_url != cfg.base_url
+                }) =>
+            {
+                state.credentials.clone()
+            }
+            _ => self.chat_state_handle.get_credentials().await,
+        };
+        let mut cfg = cfg;
+        // 只刷新连接与鉴权，不改变本轮视觉快照。
+        match self.models_manager.runtime_model_entry(&cfg.model) {
+            Ok(Some(entry)) => {
+                let session_auth = self
+                    .auth_manager
+                    .as_ref()
+                    .and_then(|am| am.current_or_expired());
+                let resolved = crate::agent::config::resolve_credentials(
+                    &entry,
+                    session_auth.as_ref().map(|auth| auth.key.as_str()),
+                );
+                creds.api_key = resolved.api_key;
+                creds.auth_type = resolved.auth_type;
+                cfg.base_url = resolved.base_url;
+                cfg.mtls_cert_dir = entry.mtls_cert_dir;
+                cfg.api_backend = entry.info.api_backend;
+                cfg.extra_headers = entry.info.extra_headers;
+                cfg.query_params = entry.info.query_params;
+                cfg.env_http_headers = entry.info.env_http_headers;
+            }
+            Err(_) => {
+                cfg.base_url.clear();
+                cfg.extra_headers.clear();
+                cfg.env_http_headers.clear();
+                cfg.query_params.clear();
+                cfg.mtls_cert_dir = None;
+                creds.api_key = None;
+            }
+            Ok(None) => {}
+        }
         let model_facts = self.model_auth_facts(cfg.model.as_str());
         // Gate on the stable session classifier, not `creds.auth_type`; see `crate::agent::auth_method::session_token_auth_gate`
         // `cfg.base_url` keeps an `Unknown` BYOK status refreshable against first-party xAI hosts
@@ -758,9 +887,7 @@ impl SessionActor {
                 None
             },
             supports_backend_search: self.supports_backend_search.get(),
-            supports_vision: self
-                .models_manager
-                .model_supports_vision(self.models_manager.current_model_id().0.as_ref()),
+            supports_vision,
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
             // The sampler sends the opt-in header itself when this is set.
@@ -983,6 +1110,7 @@ impl SessionActor {
         &self,
         force_http1: bool,
     ) -> Result<xai_grok_sampler::SamplingClient, acp::Error> {
+        self.refresh_runtime_model_auth().await?;
         // Check if the JWT token is expired/near-expiration and refresh from config if needed
         self.refresh_token_if_expired().await;
 
@@ -1001,7 +1129,8 @@ impl SessionActor {
     // (See `SamplerFailureRecovery` enum near the bottom of the impl block.)
 
     /// Refresh auth and push a fresh `SamplerConfig` before each turn.
-    pub(crate) async fn prepare_sampler_for_turn(&self) {
+    pub(crate) async fn prepare_sampler_for_turn(&self) -> Result<(), acp::Error> {
+        self.refresh_runtime_model_auth().await?;
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
         if self.tool_context.task_output_token_budget.is_some()
@@ -1012,6 +1141,7 @@ impl SessionActor {
         // Carry over the session's per-chunk idle timeout via `SamplerConfig.idle_timeout_secs`
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
         self.sampler_handle.update_config(sampler_config);
+        Ok(())
     }
 
     /// Fold an auth remedy into a turn failure: its advice becomes the tail of the message.
@@ -1394,7 +1524,7 @@ impl SessionActor {
                     Some(self.session_info.id.0.as_ref()),
                     None,
                 );
-                self.prepare_sampler_for_turn().await;
+                self.prepare_sampler_for_turn().await?;
                 return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
                     credential: error.credential,
                     store: RecoveredStore::SessionToken,
@@ -1422,7 +1552,7 @@ impl SessionActor {
         if let Some(ref provider) = auth_provider
             && self.try_provider_401_recovery(provider).await
         {
-            self.prepare_sampler_for_turn().await;
+            self.prepare_sampler_for_turn().await?;
             return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
                 credential: error.credential,
                 store: RecoveredStore::AuthProvider,
@@ -1641,10 +1771,16 @@ impl SessionActor {
         mid_salvage_continuation: bool,
         park: TurnParkState,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
+        // 挂起重试也检查临时来源，但不触发 token 刷新。
+        if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
+            self.models_manager
+                .runtime_model_entry(&cfg.model)
+                .map_err(|error| acp::Error::invalid_params().data(error))?;
+        }
         // Per-turn auth refresh + sampler config push. Mirrors
         // `prepare_chat_completion(false)` from the legacy path.
         if !park.is_parked() {
-            self.prepare_sampler_for_turn().await;
+            self.prepare_sampler_for_turn().await?;
         }
 
         if !budget.can_wait() {
@@ -1690,7 +1826,7 @@ impl SessionActor {
                     // A token can expire across minutes of accumulated waits
                     // (parked turns skip it — see `run_turn_via_sampler`).
                     if !park.is_parked() {
-                        self.prepare_sampler_for_turn().await;
+                        self.prepare_sampler_for_turn().await?;
                     }
                     self.turn_phases.record_sampling_retries(1);
                 }
@@ -2088,6 +2224,11 @@ impl SessionActor {
     }
 
     fn reload_api_key_from_config(&self, current_model_id: &str) -> Option<String> {
+        match self.models_manager.runtime_model_entry(current_model_id) {
+            Ok(Some(entry)) => return entry.own_credential(),
+            Err(_) => return None,
+            Ok(None) => {}
+        }
         let raw_config = crate::config::load_effective_config()
             .map_err(|e| tracing::warn!(error = %e, "Failed to reload config"))
             .ok()?;

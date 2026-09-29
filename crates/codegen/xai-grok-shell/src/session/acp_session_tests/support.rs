@@ -255,7 +255,13 @@ async fn create_test_actor_inner(
     SessionActor,
     tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
 ) {
-    let cwd = xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
+    // Windows 的 /tmp 不是绝对路径。
+    let test_cwd = if cfg!(windows) {
+        std::env::temp_dir()
+    } else {
+        std::path::PathBuf::from("/tmp")
+    };
+    let cwd = xai_grok_paths::AbsPathBuf::new(test_cwd).unwrap();
     let fs = Arc::new(xai_grok_workspace::file_system::MockFs::new(
         cwd.to_path_buf(),
     ));
@@ -351,6 +357,7 @@ async fn create_test_actor_inner(
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        vision_overrides: Default::default(),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),

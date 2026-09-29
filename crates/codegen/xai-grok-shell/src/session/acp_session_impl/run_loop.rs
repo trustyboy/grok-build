@@ -841,6 +841,10 @@ pub(super) async fn run_session(
                             let updated_model_id = session.handle_set_reasoning_effort(effort).await;
                             let _ = responds_to.send(updated_model_id);
                         }
+                        SessionCommand::SupportVision { enabled, expected_model_id, responds_to } => {
+                            let outcome = session.handle_support_vision(enabled, expected_model_id.as_deref()).await;
+                            let _ = responds_to.send(outcome);
+                        }
                         SessionCommand::RebuildAgentForDefinition { definition, responds_to } => {
                             let outcome = session.handle_rebuild_agent_for_definition(definition).await;
                             let _ = responds_to.send(outcome);
