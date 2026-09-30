@@ -42,7 +42,50 @@
 & .\tools\windows-protoc\build-release.ps1 --locked
 ```
 
-脚本只在构建进程期间设置 `PROTOC`，完成后恢复调用前的环境变量。持久目录中的压缩包、官方编译器、include 文件和 Wrapper 均不会删除。
+构建和测试入口通过 `invoke-cargo-release.ps1` 共用工具环境，仅在执行 Cargo 期间设置 `PROTOC` 和 `GROK_TOOLS_BUNDLE_RG_PATH`，完成或失败后均恢复原值。持久目录中的压缩包、官方编译器、include 文件和 Wrapper 均不会删除。
+
+## Release 定向测试与缓存复用
+
+测试也使用同一工具环境，避免测试后正式构建因 ripgrep 打包配置变化而重新编译：
+
+```powershell
+& .\tools\windows-protoc\test-release.ps1 -p xai-grok-shell --lib model_discovery
+```
+
+传给测试程序的参数需要用带引号的 `'--'` 分隔，防止 PowerShell 将它当作自身的参数结束符：
+
+```powershell
+& .\tools\windows-protoc\test-release.ps1 -p xai-grok-shell --lib model_discovery '--' --nocapture
+```
+
+同一批修改有多个过滤条件时，可以先用 `--no-run` 编译一次，再使用 Cargo 输出的测试可执行文件路径分别运行过滤条件。代码变化后需要重新编译测试程序。
+
+保留 Release 增量编译；固定 Rust 版本、目标架构、功能开关、`RUSTFLAGS` 和工具路径。构建与测试自身的优化、panic 和特性差异仍可能生成不同产物，共享工具环境只减少额外的配置切换。
+
+## 受控清理旧增量缓存
+
+先预览：
+
+```powershell
+& .\tools\windows-protoc\clean-incremental.ps1
+```
+
+确认清单后执行：
+
+```powershell
+& .\tools\windows-protoc\clean-incremental.ps1 -Apply
+```
+
+默认规则：
+
+- 清理范围固定为本仓库 `target/release/incremental` 下的完整缓存目录。
+- 每个 crate 至少保留最新 2 个变体，额外变体中只选择超过 14 天未修改的目录；可通过 `-KeepLatest`、`-OlderThanDays` 调整。
+- 保留独有缓存、近期缓存和无法按名称归属包的 `build_script_build` 缓存。
+- 检测到 Cargo/rustc 运行、无法独占 Release 构建锁或路径含链接时停止或跳过；删除前再次检查候选是否发生变化。
+- `-Apply -WhatIf` 只预览删除操作。正常构建不会自动清理。
+- `deps`、`build`、正式可执行文件和 `tools/windows-protoc/runtime` 均保留。
+
+修改时间用于保守筛选，不能证明缓存完全失效；再次使用已清理的旧变体时会重新生成缓存。预览大小按文件逻辑大小统计，硬链接可能使该值高于实际释放空间。
 
 ## ripgrep 打包
 
@@ -74,12 +117,13 @@ winget install BurntSushi.ripgrep.MSVC
 
 ## 手动使用
 
-需要运行其他 Cargo 命令时，可以在当前 PowerShell 会话中设置：
+需要 Release 静态编译检查时，可以复用相同环境：
 
 ```powershell
-$env:PROTOC = (Resolve-Path .\tools\windows-protoc\runtime\bin\protoc-wrapper.exe).Path
-cargo check -p xai-grok-tools-api
+& .\tools\windows-protoc\invoke-cargo-release.ps1 -CargoCommand check -CargoArguments @('-p', 'xai-grok-tools-api')
 ```
+
+该入口固定附加 `--release`；正式程序构建继续使用 `build-release.ps1`。
 
 ## 更新版本
 

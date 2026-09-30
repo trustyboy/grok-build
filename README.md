@@ -71,6 +71,18 @@ features, and improvements in each release.
 
 ## Building from source
 
+### 本分支 Windows Release 构建与缓存维护
+
+使用 PowerShell 7 和 MSVC 工具链：
+
+```powershell
+& .\tools\windows-protoc\build-release.ps1 --locked
+```
+
+定向测试使用 `tools/windows-protoc/test-release.ps1`，与正式构建共享 protoc 和 ripgrep 环境。保留增量编译时，可以使用 `tools/windows-protoc/clean-incremental.ps1` 预览旧缓存候选，确认后加 `-Apply` 清理。默认保留每个 crate 最新两个变体及 14 天内缓存，保留已编译依赖和正式程序。
+
+详细规则见 [Windows 构建与缓存维护](tools/windows-protoc/README.md)。以下为上游跨平台构建说明。
+
 Requirements:
 
 - **Rust** — the toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml);

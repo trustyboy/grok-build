@@ -15,6 +15,8 @@
   & .\tools\windows-protoc\build-release.ps1 --locked
   ```
 
+- Windows 定向测试使用 `tools/windows-protoc/test-release.ps1 -p <包名> <过滤条件>`，与正式构建共享 protoc/ripgrep 环境；测试程序参数用带引号的 `'--'` 分隔。同一批代码的多个过滤条件优先复用已编译测试程序。
+- 保留 Release 增量编译；旧缓存维护用 `tools/windows-protoc/clean-incremental.ps1` 预览，经用户授权后加 `-Apply`。默认保留每个 crate 最新 2 个变体及 14 天内缓存，构建期间拒绝清理；不得自动清空整个 target。
 - 禁止执行不带 `--release` 的 `cargo build`。
 - 禁止通过 `cargo run` 隐式触发 Debug 构建。
 - 不得为了快速验证而主动编译 Debug 产物；需要验证时，应优先使用不会生成 Debug 可执行文件的静态检查或针对性测试。若验证命令会触发 Rust 编译，也必须显式使用 Release 配置。
