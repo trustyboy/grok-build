@@ -36,8 +36,7 @@ pub enum ConfigUpdate {
     /// Updated `[compat]` vendor-compatibility config.
     /// It is applied on the next agent (re)build, which re-resolves `compat_resolved`.
     Compat(Box<xai_grok_tools::types::compat::CompatConfigToml>),
-    /// The `[model.*]` entries in config.toml changed.
-    /// The agent should re-resolve its model list (BYOK models added/removed, default or surprise changed).
+    /// 模型、默认选择或连接与认证提供者配置变化，需要重建模型目录。
     ModelsChanged,
     /// `~/.grok/models_cache.json` was rewritten on disk (possibly by another grok process sharing the home dir). The agent should consult the cache via `ModelsManager::reload_from_disk_cache`.
     /// That method content-dedupes self-writes (`persist` / `renew_ttl`) before applying.
@@ -335,13 +334,7 @@ impl ConfigReloader {
                 .send(ConfigUpdate::Compat(Box::new(new_compat)));
         }
 
-        // Models: compare [model] (BYOK entries) and [models] (default, surprise) tables
-        // Use toml::Value comparison (covers all fields including nested model entries).
-        let old_model_table = self.last_global_config.get("model");
-        let new_model_table = new_global.get("model");
-        let old_models_table = self.last_global_config.get("models");
-        let new_models_table = new_global.get("models");
-        if old_model_table != new_model_table || old_models_table != new_models_table {
+        if models_config_changed(&self.last_global_config, &new_global) {
             info!("model config change detected");
             let _ = self.config_update_tx.send(ConfigUpdate::ModelsChanged);
         }
@@ -364,6 +357,13 @@ impl ConfigReloader {
         }
         Ok(())
     }
+}
+
+/// 提供者表的增删与修改同样会改变模型的连接或认证来源。
+fn models_config_changed(old: &toml::Value, new: &toml::Value) -> bool {
+    ["model", "models", "model_providers", "auth_provider"]
+        .iter()
+        .any(|key| old.get(*key) != new.get(*key))
 }
 
 fn changed_memory_config(
@@ -874,14 +874,39 @@ base_url = "https://api.example.com/v1"
 "#,
         )
         .unwrap();
-        assert_ne!(a.get("model"), b.get("model"));
+        assert!(models_config_changed(&a, &b));
     }
 
     #[test]
     fn models_changed_detects_default_change() {
         let a: toml::Value = toml::from_str("[models]\ndefault = \"grok-code-fast-1\"").unwrap();
         let b: toml::Value = toml::from_str("[models]\ndefault = \"grok-code-slow-1\"").unwrap();
-        assert_ne!(a.get("models"), b.get("models"));
+        assert!(models_config_changed(&a, &b));
+    }
+
+    #[test]
+    fn models_changed_detects_provider_add_edit_remove() {
+        let empty = toml::Value::Table(toml::map::Map::new());
+        for (table, field) in [
+            ("model_providers", "base_url"),
+            ("auth_provider", "command"),
+        ] {
+            let before: toml::Value =
+                toml::from_str(&format!("[{table}.test]\n{field} = 'before'")).unwrap();
+            let after: toml::Value =
+                toml::from_str(&format!("[{table}.test]\n{field} = 'after'")).unwrap();
+            assert!(models_config_changed(&empty, &before), "{table} 新增");
+            assert!(models_config_changed(&before, &after), "{table} 修改");
+            assert!(models_config_changed(&after, &empty), "{table} 删除");
+            assert!(!models_config_changed(&before, &before), "{table} 未变");
+        }
+    }
+
+    #[test]
+    fn models_changed_ignores_unrelated_config() {
+        let before: toml::Value = toml::from_str("[ui]\ntheme = 'light'").unwrap();
+        let after: toml::Value = toml::from_str("[ui]\ntheme = 'dark'").unwrap();
+        assert!(!models_config_changed(&before, &after));
     }
 
     #[test]

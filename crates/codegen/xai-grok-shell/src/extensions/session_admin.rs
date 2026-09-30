@@ -723,9 +723,18 @@ fn cwd_matches(session_cwd: &std::path::Path, target_cwd: &std::path::Path) -> b
 
 // internal/reload_models
 
-/// Re-resolve the agent model list from config.toml. Called by the config hot-reload watcher when `[model.*]` or `[models]` changes.
-/// Re-reads config from disk, re-runs the `new_with_models()` resolution logic for user TOML config entries, and swaps the model list in-place.
-/// Prefetched (API) and default models are NOT re-fetched; only BYOK entries from config are updated.
+/// 模型与提供者使用同一份配置快照，保留端点和启动参数等运行时字段。
+fn sync_model_config(
+    current: &mut crate::agent::config::Config,
+    loaded: &crate::agent::config::Config,
+) {
+    current.models = loaded.models.clone();
+    current.config_models = loaded.config_models.clone();
+    current.auth_providers = loaded.auth_providers.clone();
+    current.model_providers = loaded.model_providers.clone();
+}
+
+/// 模型或提供者配置变化时重建本地目录，不重新获取远端模型。
 fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
     let disk_config = crate::config::load_effective_config()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
@@ -745,8 +754,7 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
         );
         drop(agent_config);
         let mut agent_config = agent.cfg.borrow_mut();
-        agent_config.models = toml_config.models.clone();
-        agent_config.config_models = toml_config.config_models.clone();
+        sync_model_config(&mut agent_config, &toml_config);
         agent_config.web_search_model = overrides.web_search;
         agent_config.session_summary_model = overrides.session_summary;
         agent_config.image_description_model = overrides.image_description;
@@ -899,6 +907,75 @@ async fn handle_session_fork(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtRes
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
     to_raw_response(&response)
+}
+
+#[cfg(test)]
+mod model_reload_tests {
+    use super::sync_model_config;
+    use crate::agent::config::{Config, resolve_model_list};
+
+    #[test]
+    fn model_reload_syncs_provider_changes_and_removal() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+[auth_provider.reload-helper]
+command = "unused-old-helper"
+
+[model_providers.reload-route]
+base_url = "https://old.example/v1"
+auth_provider = "reload-helper"
+
+[model.reload-source]
+model = "reload-wire"
+model_provider = "reload-route"
+"#,
+        )
+        .unwrap();
+        let mut current = Config::new_from_toml_cfg(&raw).unwrap();
+        current.default_model_override = Some("launch-model".into());
+        current.endpoints.models_base_url = Some("https://launch.example/v1".into());
+        let mut changed = raw.clone();
+        changed["auth_provider"]["reload-helper"]["command"] =
+            toml::Value::String("unused-new-helper".into());
+        changed["model_providers"]["reload-route"]["base_url"] =
+            toml::Value::String("https://new.example/v1".into());
+        let loaded = Config::new_from_toml_cfg(&changed).unwrap();
+
+        sync_model_config(&mut current, &loaded);
+        let models = resolve_model_list(&current, None);
+        let source = models.get("reload-source").unwrap();
+        assert_eq!(source.info.base_url, "https://new.example/v1");
+        assert_eq!(
+            source.auth_provider.as_ref().unwrap().config.command,
+            "unused-new-helper"
+        );
+        assert_eq!(
+            current.default_model_override.as_deref(),
+            Some("launch-model")
+        );
+        assert_eq!(
+            current.endpoints.models_base_url.as_deref(),
+            Some("https://launch.example/v1")
+        );
+
+        changed.as_table_mut().unwrap().remove("auth_provider");
+        let loaded = Config::new_from_toml_cfg(&changed).unwrap();
+        sync_model_config(&mut current, &loaded);
+        assert!(current.auth_providers.is_empty());
+        let models = resolve_model_list(&current, None);
+        let source = models.get("reload-source").unwrap();
+        let provider = source.auth_provider.as_ref().unwrap();
+        assert!(provider.config.command.is_empty());
+        assert!(source.own_credential().is_none());
+
+        changed.as_table_mut().unwrap().remove("model_providers");
+        let loaded = Config::new_from_toml_cfg(&changed).unwrap();
+        sync_model_config(&mut current, &loaded);
+        assert!(current.model_providers.is_empty());
+        let models = resolve_model_list(&current, None);
+        let source = models.get("reload-source").unwrap();
+        assert!(source.auth_provider.as_ref().unwrap().is_fail_closed());
+    }
 }
 
 #[cfg(test)]
