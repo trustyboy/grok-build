@@ -35,7 +35,7 @@ fn discovered() -> acp::SessionModelState {
         "currentModelId": "new",
         "availableModels": [
             {"modelId":"original", "name":"Original"},
-            {"modelId":"new", "name":"New", "_meta":{"runtimeDiscovered":true}}
+            {"modelId":"new", "name":"New", "_meta":{"runtimeDiscovered":true, "totalContextTokens":256000}}
         ]
     }))
     .unwrap()
@@ -45,6 +45,10 @@ fn discovered() -> acp::SessionModelState {
 #[test]
 fn model_request_discovery_success_and_queue() {
     let mut app = model_app();
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .apply_context_used(1_000, 128_000);
     let request = start_discovery(&mut app);
     assert!(app.agents[&AgentId(0)].session.model_switch_pending);
     assert_eq!(
@@ -59,10 +63,7 @@ fn model_request_discovery_success_and_queue() {
         Action::DiscoverAndSwitchModel {
             model_id: acp::ModelId::new("other"),
         },
-        Action::SwitchModel {
-            model_id: acp::ModelId::new("original"),
-            effort: None,
-        },
+        Action::SwitchModel(ModelChoice::new(acp::ModelId::new("original"))),
         Action::SetDefaultModel(acp::ModelId::new("original")),
         Action::SupportVision {
             enabled: Some(true),
@@ -87,6 +88,14 @@ fn model_request_discovery_success_and_queue() {
         Some("new")
     );
     assert_eq!(app.models.current_model_id_str(), Some("original"));
+    assert_eq!(
+        app.agents[&AgentId(0)]
+            .context_state
+            .as_ref()
+            .unwrap()
+            .total,
+        256000
+    );
     assert!(app.models.is_runtime_discovered(&acp::ModelId::new("new")));
     assert!(!app.agents[&AgentId(0)].session.model_switch_pending);
     assert!(
@@ -232,8 +241,7 @@ fn model_request_runtime_selection_never_persists() {
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: AgentId(0),
-            model_id: acp::ModelId::new("new"),
-            effort: None,
+            choice: ModelChoice::new(acp::ModelId::new("new")),
             result: Ok(()),
             prev_model_id: None,
         }),
@@ -288,6 +296,12 @@ fn model_request_vision_completion_paths() {
             panic!("expected vision request")
         };
         assert_eq!(*actual, enabled);
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .session
+            .models
+            .model_changed_during_switch = true;
         enqueue_local(&mut app, AgentId(0), "hello");
         let effects = dispatch(
             Action::TaskComplete(TaskResult::SupportVisionComplete {
@@ -297,6 +311,12 @@ fn model_request_vision_completion_paths() {
             &mut app,
         );
         assert!(!app.agents[&AgentId(0)].session.model_switch_pending);
+        assert!(
+            !app.agents[&AgentId(0)]
+                .session
+                .models
+                .model_changed_during_switch
+        );
         assert_eq!(
             app.agents[&AgentId(0)]
                 .session

@@ -1,5 +1,6 @@
 //! 模型扩展请求的协议编码与严格响应校验。
 
+use super::helpers::{SessionRpcError, format_acp_error};
 use super::{acp_send_bounded, sanitize_user_error};
 use crate::app::actions::{ModelRequestContext, SupportVisionState};
 use agent_client_protocol as acp;
@@ -55,9 +56,13 @@ async fn send<T: Serialize + DeserializeOwned>(
             .expect("model request params")
             .into(),
     );
-    let response = acp_send_bounded(req, tx, method)
-        .await
-        .map_err(|error| sanitize_user_error(&super::helpers::format_acp_error(&error, false)))?;
+    let response = acp_send_bounded(req, tx, method).await.map_err(|error| {
+        let message = match error {
+            SessionRpcError::Rpc(error) => format_acp_error(&error, false),
+            timeout @ SessionRpcError::TimedOut { .. } => timeout.to_string(),
+        };
+        sanitize_user_error(&message)
+    })?;
     parse_result(response.0.get())
 }
 

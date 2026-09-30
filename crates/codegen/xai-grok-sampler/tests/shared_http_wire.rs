@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Once};
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::Version;
-use axum::routing::post;
+use axum::routing::{get, post};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -244,7 +244,11 @@ async fn start_mtls_server(tls: &TestTlsMaterial, state: Arc<TestTlsServerState>
             }
             version => panic!("unexpected negotiated HTTP version: {version:?}"),
         }
-        r#"{"id":"test","object":"chat.completion","created":0,"model":"test","choices":[]}"#
+        if request.uri().path() == "/models" {
+            r#"{"data":[{"id":"mtls-model"}]}"#
+        } else {
+            r#"{"id":"test","object":"chat.completion","created":0,"model":"test","choices":[]}"#
+        }
     }
 
     let certs: Vec<CertificateDer<'static>> =
@@ -270,6 +274,11 @@ async fn start_mtls_server(tls: &TestTlsMaterial, state: Arc<TestTlsServerState>
 
     let app = Router::new()
         .route("/chat/completions", post(accept_request))
+        .route("/models", get(accept_request))
+        .route(
+            "/redirect/models",
+            get(|| async { axum::response::Redirect::temporary("/models") }),
+        )
         .with_state(state);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mTLS server");
     listener.set_nonblocking(true).expect("set nonblocking");
@@ -284,6 +293,34 @@ async fn start_mtls_server(tls: &TestTlsMaterial, state: Arc<TestTlsServerState>
     });
     tokio::task::yield_now().await;
     format!("https://localhost:{port}")
+}
+
+/// 模型发现沿用 mTLS 身份与 HTTP/1 配置，且不得跟随重定向。
+#[tokio::test(flavor = "current_thread")]
+async fn discovery_preserves_mtls_http1_and_rejects_redirects() {
+    pin_env();
+    let fixture = &*TLS_FIXTURE;
+    let mut config = mtls_config(&fixture.cert_dir);
+    config.force_http1 = true;
+    drop(SamplingClient::new(config.clone()).expect("initialize sampler TLS policy"));
+    let state = Arc::new(TestTlsServerState::default());
+    let base_url = start_mtls_server(&fixture.material, state.clone()).await;
+    config.base_url = base_url.clone();
+    assert_eq!(
+        SamplingClient::discover_model_ids(config.clone())
+            .await
+            .unwrap(),
+        ["mtls-model"]
+    );
+    assert_eq!(state.http1_requests.load(Ordering::SeqCst), 1);
+    config.base_url = format!("{base_url}/redirect");
+    assert!(
+        SamplingClient::discover_model_ids(config)
+            .await
+            .unwrap_err()
+            .contains("307")
+    );
+    assert_eq!(state.accepted_requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

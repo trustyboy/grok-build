@@ -18,6 +18,7 @@
 - 禁止执行不带 `--release` 的 `cargo build`。
 - 禁止通过 `cargo run` 隐式触发 Debug 构建。
 - 不得为了快速验证而主动编译 Debug 产物；需要验证时，应优先使用不会生成 Debug 可执行文件的静态检查或针对性测试。若验证命令会触发 Rust 编译，也必须显式使用 Release 配置。
+- Windows/MSVC 可执行程序在 `xai-grok-pager-bin/build.rs` 预留 8 MiB 主线程栈；恢复默认 1 MiB 会导致后台启动时栈溢出，不能只验证 `--version`。
 - Release 可执行文件输出到：
 
   ```text
@@ -51,6 +52,7 @@
 
 - 非 UTF-8 文本文件（GBK/Big5 等）的读写由 `computer/transcoding_fs.rs` 的装饰器在 fs 抽象层统一处理，工具层无需感知。设计见 `docs/非UTF8文件编码支持实现计划.md`，合并见同名合并指南。
 - 生产接入点只有 `registry/types.rs` 一处，若被改回 `FileSystem(ctx.fs)`，功能会**静默失效**（不报错、不崩溃，只是退回乱码行为）。
+- 装饰器需保留有界读取及内容搜索委托；非 UTF-8 单文件搜索仍使用带 `--encoding` 的 ripgrep，不能被不支持编码参数的搜索提供方接管。
 - 弱样本（非 ASCII 字节 < 64）时按 `GROK_FILE_ENCODING` 或系统 ANSI 代码页判定编码，可用该环境变量覆盖。
 - 排查文件乱码用 `cargo test --release -p xai-text-codec --test diagnose -- --nocapture`（需设 `DIAG_FILE`）。
 
@@ -59,6 +61,7 @@
 - Windows 构建辅助模块应与业务代码和主题移植保持独立。
 - 合并上游版本后，先检查仓库 `bin/protoc` 使用的版本；只有上游版本变化时，才同步更新 `tools/windows-protoc/setup.ps1` 中的版本、下载地址和 SHA-256。
 - 不得使用 Git 还原用户已有改动。发现无关的未提交文件时，应保留并绕开这些改动。
+- Windows 下 `cc 1.2.48` 与 `find-msvc-tools 0.1.13` 存在临时文件标志类型不兼容；锁文件使用 `find-msvc-tools 0.1.5`，升级时需验证 Release 编译，勿修改 Cargo 缓存源码。
 
 ## 运行时模型与视觉
 
@@ -73,5 +76,5 @@
 - 合并/维护指南：见 `docs/vision-bridge-插件系统合并指南.md`；功能设计见 `docs/用户提示词变换钩子实现计划.md`。
 - 插件本体在用户主目录 `~/.grok/plugins/vision-bridge/`，**不在仓库内**（`bridge.js` 三通道检测 + `hooks.json`）。迁移到新机器需单独复制该目录。
 - 插件钩子命令必须用 `${GROK_PLUGIN_ROOT}` 占位符写成绝对路径（如 `node ${GROK_PLUGIN_ROOT}/hooks/bin/bridge.js`）。grok 执行钩子命令时 cwd 是工作区，相对路径（如 `node bin/bridge.js`）会静默失败。
-- 会话启动时插件钩子随 hook_registry 一起注册（`spawn.rs` 调用 `append_plugin_hooks_to`）；不要依赖 `/hooks reload` 等 mid-session 事件才加载。
+- 会话启动与钩子重载通过 `with_plugin_hooks` 注册插件层，插件重载通过 `replace_plugin_hooks` 替换；不要再额外追加注册，避免重复执行。`spawn.rs` 必须在首轮前完成注册，并保留受管钩子禁令。
 - 用户级插件从 `$GROK_HOME/plugins`（默认 `~/.grok/plugins`）发现，不从项目 `.grok/plugins` 之外的路径扫描。

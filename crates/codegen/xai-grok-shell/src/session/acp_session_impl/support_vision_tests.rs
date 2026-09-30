@@ -232,6 +232,71 @@ async fn support_vision_hook_matches_wire_images_and_keeps_attachments() {
     }).await;
 }
 
+/// 临时来源逐轮刷新；认证失效后不能发送旧凭据或借新模型绕过检查。
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_model_turn_auth_refreshes_and_fails_closed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut actor = actor().await;
+            let raw: toml::Value = toml::from_str(
+                "[model.source]\nmodel = 'source-wire'\nbase_url = 'https://runtime.example/v1'\napi_key = 'source-key'\n",
+            )
+            .unwrap();
+            let mut config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let auth = Arc::new(xai_grok_login::AuthManager::new(
+                directory.path(),
+                xai_grok_login::GrokComConfig::default(),
+            ));
+            actor.models_manager = crate::agent::remote_config::ModelsManager::new(
+                None,
+                crate::agent::remote_config::resolve_model_catalog(&config, None),
+                acp::ModelId::new("source"),
+                auth,
+                config.clone(),
+            );
+            let model = "runtime-session-turn-auth";
+            actor.models_manager.register_runtime_model("source", model).unwrap();
+            select_model(&actor, model).await;
+            actor.prepare_sampler_for_turn().await.unwrap();
+            let first = actor.reconstruct_full_config().await;
+            assert_eq!(first.api_key.as_deref(), Some("source-key"));
+            assert!(!first.supports_vision);
+
+            let source = config.config_models.get_mut("source").unwrap();
+            source.api_key = Some("rotated-key".into());
+            source.base_url = Some("https://rotated.example/v1".into());
+            actor.models_manager.apply_config(config.clone());
+            actor.prepare_sampler_for_turn().await.unwrap();
+            let second = actor.reconstruct_full_config().await;
+            assert_eq!(second.api_key.as_deref(), Some("rotated-key"));
+            assert_eq!(second.base_url, "https://rotated.example/v1");
+            assert!(second.bearer_resolver.is_none());
+
+            let snapshot = actor.capture_turn_sampling_state().await;
+            config.config_models.get_mut("source").unwrap().api_key = None;
+            actor.models_manager.apply_config(config);
+            assert!(actor.prepare_sampler_for_turn().await.is_err());
+            let blocked = actor.reconstruct_full_config().await;
+            assert!(blocked.base_url.is_empty());
+            assert!(blocked.api_key.is_none());
+            assert!(blocked.bearer_resolver.is_none());
+
+            select_model(&actor, "test").await;
+            super::super::sampler_turn::TURN_SAMPLING_STATE
+                .scope(snapshot, async {
+                    assert!(actor.prepare_sampler_for_turn().await.is_err());
+                    let blocked = actor.reconstruct_full_config().await;
+                    assert_eq!(blocked.model, model);
+                    assert!(blocked.base_url.is_empty());
+                    assert!(blocked.api_key.is_none());
+                    assert!(!blocked.supports_vision);
+                })
+                .await;
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn support_vision_inflight_snapshot_and_next_turn_agree() {
     tokio::task::LocalSet::new()
@@ -264,8 +329,20 @@ async fn support_vision_inflight_snapshot_and_next_turn_agree() {
                     // 上游修正窗口或压缩更新同模型配置时，本轮快照不能恢复旧值。
                     let mut adjusted = actor.chat_state_handle.get_sampling_config().await.unwrap();
                     adjusted.context_window = std::num::NonZeroU64::new(128_000).unwrap();
+                    adjusted.max_request_bytes = std::num::NonZeroU64::new(1_048_576);
+                    adjusted.reasoning_summary =
+                        Some(xai_grok_sampling_types::ReasoningSummary::Detailed);
                     actor.chat_state_handle.update_sampling_config(adjusted);
-                    assert_eq!(actor.reconstruct_full_config().await.context_window, 128_000);
+                    let refreshed = actor.reconstruct_full_config().await;
+                    assert_eq!(refreshed.context_window, 128_000);
+                    assert_eq!(
+                        refreshed.max_request_bytes.map(|limit| limit.get()),
+                        Some(1_048_576)
+                    );
+                    assert_eq!(
+                        refreshed.reasoning_summary,
+                        Some(xai_grok_sampling_types::ReasoningSummary::Detailed)
+                    );
                     actor
                         .chat_state_handle
                         .update_credentials(xai_chat_state::Credentials {

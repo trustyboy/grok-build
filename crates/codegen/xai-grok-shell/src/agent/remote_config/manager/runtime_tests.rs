@@ -51,6 +51,9 @@ fn runtime_defaults_do_not_inherit_capabilities() {
     assert!(!entry.info.supports_vision);
     assert_eq!(entry.info.context_window.get(), 256_000);
     assert_eq!(entry.info.reasoning_effort, None);
+    assert_eq!(entry.info.reasoning_summary, None);
+    assert!(entry.info.context_windows.is_empty());
+    assert_eq!(entry.info.max_request_bytes, None);
     assert!(!entry.info.supports_reasoning_effort);
     assert!(entry.info.reasoning_efforts.is_empty());
     assert!(entry.info.variants.is_empty());
@@ -84,6 +87,55 @@ fn runtime_defaults_do_not_inherit_capabilities() {
     assert!(!manager.model_supports_vision(id));
     assert_eq!(manager.current_model_id().0.as_ref(), "source");
     assert!(manager.inner.cfg.read().models.default.is_none());
+}
+
+#[test]
+fn runtime_task_projection_tracks_valid_sources_and_metadata() {
+    let (manager, mut cfg) = fixture("");
+    let id = "runtime-task-projection";
+    manager.register_runtime_model("source", id).unwrap();
+    let stale_models = manager.models();
+    let snapshot = manager.task_model_catalog_snapshot(false);
+    assert_eq!(snapshot.authority, CatalogAuthority::Complete);
+    assert!(
+        snapshot
+            .eligible
+            .iter()
+            .any(|entry| entry.id == id && entry.model_family.is_none())
+    );
+    assert!(manager.task_model_error(id).is_none());
+    assert_eq!(manager.catalog_key(id), Some(acp::ModelId::new(id)));
+    assert!(manager.available().contains_key(&acp::ModelId::new(id)));
+
+    cfg.models.hidden_models = Some(vec![id.to_owned()]);
+    manager.apply_config(cfg);
+    assert!(manager.runtime_model_entry(id).is_err());
+    assert!(manager.task_model_error(id).is_some());
+    assert!(manager.catalog_key(id).is_none());
+    assert!(!manager.model_in_catalog(id));
+    assert!(!manager.available().contains_key(&acp::ModelId::new(id)));
+    assert!(
+        !manager
+            .task_model_catalog_snapshot(false)
+            .eligible
+            .iter()
+            .any(|entry| entry.id == id)
+    );
+    let stale_acp = config::to_acp_model_info(&stale_models);
+    let meta = stale_acp
+        .get(&acp::ModelId::new(id))
+        .unwrap()
+        .meta
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        meta.get("runtimeDiscovered"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        meta.get("totalContextTokens"),
+        Some(&serde_json::json!(256_000))
+    );
 }
 
 #[test]
@@ -244,6 +296,47 @@ fn runtime_child_keeps_original_source_and_rejects_rebinding() {
             .register_runtime_model("other", "runtime-parent")
             .is_err()
     );
+}
+
+#[test]
+fn runtime_external_catalog_removal_invalidates_source() {
+    let raw: toml::Value = toml::from_str(
+        "[auth]\nauth_provider_command = 'unused-runtime-provider'\n\
+         [endpoints]\nmodels_base_url = 'https://runtime.example/v1'\n\
+         [model.source]\nmodel = 'source-wire'\nbase_url = 'https://runtime.example/v1'\napi_key = 'source-key'\n",
+    ).unwrap();
+    let cfg = config::Config::new_from_toml_cfg(&raw).unwrap();
+    assert!(cfg.config_models.is_empty());
+    assert!(resolve_model_catalog(&cfg, None).is_empty());
+    // 外部目录只信任端点返回的条目，本地模型表不能提供来源。
+    let mut source = ModelEntry::fallback("source-wire", &cfg.endpoints);
+    source.info.base_url = "https://runtime.example/v1".to_owned();
+    source.api_key = Some("source-key".to_owned());
+    let prefetched = IndexMap::from([("source".to_owned(), source)]);
+    let catalog = resolve_model_catalog(&cfg, Some(prefetched.clone()));
+    assert!(catalog.contains_key("source"));
+    let temp = tempfile::tempdir().unwrap();
+    let manager = ModelsManager::new(
+        Some(prefetched),
+        catalog,
+        acp::ModelId::new("source"),
+        Arc::new(AuthManager::new(temp.path(), GrokComConfig::default())),
+        cfg.clone(),
+    );
+    let id = "runtime-external-source";
+    manager.register_runtime_model("source", id).unwrap();
+    manager.set_current_model_id(acp::ModelId::new(id));
+    manager.apply_catalog(&cfg, IndexMap::new(), None);
+    assert!(manager.runtime_model_entry(id).is_err());
+    assert!(
+        manager
+            .task_model_catalog_snapshot(false)
+            .eligible
+            .is_empty()
+    );
+    assert!(manager.available().is_empty());
+    assert!(manager.sampling_config().api_key.is_none());
+    assert!(manager.sampling_config().base_url.is_empty());
 }
 
 #[test]

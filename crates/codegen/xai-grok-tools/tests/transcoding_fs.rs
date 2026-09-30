@@ -55,6 +55,36 @@ async fn reads_gbk_file_as_utf8() {
     );
 }
 
+/// 新增的有界读取保留编码转换，并同时限制原始字节和转换后的字节。
+#[tokio::test]
+async fn bounded_read_preserves_encoding_and_limits() {
+    let (fs, dir) = fixture();
+    assert!(fs.supports_bounded_read());
+    let path = write_raw(&dir, "bounded.txt", SAMPLE, encoding_rs::GBK);
+    let raw_len = std::fs::metadata(&path).unwrap().len() as usize;
+    assert!(raw_len < SAMPLE.len());
+    assert_eq!(
+        fs.read_file_bounded(&path, SAMPLE.len()).await.unwrap(),
+        SAMPLE.as_bytes()
+    );
+    for limit in [raw_len - 1, raw_len] {
+        assert_eq!(
+            fs.read_file_bounded(&path, limit)
+                .await
+                .unwrap_err()
+                .io_error_kind(),
+            Some(std::io::ErrorKind::FileTooLarge)
+        );
+    }
+    let binary = dir.path().join("bounded.png");
+    let bytes = [0x89, 0x50, 0x4e, 0x47, 0x00, 0xff];
+    std::fs::write(&binary, bytes).unwrap();
+    assert_eq!(
+        fs.read_file_bounded(&binary, bytes.len()).await.unwrap(),
+        bytes
+    );
+}
+
 #[tokio::test]
 async fn utf8_file_passes_through_unchanged() {
     let (fs, dir) = fixture();
@@ -182,6 +212,37 @@ async fn binary_write_passes_through() {
     fs.write_file(&path, &raw).await.unwrap();
 
     assert_eq!(std::fs::read(&path).unwrap(), raw, "二进制写入应原样落盘");
+}
+
+/// 搜索命令重构后仍需向 ripgrep 传递单文件编码。
+#[tokio::test]
+async fn grep_reads_single_gbk_file() {
+    use xai_grok_tools::implementations::grok_build::grep::{GrepSearchInput, GrepTool};
+    use xai_grok_tools::types::resources::{Cwd, FileSystem, Resources};
+
+    let (fs, dir) = fixture();
+    let path = write_raw(&dir, "grep.txt", SAMPLE, encoding_rs::GBK);
+    let mut resources = Resources::new();
+    resources.insert(Cwd(dir.path().to_path_buf()));
+    resources.insert(FileSystem(Arc::new(fs)));
+    let input: GrepSearchInput = serde_json::from_value(serde_json::json!({
+        "pattern": "编码探测",
+        "path": path,
+    }))
+    .unwrap();
+    let output = xai_tool_runtime::Tool::run(
+        &GrepTool,
+        xai_grok_tools::types::tool_metadata::test_ctx(resources.into_shared()),
+        input,
+    )
+    .await
+    .unwrap();
+    assert_eq!(output.exit_code, 0, "{:?}", output.stderr);
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("编码探测")
+    );
 }
 
 #[tokio::test]

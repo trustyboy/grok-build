@@ -65,6 +65,122 @@ async fn discovery_supports_x_api_key_and_verbatim_header_overrides() {
     task.abort();
 }
 
+/// 发现请求必须等待刷新，并与推理共用动态认证来源。
+#[tokio::test]
+async fn discovery_uses_prepared_bearer_for_both_auth_schemes() {
+    #[derive(Debug)]
+    struct Resolver(std::sync::atomic::AtomicBool);
+
+    impl xai_grok_sampler::BearerResolver for Resolver {
+        fn current_bearer(&self) -> Option<String> {
+            Some(
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    "fresh-key"
+                } else {
+                    "unprepared-key"
+                }
+                .to_owned(),
+            )
+        }
+
+        fn prepare_for_send(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+
+    for scheme in [AuthScheme::Bearer, AuthScheme::XApiKey] {
+        let (base, task) = serve(Router::new().route(
+            "/v1/models",
+            get(move |req: Request| async move {
+                match scheme {
+                    AuthScheme::Bearer => {
+                        assert_eq!(req.headers()["authorization"], "Bearer fresh-key");
+                        assert!(!req.headers().contains_key("x-api-key"));
+                    }
+                    AuthScheme::XApiKey => {
+                        assert_eq!(req.headers()["x-api-key"], "fresh-key");
+                        assert!(!req.headers().contains_key("authorization"));
+                    }
+                }
+                Json(serde_json::json!({"data":[{"id":"prepared"}]}))
+            }),
+        ))
+        .await;
+        assert_eq!(
+            SamplingClient::discover_model_ids(SamplerConfig {
+                base_url: base,
+                api_key: Some("stale-key".into()),
+                auth_scheme: scheme,
+                bearer_resolver: Some(std::sync::Arc::new(Resolver(false.into()))),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+            ["prepared"]
+        );
+        task.abort();
+    }
+}
+
+/// 无 Content-Length 的分块响应同样受 4 MiB 上限约束。
+#[tokio::test]
+async fn discovery_rejects_oversized_chunked_body() {
+    let (base, task) = serve(Router::new().route(
+        "/v1/models",
+        get(|| async {
+            axum::body::Body::from_stream(futures_util::stream::iter(
+                (0..5).map(|_| Ok::<_, std::io::Error>(vec![b'x'; 1024 * 1024])),
+            ))
+        }),
+    ))
+    .await;
+    assert!(
+        SamplingClient::discover_model_ids(SamplerConfig {
+            base_url: base,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err()
+        .contains("大小限制")
+    );
+    task.abort();
+}
+
+/// 认证刷新也计入发现请求的八秒预算。
+#[tokio::test(start_paused = true)]
+async fn discovery_bounds_bearer_preparation_to_eight_seconds() {
+    #[derive(Debug)]
+    struct PendingResolver;
+
+    impl xai_grok_sampler::BearerResolver for PendingResolver {
+        fn current_bearer(&self) -> Option<String> {
+            None
+        }
+
+        fn prepare_for_send(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    let start = tokio::time::Instant::now();
+    let error = SamplingClient::discover_model_ids(SamplerConfig {
+        base_url: "http://127.0.0.1:1/v1".into(),
+        bearer_resolver: Some(std::sync::Arc::new(PendingResolver)),
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(error.contains("超时"));
+    assert!(start.elapsed() >= std::time::Duration::from_secs(8));
+    assert!(start.elapsed() < std::time::Duration::from_secs(9));
+}
+
 #[tokio::test]
 async fn discovery_rejects_redirects_and_does_not_echo_error_body() {
     let redirected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

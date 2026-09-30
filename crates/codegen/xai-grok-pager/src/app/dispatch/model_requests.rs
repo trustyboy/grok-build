@@ -70,6 +70,7 @@ fn finish_request(app: &mut AppView, request: &ModelRequestContext) -> bool {
     }
     agent.pending_model_request = None;
     agent.session.model_switch_pending = false;
+    agent.session.models.model_changed_during_switch = false;
     true
 }
 
@@ -104,6 +105,7 @@ pub(super) fn discover_complete(
     match result {
         Ok(models) => {
             agent.session.models = Some(models).into();
+            agent.refresh_context_total();
             agent.session.user_model_preference = Some(model_id.clone());
             app.models
                 .update_catalog(agent.session.models.available.clone());

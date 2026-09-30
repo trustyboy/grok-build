@@ -10,6 +10,11 @@ fn opencode_theme_public_contract() {
     assert_eq!(ThemeKind::from_name("opencode"), Some(ThemeKind::OpenCode));
     assert_eq!(ThemeKind::from_name("open-code"), Some(ThemeKind::OpenCode));
     assert_eq!(ThemeKind::from_name("oc"), Some(ThemeKind::OpenCode));
+    assert_eq!(ThemeKind::OpenCode.display_name(), "opencode");
+    assert_eq!(
+        xai_grok_pager_render::theme::display_name_for_canonical("opencode"),
+        "OpenCode"
+    );
     assert!(ThemeKind::selectable().contains(&ThemeKind::OpenCode));
     assert!(ThemeKind::available().contains(&ThemeKind::OpenCode));
     assert_ne!(ThemeKind::OpenCode as u8, ThemeKind::Terminal as u8);

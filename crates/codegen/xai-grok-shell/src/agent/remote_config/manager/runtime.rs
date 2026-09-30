@@ -172,9 +172,18 @@ impl ModelsManager {
     pub(super) fn models_with_runtime(&self) -> IndexMap<String, ModelEntry> {
         let cfg = self.inner.cfg.read();
         let cat = self.inner.catalog.read();
+        self.models_with_runtime_snapshot(&cfg, &cat)
+    }
+
+    /// 复用同代配置和目录，避免任务模型投影混入另一轮刷新。
+    pub(super) fn models_with_runtime_snapshot(
+        &self,
+        cfg: &config::Config,
+        cat: &CatalogState,
+    ) -> IndexMap<String, ModelEntry> {
         let mut models = cat.models.clone();
         models.extend(cat.runtime.iter().filter_map(|(id, runtime)| {
-            self.resolve_runtime_entry(&cfg, &cat, id, runtime)
+            self.resolve_runtime_entry(cfg, cat, id, runtime)
                 .ok()
                 .map(|entry| (id.clone(), entry))
         }));

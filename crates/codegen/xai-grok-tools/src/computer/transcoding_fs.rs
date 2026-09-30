@@ -147,6 +147,40 @@ impl AsyncFileSystem for TranscodingFs {
         Ok(Self::decode_to_utf8(path, &raw).unwrap_or(raw))
     }
 
+    fn supports_bounded_read(&self) -> bool {
+        self.inner.supports_bounded_read()
+    }
+
+    /// 保留底层读取上限，转码扩张后的内容也不得超过调用方限额。
+    async fn read_file_bounded(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ComputerError> {
+        let raw = self.inner.read_file_bounded(path, max_bytes).await?;
+        if raw.len() > max_bytes {
+            return Err(ComputerError::io_with_kind(
+                "文件超过读取大小限制",
+                std::io::ErrorKind::FileTooLarge,
+            ));
+        }
+        let bytes = Self::decode_to_utf8(path, &raw).unwrap_or(raw);
+        if bytes.len() > max_bytes {
+            return Err(ComputerError::io_with_kind(
+                "文件转码后超过读取大小限制",
+                std::io::ErrorKind::FileTooLarge,
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn offer_content_search(
+        &self,
+        request: &crate::computer::content_search::ContentSearchRequest,
+    ) -> Option<crate::computer::content_search::ContentSearchJob> {
+        self.inner.offer_content_search(request)
+    }
+
     async fn write_file(&self, path: &Path, data: &[u8]) -> Result<(), ComputerError> {
         let bytes = self.encode_for_target(path, data).await?;
         self.inner.write_file(path, &bytes).await
