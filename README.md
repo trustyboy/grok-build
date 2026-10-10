@@ -56,6 +56,10 @@ for the version of the code present in this tree.
 
 运行时模型在后台进程退出后不再保留；视觉覆盖也不跨进程保存。用户主动查询已配置的自定义上游不会开启后台远端设置获取，管理层的远程访问禁令仍然优先。
 
+## 第三方模型工具调用兼容（本分支）
+
+Chat Completions 流式工具调用支持后续片段将 `function.name` 留空、设为 `null` 或省略的接口。程序会保留已收到的有效工具名并继续拼接参数，解决部分 DeepSeek 兼容网关触发的空工具名 `Tool not found` 错误。该兼容处理自动生效，使用包含修复的新构建即可。
+
 ## Installing the released binary
 
 Prebuilt binaries are published for macOS, Linux, and Windows:

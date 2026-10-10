@@ -195,7 +195,8 @@ pub fn stream_chat_completions<'a>(
                         id_for_event = Some(id);
                     }
                     if let Some(func) = tc_delta.function {
-                        if let Some(name) = func.name {
+                        // 部分兼容接口用空名称表示本片段仅更新参数。
+                        if let Some(name) = func.name.filter(|name| !name.is_empty()) {
                             entry.1 = name.clone();
                             name_for_event = Some(name);
                         }
@@ -677,6 +678,139 @@ mod tests {
                 assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// 覆盖网关以空字符串、null 或缺省字段表示工具名未更新的流式响应。
+    #[tokio::test]
+    async fn tool_call_stream_preserves_names_across_empty_continuations() {
+        let chunks = [
+            serde_json::json!([
+                {"index": 0, "id": "call_read", "function": {"name": "read_file", "arguments": ""}},
+                {"index": 1, "id": "call_list", "function": {"name": "list_dir", "arguments": ""}}
+            ]),
+            serde_json::json!([
+                {"index": 1, "function": {"name": "", "arguments": "{\"target_directory\":"}},
+                {"index": 0, "function": {"name": "", "arguments": "{\"target_file\":"}}
+            ]),
+            serde_json::json!([
+                {"index": 0, "function": {"name": null, "arguments": "\"example.txt\""}},
+                {"index": 1, "function": {"arguments": "\".\""}}
+            ]),
+            serde_json::json!([
+                {"index": 1, "function": {"name": "", "arguments": "}"}},
+                {"index": 0, "function": {"name": "", "arguments": "}"}}
+            ]),
+        ]
+        .into_iter()
+        .map(|tool_calls| {
+            Ok(make_chunk(vec![ChatChunkDelta {
+                tool_calls: serde_json::from_value(tool_calls).expect("valid tool call deltas"),
+                ..Default::default()
+            }]))
+        });
+        let events = collect(stream_chat_completions(
+            stream::iter(chunks).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ToolCallDelta {
+                    tool_index,
+                    name,
+                    arguments_delta,
+                    ..
+                } => Some((*tool_index, name.as_deref(), arguments_delta.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            vec![
+                (0, Some("read_file"), Some("")),
+                (1, Some("list_dir"), Some("")),
+                (1, None, Some("{\"target_directory\":")),
+                (0, None, Some("{\"target_file\":")),
+                (0, None, Some("\"example.txt\"")),
+                (1, None, Some("\".\"")),
+                (1, None, Some("}")),
+                (0, None, Some("}")),
+            ]
+        );
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls.len(), 2);
+                assert_eq!(nth(calls, 0).id.as_ref(), "call_read");
+                assert_eq!(nth(calls, 0).name, "read_file");
+                assert_eq!(
+                    nth(calls, 0).arguments.as_ref(),
+                    "{\"target_file\":\"example.txt\"}"
+                );
+                assert_eq!(nth(calls, 1).id.as_ref(), "call_list");
+                assert_eq!(nth(calls, 1).name, "list_dir");
+                assert_eq!(
+                    nth(calls, 1).arguments.as_ref(),
+                    "{\"target_directory\":\".\"}"
+                );
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// 工具名可延迟到达或再次更新；始终缺失时保持空值，交由工具查找报错。
+    #[tokio::test]
+    async fn tool_call_stream_accepts_late_names_without_inventing_missing_names() {
+        for names in [["", "read_file", "list_dir"], ["", "", ""]] {
+            let chunks = names.into_iter().enumerate().map(|(index, name)| {
+                Ok(make_chunk(vec![ChatChunkDelta {
+                    tool_calls: vec![ChunkToolCallDelta {
+                        index: 0,
+                        id: (index == 0).then(|| "call_late".into()),
+                        function: Some(ToolCallFunctionDelta {
+                            name: Some(name.into()),
+                            arguments: Some(if index == 0 { "{}" } else { "" }.into()),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }]))
+            });
+            let events = collect(stream_chat_completions(
+                stream::iter(chunks).boxed(),
+                None,
+                rid(),
+                Duration::from_secs(60),
+            ))
+            .await;
+
+            let emitted_names: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    SamplingEvent::ToolCallDelta { name, .. } => Some(name.as_deref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                emitted_names,
+                names.map(|name| (!name.is_empty()).then_some(name))
+            );
+            match events.last().unwrap() {
+                SamplingEvent::Completed { response, .. } => {
+                    let calls = response.tool_calls();
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(nth(calls, 0).name, names[2]);
+                    assert_eq!(nth(calls, 0).arguments.as_ref(), "{}");
+                }
+                other => panic!("expected Completed, got {other:?}"),
+            }
         }
     }
 

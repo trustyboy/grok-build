@@ -73,6 +73,11 @@
 - `/support_vision [on|off]` 的覆盖只属于当前会话和模型；hook 与 sampler 使用 `session/acp_session_impl/sampler_turn.rs` 的同一轮次快照，禁止改回读取共享 `current_model_id`。
 - 本地端到端验证：先完成 Release 构建，再运行 `python tools/test-model-discovery.py`。脚本使用临时配置和本地假上游，不需要真实凭据。
 
+## Chat Completions 工具调用兼容
+
+- `xai-grok-sampler/src/stream/chat_completions.rs` 按工具调用 `index` 合并响应片段；后续 `function.name` 为空字符串、null 或缺省时保留已有名称，流式事件也应跳过空名称更新。部分 DeepSeek 兼容接口会持续返回空名称占位符，合并上游时需保留此处理。
+- 回归测试位于同文件的 `tool_call_stream_*`，覆盖交错调用、空名称、null、字段缺省和延迟名称；原始流始终缺少名称时保持原有错误路径。
+
 ## 插件系统（vision-bridge）
 
 - 功能：主模型不支持视觉时，`UserPromptTransform` 钩子在用户消息发送前注入提示词，引导模型调用 vision MCP 工具识别图片（如 `opencode-vision-lite` 的 `vision_analyze`）；模型 `supports_vision=true` 时插件放行不注入。
