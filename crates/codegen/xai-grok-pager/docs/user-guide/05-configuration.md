@@ -357,19 +357,21 @@ dimensions = 1024                     # vector dimensions
 ### Subagents
 
 ```toml
-[subagents]
+[subagent]
 enabled = true
 sampling_limit = 12                   # concurrent in-flight subagent sampling calls per process; defaults to max_concurrent (32) when unset (GROK_SUBAGENT_SAMPLING_LIMIT)
 
-[subagents.toggle]
+[subagent.toggle]
 explore = true                        # enable/disable specific types
 plan = false
 
-[subagents.models]
+[subagent.models]
 explore = "grok-4.6"               # route to different models
 ```
 
-To pin the model a subagent uses, set its entry under `[subagents.models]`.
+按类型指定模型用 `[subagent.models]`；统一默认模型和 effort 用 `[subagent] model/reasoning_effort`，主模型专属默认用 `[model.<id>] subagent_model`。后者只指定模型，低于按类型规则、高于统一默认；完整优先级见[子代理配置](16-subagents.md#模型与推理强度优先级)。
+
+正式配置名称为 `[subagent]` 及其 `models/roles/personas/toggle` 子表。旧 `[subagents]` 仍兼容读取，新旧同键单数优先，旧表独有键保留；环境变量和 `--no-subagents` 不改名。会话临时选择用 `/subagent-model`，旧 `/subagents-model` 保留兼容别名。
 
 ### Goal mode and background workflows
 

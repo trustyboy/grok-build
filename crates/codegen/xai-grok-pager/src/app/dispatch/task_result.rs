@@ -972,6 +972,12 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::SupportVisionComplete { request, result } => {
             super::model_requests::support_vision_complete(app, request, result)
         }
+        TaskResult::FastModeComplete { request, result } => {
+            super::model_requests::fast_mode_complete(app, request, result)
+        }
+        TaskResult::SubagentsModelComplete { request, result } => {
+            super::model_requests::subagents_model_complete(app, request, result)
+        }
         TaskResult::MemoryFlushComplete { agent_id, result } => handle_memory_command_complete(
             app,
             agent_id,

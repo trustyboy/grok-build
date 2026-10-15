@@ -331,6 +331,15 @@ impl MvpAgent {
             parent_max_turns,
             available_models,
             subagent_model_overrides,
+            subagents_model: ps
+                .map(|h| h.subagents_model.lock().clone())
+                .unwrap_or_default(),
+            subagent_default_model: self.cfg.borrow().subagent_default_model.clone(),
+            subagent_default_reasoning_effort: self
+                .cfg
+                .borrow()
+                .subagent_default_reasoning_effort
+                .clone(),
             subagent_toggle,
             subagent_roles,
             subagent_personas,

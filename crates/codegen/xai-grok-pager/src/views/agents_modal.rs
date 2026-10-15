@@ -587,13 +587,17 @@ fn persona_detail_from_local_file(
         scope_label: Some(scope.label().to_string()),
     })
 }
-/// Load the `[subagents.toggle]` map from config.toml.
+/// 读取 `[subagent.toggle]`，兼容旧的 `[subagents.toggle]`。
 pub fn load_agent_toggle() -> HashMap<String, bool> {
     let root = match xai_grok_shell::config::load_effective_config() {
         Ok(r) => r,
         Err(_) => return HashMap::new(),
     };
-    let Some(subagents) = root.get("subagents") else {
+    agent_toggle_from_config(&root)
+}
+/// 原始配置与有效配置共用别名合并规则。
+fn agent_toggle_from_config(root: &toml::Value) -> HashMap<String, bool> {
+    let Some(subagents) = xai_grok_config::subagent_config_section(root) else {
         return HashMap::new();
     };
     let Some(toggle_table) = subagents.get("toggle") else {
@@ -775,25 +779,40 @@ pub fn set_default_agent(name: Option<&str>) -> Result<(), String> {
         .map_err(|e| format!("Failed to write config.toml: {e}"))?;
     Ok(())
 }
-/// Toggle an agent's enabled state via `[subagents.toggle]` in config.toml.
+/// 将开关写入 `[subagent.toggle]`，保留其他旧配置。
 pub fn toggle_agent(name: &str, enabled: bool) -> Result<(), String> {
     let config_path = xai_grok_config::grok_home().join(xai_grok_config::USER_CONFIG_FILENAME);
+    toggle_agent_at(&config_path, name, enabled)
+}
+/// 显式路径便于隔离配置写入测试。
+fn toggle_agent_at(config_path: &Path, name: &str, enabled: bool) -> Result<(), String> {
     if let Some(parent) = config_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Some(mut doc) = crate::config_toml_edit::read_config_document_for_edit(&config_path) else {
+    let Some(mut doc) = crate::config_toml_edit::read_config_document_for_edit(config_path) else {
         return Err("Could not read or parse config.toml".to_string());
     };
-    let subagents_item = doc.entry("subagents").or_insert(toml_edit::table());
+    let subagents_item = doc.entry("subagent").or_insert(toml_edit::table());
     let subagents = subagents_item
-        .as_table_mut()
-        .ok_or("subagents is not a table")?;
-    let toggle_item = subagents.entry("toggle").or_insert(toml_edit::table());
-    let toggle_table = toggle_item
-        .as_table_mut()
-        .ok_or("subagents.toggle is not a table")?;
+        .as_table_like_mut()
+        .ok_or("subagent is not a table")?;
+    if !subagents.contains_key("toggle") {
+        subagents.insert("toggle", toml_edit::table());
+    }
+    let toggle_table = subagents
+        .get_mut("toggle")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or("subagent.toggle is not a table")?;
     toggle_table.insert(name, toml_edit::value(enabled));
-    std::fs::write(&config_path, doc.to_string())
+    // 清除同一个旧键，避免后续删除新覆盖时旧值复活。
+    if let Some(legacy) = doc
+        .get_mut("subagents")
+        .and_then(|section| section.get_mut("toggle"))
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        legacy.remove(name);
+    }
+    std::fs::write(config_path, doc.to_string())
         .map_err(|e| format!("Failed to write config.toml: {e}"))?;
     Ok(())
 }
@@ -2524,6 +2543,68 @@ pub fn handle_agents_mouse(state: &mut AgentsModalState, mouse: &MouseEvent) -> 
 mod tests {
     use super::*;
     use xai_grok_shell::agent::config::DEFAULT_AGENT_TYPE;
+
+    #[test]
+    fn subagent_toggle_reads_legacy_and_canonical_per_key() {
+        let raw: toml::Value = toml::from_str(
+            "[subagents.toggle]\nexplore = false\nplan = false\nbad = 42\n[subagent.toggle]\nexplore = true\n",
+        ).unwrap();
+        let toggles = agent_toggle_from_config(&raw);
+        assert_eq!(toggles.get("explore"), Some(&true));
+        assert_eq!(toggles.get("plan"), Some(&false));
+        assert!(!toggles.contains_key("bad"));
+        let old: toml::Value = toml::from_str("[subagents.toggle]\nexplore = false").unwrap();
+        assert_eq!(agent_toggle_from_config(&old).get("explore"), Some(&false));
+    }
+
+    #[test]
+    fn subagent_toggle_writes_canonical_and_removes_only_matching_legacy_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for source in [
+            "[subagents.toggle]\nexplore = false\nplan = false\n[subagents.personas.reviewer]\ninstructions = 'keep'\n[ui]\ntheme = 'terminal'\n",
+            "subagents = { toggle = { explore = false, plan = false }, personas = { reviewer = { instructions = 'keep' } } }\nsubagent = { toggle = { explore = false } }\n[ui]\ntheme = 'terminal'\n",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            toggle_agent_at(&path, "explore", true).unwrap();
+            let raw: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                raw.get("subagent")
+                    .and_then(|s| s.get("toggle"))
+                    .and_then(|t| t.get("explore"))
+                    .and_then(toml::Value::as_bool),
+                Some(true)
+            );
+            assert!(
+                raw.get("subagents")
+                    .and_then(|s| s.get("toggle"))
+                    .and_then(|t| t.get("explore"))
+                    .is_none()
+            );
+            assert_eq!(agent_toggle_from_config(&raw).get("plan"), Some(&false));
+            assert_eq!(
+                raw.get("subagents")
+                    .and_then(|s| s.get("personas"))
+                    .and_then(|p| p.get("reviewer"))
+                    .and_then(|p| p.get("instructions"))
+                    .and_then(toml::Value::as_str),
+                Some("keep")
+            );
+            assert_eq!(
+                raw.get("ui")
+                    .and_then(|s| s.get("theme"))
+                    .and_then(toml::Value::as_str),
+                Some("terminal")
+            );
+        }
+        for bad in ["subagent = 42", "[subagent]\ntoggle = false", "not valid ["] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(toggle_agent_at(&path, "explore", true).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+        }
+    }
+
     #[test]
     fn agents_tab_next_cycles() {
         assert_eq!(AgentsTab::Agents.next(), AgentsTab::Personas);

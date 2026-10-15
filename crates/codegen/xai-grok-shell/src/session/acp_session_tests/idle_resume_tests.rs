@@ -177,6 +177,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
                 vision_overrides: Default::default(),
+                fast_mode_overrides: Default::default(),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),

@@ -2446,9 +2446,7 @@ async fn read_parent_sampling_config_fallback_resolves_compactions_remaining_fro
             "fallback path should also resolve compactions-remaining capability from the catalog"
         );
 }
-/// Drive the real precedence path (`resolve_effective_model_config`, which `run_shell_child` calls).
-/// With both an explicit `runtime_override_model` and a `[subagents.models]` pin for the same agent present, the runtime override wins.
-/// With `None` (inherit) the pin wins, and an unknown override falls through to the pin.
+/// 测试入口与生产共享模型解析；显式模型优先于类型配置，未知模型逐级回退。
 #[tokio::test]
 async fn runtime_override_wins_over_subagents_models_pin_in_precedence_path() {
     use xai_grok_agent::config::ModelOverride;

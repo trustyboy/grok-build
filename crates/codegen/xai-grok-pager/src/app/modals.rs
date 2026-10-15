@@ -1805,6 +1805,12 @@ impl AgentView {
                         &self.session.models,
                         args_query,
                     ),
+                    "subagent-model" | "subagents-model" => {
+                        crate::slash::commands::subagents_model::picker_title(
+                            &self.session.models,
+                            args_query,
+                        )
+                    }
                     "theme" | "t" => "Pick theme",
                     _ => "Pick option",
                 };

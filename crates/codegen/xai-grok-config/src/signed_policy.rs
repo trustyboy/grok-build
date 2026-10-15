@@ -66,8 +66,8 @@ const fn const_str_eq(a: &str, b: &str) -> bool {
     true
 }
 
-/// Debug-only key override for tests (`test` or `test-signing-seam`); never in release builds.
-#[cfg(all(test, debug_assertions))]
+/// 仅测试程序使用的密钥覆盖，支持 Release 测试；正式产物不包含此入口。
+#[cfg(test)]
 pub mod test_seam {
     use std::cell::RefCell;
     use std::sync::RwLock;
@@ -135,7 +135,7 @@ pub mod test_seam {
 }
 
 fn with_embedded_keys<R>(f: impl FnOnce(&[(&str, &[u8])]) -> R) -> R {
-    #[cfg(all(test, debug_assertions))]
+    #[cfg(test)]
     {
         test_seam::with_override(|overridden| match overridden {
             Some(keys) => {
@@ -148,7 +148,7 @@ fn with_embedded_keys<R>(f: impl FnOnce(&[(&str, &[u8])]) -> R) -> R {
             None => f(EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS),
         })
     }
-    #[cfg(not(all(test, debug_assertions)))]
+    #[cfg(not(test))]
     {
         f(EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS)
     }

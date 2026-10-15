@@ -32,36 +32,11 @@ impl SlashCommand for ModelCommand {
     }
 
     fn suggest_args(&self, ctx: &AppCtx, args_query: &str) -> Option<Vec<ArgItem>> {
-        if ctx.models.is_empty() {
-            return None;
-        }
-
-        match chained_phase(ctx.models, args_query) {
-            Some(ChainedPhase::Window { model_id, prefix }) => {
-                Some(build_window_items(ctx.models, &model_id, &prefix))
-            }
-            Some(ChainedPhase::Effort { model_id, prefix }) => {
-                Some(build_effort_items(ctx.models, &model_id, &prefix))
-            }
-            Some(ChainedPhase::Done) => None,
-            None => Some(build_model_items(ctx.models)),
-        }
+        suggest_model_args(ctx.models, args_query)
     }
 
     fn preselected_arg(&self, ctx: &AppCtx, args_query: &str) -> Option<String> {
-        // A typed filter leaves the opening row to the match ranking
-        let fresh = |prefix: &str| args_query.trim_end().eq_ignore_ascii_case(prefix);
-        match chained_phase(ctx.models, args_query)? {
-            ChainedPhase::Window { model_id, prefix } if fresh(&prefix) => {
-                let window = ctx.models.window_after_switch_to(&model_id)?;
-                Some(window_insert_text(ctx.models, &model_id, &prefix, window))
-            }
-            ChainedPhase::Effort { model_id, prefix } if fresh(&prefix) => {
-                let option = ctx.models.preselected_effort_option_for(&model_id)?;
-                Some(effort_insert_text(&prefix, &option))
-            }
-            ChainedPhase::Window { .. } | ChainedPhase::Effort { .. } | ChainedPhase::Done => None,
-        }
+        preselected_model_arg(ctx.models, args_query)
     }
 
     /// 已知目录优先解析，未知单个 ID 才进入异步发现。
@@ -71,46 +46,28 @@ impl SlashCommand for ModelCommand {
             return CommandResult::Error("Usage: /model <name> [window] [effort]".into());
         }
 
-        // Prefer an exact full-string catalog match first. Model display names often contain spaces ("Grok 4.5").
-        // If we split on the last token first, a shorter catalog entry ("Grok") would steal the prefix and treat "4.5" as an effort level
-        if let Some(id) = ctx.models.resolve_by_name_or_id(trimmed) {
-            return CommandResult::Action(if ctx.models.is_runtime_discovered(&id) {
-                Action::SwitchModel(ModelChoice::new(id))
-            } else {
-                Action::SetDefaultModel(id)
-            });
-        }
-
-        // A trailing window or effort after the model is a session switch
-        if let Some((id, rest)) = split_model_rest(ctx.models, trimmed) {
-            let windows = ctx.models.context_window_options_for(&id);
-            let (window, effort_token) = match split_window_effort(rest, &windows) {
-                Ok(split) => split,
-                Err(message) => return CommandResult::Error(message),
-            };
-
-            // A window alone keeps the current model's effort, like `/context-window`
-            if let Some(window) = window
-                && effort_token.is_empty()
-            {
-                let effort = ctx
-                    .models
-                    .reasoning_effort
-                    .filter(|_| ctx.models.current.as_ref() == Some(&id));
-                return CommandResult::Action(Action::SwitchModel(ModelChoice {
-                    model_id: id,
-                    effort,
-                    context_window_selection: Some(window),
-                }));
+        match parse_known_model_choice(ctx.models, trimmed) {
+            Ok(Some(mut choice)) => {
+                if choice.effort.is_none() && choice.context_window_selection.is_none() {
+                    return CommandResult::Action(
+                        if ctx.models.is_runtime_discovered(&choice.model_id) {
+                            Action::SwitchModel(choice)
+                        } else {
+                            Action::SetDefaultModel(choice.model_id)
+                        },
+                    );
+                }
+                // 主模型的仅窗口选择保留当前 effort；共享解析器不继承会话值。
+                if choice.effort.is_none() {
+                    choice.effort = ctx
+                        .models
+                        .reasoning_effort
+                        .filter(|_| ctx.models.current.as_ref() == Some(&choice.model_id));
+                }
+                return CommandResult::Action(Action::SwitchModel(choice));
             }
-            return match ctx.models.resolve_effort_for_model(&id, effort_token) {
-                Ok(effort) => CommandResult::Action(Action::SwitchModel(ModelChoice {
-                    model_id: id,
-                    effort: Some(effort),
-                    context_window_selection: window,
-                })),
-                Err(err) => CommandResult::Error(err.message()),
-            };
+            Err(message) => return CommandResult::Error(message),
+            Ok(None) => {}
         }
 
         if !trimmed.chars().any(char::is_whitespace) {
@@ -128,6 +85,68 @@ impl SlashCommand for ModelCommand {
     }
 }
 
+/// 精确名称优先；只解析显式参数，不继承主会话值或产生持久化动作。
+pub(super) fn parse_known_model_choice(
+    models: &ModelState,
+    args: &str,
+) -> Result<Option<ModelChoice>, String> {
+    if let Some(id) = models.resolve_by_name_or_id(args) {
+        return Ok(Some(ModelChoice::new(id)));
+    }
+    let Some((model_id, rest)) = split_model_rest(models, args) else {
+        return Ok(None);
+    };
+    let windows = models.context_window_options_for(&model_id);
+    let (context_window_selection, effort_token) = split_window_effort(rest, &windows)?;
+    let effort = if effort_token.is_empty() {
+        None
+    } else {
+        Some(
+            models
+                .resolve_effort_for_model(&model_id, effort_token)
+                .map_err(|error| error.message())?,
+        )
+    };
+    Ok(Some(ModelChoice {
+        model_id,
+        effort,
+        context_window_selection,
+    }))
+}
+
+/// 共享模型、窗口和 effort 链式补全；调用方决定是否提供会话选择。
+pub(super) fn suggest_model_args(models: &ModelState, args_query: &str) -> Option<Vec<ArgItem>> {
+    if models.is_empty() {
+        return None;
+    }
+    match chained_phase(models, args_query) {
+        Some(ChainedPhase::Window { model_id, prefix }) => {
+            Some(build_window_items(models, &model_id, &prefix))
+        }
+        Some(ChainedPhase::Effort { model_id, prefix }) => {
+            Some(build_effort_items(models, &model_id, &prefix))
+        }
+        Some(ChainedPhase::Done) => None,
+        None => Some(build_model_items(models)),
+    }
+}
+
+/// 仅新打开的子菜单预选默认项，输入筛选词后交由匹配排序。
+pub(super) fn preselected_model_arg(models: &ModelState, args_query: &str) -> Option<String> {
+    let fresh = |prefix: &str| args_query.trim_end().eq_ignore_ascii_case(prefix);
+    match chained_phase(models, args_query)? {
+        ChainedPhase::Window { model_id, prefix } if fresh(&prefix) => {
+            let window = models.window_after_switch_to(&model_id)?;
+            Some(window_insert_text(models, &model_id, &prefix, window))
+        }
+        ChainedPhase::Effort { model_id, prefix } if fresh(&prefix) => {
+            let option = models.preselected_effort_option_for(&model_id)?;
+            Some(effort_insert_text(&prefix, &option))
+        }
+        ChainedPhase::Window { .. } | ChainedPhase::Effort { .. } | ChainedPhase::Done => None,
+    }
+}
+
 fn supports_reasoning_effort(info: &acp::ModelInfo) -> bool {
     supports_reasoning_effort_meta(info.meta.as_ref())
 }
@@ -142,7 +161,7 @@ pub(crate) fn picker_title(models: &ModelState, args_query: &str) -> &'static st
 }
 
 /// Which chained sub-menu the typed args have reached.
-enum ChainedPhase {
+pub(super) enum ChainedPhase {
     Window {
         model_id: acp::ModelId,
         prefix: String,
@@ -155,7 +174,7 @@ enum ChainedPhase {
 }
 
 /// The sub-menu for `args_query`, or `None` while the user is still picking a model.
-fn chained_phase(models: &ModelState, args_query: &str) -> Option<ChainedPhase> {
+pub(super) fn chained_phase(models: &ModelState, args_query: &str) -> Option<ChainedPhase> {
     let (id, key, rest) = longest_chained_prefix(models, args_query)?;
     let model_id = id.clone();
     let windows = models.context_window_options_for(&model_id);
@@ -253,11 +272,20 @@ fn longest_chained_prefix<'a>(
     models: &'a ModelState,
     args: &'a str,
 ) -> Option<(&'a acp::ModelId, &'a str, &'a str)> {
+    longest_model_prefix(models, args, true)
+}
+
+/// 参数解析匹配全部模型；补全只匹配有后续子菜单的模型。
+fn longest_model_prefix<'a>(
+    models: &'a ModelState,
+    args: &'a str,
+    chained_only: bool,
+) -> Option<(&'a acp::ModelId, &'a str, &'a str)> {
     let mut best: Option<(&acp::ModelId, &str, &str)> = None;
     for (id, info) in models
         .available
         .iter()
-        .filter(|(id, info)| has_chained_args(models, id, info))
+        .filter(|(id, info)| !chained_only || has_chained_args(models, id, info))
     {
         let name = info.name.as_str();
         let id_str = id.0.as_ref();
@@ -274,7 +302,7 @@ fn longest_chained_prefix<'a>(
 }
 
 fn split_model_rest<'a>(models: &'a ModelState, args: &'a str) -> Option<(acp::ModelId, &'a str)> {
-    let (id, _, rest) = longest_chained_prefix(models, args)?;
+    let (id, _, rest) = longest_model_prefix(models, args, false)?;
     let rest = rest.trim();
     if rest.is_empty() {
         None
@@ -970,8 +998,8 @@ mod tests {
         state.available.insert(id, info);
         let mut ctx = dummy_exec_ctx(&state);
         let result = ModelCommand.run(&mut ctx, "Grok 4.5 high");
-        // Falls through to "is the whole string a model name?", which it isn't, so we get an Unknown error
-        assert!(matches!(result, CommandResult::Error(_)));
+        assert!(matches!(result, CommandResult::Error(message)
+            if message.contains("does not support reasoning effort")));
     }
 
     /// The bare `/model <name>` form dispatches `Action::SetDefaultModel(<ModelId>)` instead of the legacy `Action::SwitchModel { effort: None }`.

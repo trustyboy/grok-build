@@ -164,6 +164,7 @@ pub struct TelemetryRequirements {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(remote = "Self")]
 pub struct RequirementsToml {
     #[serde(default, deserialize_with = "de_section")]
     pub models: ModelRequirements,
@@ -173,7 +174,7 @@ pub struct RequirementsToml {
     pub cli: CliRequirements,
     #[serde(default, deserialize_with = "de_section")]
     pub memory: MemoryRequirements,
-    #[serde(default, deserialize_with = "de_section")]
+    #[serde(default, rename = "subagent", deserialize_with = "de_section")]
     pub subagents: SubagentsRequirements,
     #[serde(default, deserialize_with = "de_section")]
     pub managed_mcps: ManagedMcpsRequirements,
@@ -183,10 +184,19 @@ pub struct RequirementsToml {
     pub telemetry: TelemetryRequirements,
 }
 
+impl<'de> Deserialize<'de> for RequirementsToml {
+    /// 先合并别名，避免双表触发重复字段错误并丢失其他策略。
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = toml::Value::deserialize(deserializer)?;
+        crate::normalize_subagent_config(&mut value);
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl RequirementsToml {
     #[must_use]
     pub fn from_value(layer: &toml::Value) -> Self {
-        Self::deserialize(layer.clone()).unwrap_or_default()
+        <Self as Deserialize>::deserialize(layer.clone()).unwrap_or_default()
     }
 
     pub fn tool_pins(&self) -> impl Iterator<Item = (ToolFeature, bool)> + '_ {
@@ -219,7 +229,7 @@ impl RequirementsToml {
         write_flag(
             pins.subagents_enabled,
             self.subagents.enabled,
-            "subagents.enabled",
+            "subagent.enabled",
             push,
         );
         write_flag(
@@ -417,7 +427,7 @@ pub struct CliStringPins<'a> {
 pub struct ServiceTogglePins<'a> {
     /// Receives `memory.enabled`.
     pub memory_enabled: &'a mut Option<bool>,
-    /// Receives `subagents.enabled`.
+    /// Receives `subagent.enabled`.
     pub subagents_enabled: &'a mut bool,
     /// Receives `managed_mcps.enabled`.
     pub managed_mcps_enabled: &'a mut bool,
@@ -624,7 +634,7 @@ de_bool!(
 );
 de_bool!(
     de_subagents_enabled,
-    "subagents",
+    "subagent",
     "enabled",
     "requirements value is not a boolean; the constraint is not applied"
 );

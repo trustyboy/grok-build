@@ -104,6 +104,40 @@ Switch models. Accepts a model ID or display name (case-insensitive). When the m
 /model Reasoning X 500k high
 ```
 
+### `/subagent-model [status|inherit|reset|模型 [window] [effort]]`
+
+查询或临时选择**当前父会话之后新建子代理**的默认模型，不切换主模型，也不写入配置。旧 `/subagents-model` 保留为兼容别名。无参等同于 `status`，显示默认 `general-purpose` 子代理的模型、实际推理强度、上下文窗口、来源和警告；主模型 `subagent_model` 生效时来源显示「主模型专属配置」，全局配置值与当前父模型专属值分开显示。有角色、persona 或单次显式参数时，实际选择按[子代理优先级](16-subagents.md#模型与推理强度优先级)解析。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/subagent-model` 或 `/subagent-model status` | 只查询默认状态 |
+| `/subagent-model <模型ID或名称> [window] [effort]` | 临时指定模型；按模型、窗口、effort 的顺序解析与补全，窗口或 effort 可省略 |
+| `/subagent-model inherit` | 跳过模型默认值，动态跟随父会话当前模型 |
+| `/subagent-model reset` | 清除临时选择，恢复当前主模型对应的配置规则 |
+
+例如 `/subagent-model nd-gpt-astra 256k high`；也可只写模型或模型加 `high`。窗口、effort 必须由目标模型声明支持。`status`、`inherit`、`reset` 是保留控制词。
+
+未知模型只接受单个完整 ID，先复用 `/model` 的跨上游发现，再选择命中来源的接口和认证；发现成功只注册临时模型与子代理选择，**主模型不变**。未知 ID 带参数时先单独发现，再为已经加载的模型设置参数。发现模型默认窗口 `256000`、视觉关闭且无 effort 能力，不代表真实服务能力上限。发现、参数校验或过期会话请求失败均保留原值。
+
+临时窗口和 effort 只对最终采用该临时目标模型的子代理生效，不会泄漏到单次显式指定的其他模型。`inherit`、`reset` 均清除临时窗口与 effort，但不会删除全局 `[subagent] reasoning_effort`。指定模型在父模型切换后仍保留；`inherit` 跳过主模型专属及全局模型配置，动态跟随父模型；`reset` 恢复当前主模型 `subagent_model` 等配置规则。覆盖按父会话隔离，重启或重新加载会话后恢复配置。已启动子代理不变，恢复子代理使用原模型，内部复制父上下文的路径使用父模型。
+
+### `/fast [on|off|status]`
+
+切换或查询当前会话、当前模型的快速模式。无参会**翻转状态**，只想查看时请使用 `/fast status`。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/fast` | 翻转当前有效状态 |
+| `/fast on` | 开启快速模式 |
+| `/fast off` | 关闭快速模式 |
+| `/fast status` | 只查询状态，不修改 |
+
+其他参数会显示中文用法。操作由后端确认，从下一轮生效，不改变正在运行的一轮。覆盖值按会话和模型隔离，切走再切回仍保留该模型的选择，不影响其他会话，不写入配置，也不跨进程保存。
+
+仅 Responses API 支持；非 Responses 模型可查询并获得不支持提示，但修改请求会被后端拒绝。开启时 Responses 请求发送 `service_tier: "priority"`（OpenAI Fast 兼容值），关闭时省略字段、沿用上游默认。Fast 不修改模型、思考级别或上下文窗口。
+
+**开启后账单更高**；实际加速和计费依赖服务端、模型及账户支持。状态显示已开启只代表已选择请求优先服务，不保证上游接受或提供加速。模型配置 `fast_mode` 默认 `false`，可在 `[model.<id>]` 中设为 `true` 长期默认开启，详见[自定义模型](11-custom-models.md)。
+
 ### `/effort <level>`
 
 Set reasoning effort on the **current** model without reselecting it. Levels are `low`, `medium`, `high`, and `xhigh`, and it only applies when the active model supports reasoning effort.

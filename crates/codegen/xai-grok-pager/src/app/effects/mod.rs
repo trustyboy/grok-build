@@ -1936,6 +1936,20 @@ pub(crate) fn execute(
                 TaskResult::SupportVisionComplete { request, result }
             });
         }
+        Effect::FastMode { request, action } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let result = model_requests::fast_mode(&request, action, &tx).await;
+                TaskResult::FastModeComplete { request, result }
+            });
+        }
+        Effect::SubagentsModel { request, action } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let result = model_requests::subagents_model(&request, action, &tx).await;
+                TaskResult::SubagentsModelComplete { request, result }
+            });
+        }
         Effect::SwitchModel { agent_id, session_id, choice, prev_model_id } => {
             let tx = acp_tx.clone();
             tasks

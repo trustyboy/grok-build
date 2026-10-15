@@ -501,6 +501,7 @@ pub fn hook_config_layers_at(
 /// Applies matching `[[version_overrides]]` patches against the running CLI version; strips the section either way.
 /// If the installed version can't be parsed (broken `GROK_TEST_VERSION` in dev), it silently strips without applying, keeping the CLI usable.
 pub fn apply_version_overrides_with_registered(value: &mut toml::Value) -> std::io::Result<()> {
+    normalize_subagent_config(value);
     match xai_grok_version::installed_semver() {
         Ok(version) => apply_version_overrides(value, &version)
             .map_err(|e| std::io::Error::other(e.redacted())),
@@ -517,6 +518,7 @@ pub fn apply_version_overrides_with_registered(value: &mut toml::Value) -> std::
 /// `deep_merge_toml` then replaces the whole policy from the winning layer instead of mixing keys across layers.
 /// This runs on every input of the merge, not only the disk layers.
 pub(crate) fn normalize_config_layer(layer: &mut toml::Value) {
+    normalize_subagent_config(layer);
     let Some(web_search) = layer
         .as_table_mut()
         .and_then(|t| t.get_mut("toolset"))
@@ -545,6 +547,33 @@ pub(crate) fn normalize_config_layer(layer: &mut toml::Value) {
             toml::Value::Array(Vec::new()),
         );
     }
+}
+
+/// 读取新旧子代理配置；同层按字段合并，单数同名键优先。
+pub fn subagent_config_section(config: &toml::Value) -> Option<std::borrow::Cow<'_, toml::Value>> {
+    match (config.get("subagents"), config.get("subagent")) {
+        (Some(legacy), Some(canonical)) => {
+            let mut merged = legacy.clone();
+            deep_merge_toml(&mut merged, canonical);
+            Some(std::borrow::Cow::Owned(merged))
+        }
+        (None, Some(value)) | (Some(value), None) => Some(std::borrow::Cow::Borrowed(value)),
+        (None, None) => None,
+    }
+}
+
+/// 仅归一化根级配置名；必须在各层合并前调用，避免旧名改变层优先级。
+pub fn normalize_subagent_config(config: &mut toml::Value) {
+    let Some(table) = config.as_table_mut() else {
+        return;
+    };
+    let Some(mut legacy) = table.remove("subagents") else {
+        return;
+    };
+    if let Some(canonical) = table.remove("subagent") {
+        deep_merge_toml(&mut legacy, &canonical);
+    }
+    table.insert("subagent".to_owned(), legacy);
 }
 
 /// Recursively merge `overrides` into `base`. Values in `overrides` win.
@@ -599,6 +628,79 @@ mod tests {
 
     fn write(dir: &Path, name: &str, contents: &str) {
         std::fs::write(dir.join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn subagent_alias_normalization_preserves_siblings_and_canonical_leaves() {
+        for (source, expected) in [
+            ("[subagent]\nmodel = 'new'", "[subagent]\nmodel = 'new'"),
+            ("[subagents]\nmodel = 'old'", "[subagent]\nmodel = 'old'"),
+            (
+                "[subagents]\nmodel = 'old'\nmax_depth = 3\n[subagents.toggle]\nexplore = false\nplan = false\n[subagent]\nmodel = 'new'\n[subagent.toggle]\nexplore = true",
+                "[subagent]\nmodel = 'new'\nmax_depth = 3\n[subagent.toggle]\nexplore = true\nplan = false",
+            ),
+            (
+                "subagents = false\n[subagent]\nenabled = false",
+                "[subagent]\nenabled = false",
+            ),
+            (
+                "subagent = false\n[subagents]\nenabled = true",
+                "subagent = false",
+            ),
+            (
+                "[subagents]\nmodel = 'old'\n[subagent]\nmodel = 42",
+                "[subagent]\nmodel = 42",
+            ),
+        ] {
+            let mut value: toml::Value = toml::from_str(source).unwrap();
+            let section = subagent_config_section(&value).unwrap().into_owned();
+            normalize_subagent_config(&mut value);
+            assert_eq!(value, toml::from_str::<toml::Value>(expected).unwrap());
+            assert_eq!(value.get("subagent"), Some(&section));
+            let once = value.clone();
+            normalize_subagent_config(&mut value);
+            assert_eq!(value, once);
+        }
+    }
+
+    #[test]
+    fn subagent_alias_load_and_version_patch_keep_patch_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        for (base, patch) in [("subagent", "subagents"), ("subagents", "subagent")] {
+            write(
+                dir.path(),
+                USER_CONFIG_FILENAME,
+                &format!(
+                    "[{base}]\nmodel = 'base'\nmax_depth = 2\n[[version_overrides]]\nminimum_version = '0.0.0'\n[version_overrides.{patch}]\nmodel = 'patch'\n"
+                ),
+            );
+            let mut value = load_toml_file(&dir.path().join(USER_CONFIG_FILENAME)).unwrap();
+            apply_version_overrides(&mut value, &semver::Version::new(1, 0, 0)).unwrap();
+            assert!(value.get("subagents").is_none());
+            let section = value.get("subagent").unwrap();
+            assert_eq!(
+                section.get("model").and_then(toml::Value::as_str),
+                Some("patch")
+            );
+            assert_eq!(
+                section.get("max_depth").and_then(toml::Value::as_integer),
+                Some(2)
+            );
+        }
+        write(
+            dir.path(),
+            USER_CONFIG_FILENAME,
+            "[subagents]\nenabled = false\n",
+        );
+        let value = load_config_file(&dir.path().join(USER_CONFIG_FILENAME)).unwrap();
+        assert!(value.get("subagents").is_none());
+        assert_eq!(
+            value
+                .get("subagent")
+                .and_then(|s| s.get("enabled"))
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

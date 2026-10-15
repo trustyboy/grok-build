@@ -264,6 +264,7 @@ fn wedged_child_handle() -> (
             std::sync::Arc::new(crate::terminal::LocalTerminalRunner),
         ),
         model_id: acp::ModelId::new("test-model"),
+        subagents_model: Default::default(),
         reasoning_effort: None,
         yolo_mode: false,
         origin_client: None,
@@ -2751,6 +2752,7 @@ fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHa
         token,
     )
 }
+mod model_resolution;
 mod rest;
 mod wake;
 #[tokio::test]

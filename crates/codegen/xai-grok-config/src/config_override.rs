@@ -162,6 +162,7 @@ pub fn apply_patches(
     patches: impl IntoIterator<Item = toml::Table>,
     strip_keys: &[&str],
 ) {
+    crate::loader::normalize_subagent_config(config);
     for mut patch in patches {
         for key in strip_keys {
             patch.remove(*key);

@@ -228,9 +228,64 @@ fn select_fallback(
     )))
 }
 
+/// 发现与模型选择分别提交，供主会话和子代理设置共用。
+pub(crate) struct DiscoveredModel {
+    /// 已注册的模型目录键。
+    pub model_id: acp::ModelId,
+    /// 提交前校验的连接来源与摘要。
+    pub source: Option<(String, String)>,
+}
+
+impl DiscoveredModel {
+    /// 网络等待结束后重新校验来源和可选状态。
+    pub(crate) fn validate(&self, agent: &MvpAgent) -> Result<(), acp::Error> {
+        if !agent
+            .models_manager
+            .available()
+            .contains_key(&self.model_id)
+        {
+            return Err(acp::Error::invalid_params().data("目标模型已不可选，请重试"));
+        }
+        if let Some((source_id, fingerprint)) = &self.source {
+            if !crate::util::config::explicit_model_discovery_allowed() {
+                return Err(acp::Error::invalid_params().data("查询期间远程访问策略已改变"));
+            }
+            let source = agent.resolve_model_id(&acp::ModelId::new(source_id.clone()))?;
+            if source_fingerprint(&source)?.to_hex().as_str() != fingerprint {
+                return Err(acp::Error::invalid_params().data("查询期间上游连接已改变，请重试"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 完成发现后重新校验会话与来源，再复用现有会话切换流程。
 pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     let req: DiscoverRequest = parse_params(args)?;
+    let sid = acp::SessionId::new(req.session_id);
+    let found = discover_model(agent, &sid, &req.model_id, &req.expected_model_id).await?;
+    switch_and_report(
+        agent,
+        sid,
+        found.model_id,
+        &req.expected_model_id,
+        found.source,
+    )
+    .await
+}
+
+/// 查询并注册临时模型，保持主会话的模型选择。
+pub(crate) async fn discover_model(
+    agent: &MvpAgent,
+    sid: &acp::SessionId,
+    model_id: &str,
+    expected_model_id: &str,
+) -> Result<DiscoveredModel, acp::Error> {
+    let req = DiscoverRequest {
+        session_id: sid.0.to_string(),
+        model_id: model_id.to_owned(),
+        expected_model_id: expected_model_id.to_owned(),
+    };
     validate_id(&req.model_id)?;
     if crate::agent::chat_modes::process_chat_mode_enabled() {
         return Err(acp::Error::invalid_params().data("当前聊天模式不支持自定义上游模型发现"));
@@ -256,7 +311,10 @@ pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResul
         if !agent.models_manager.available().contains_key(&key) {
             return Err(acp::Error::invalid_params().data("该模型已存在，但不允许在当前目录中选择"));
         }
-        return switch_and_report(agent, sid, key, &req.expected_model_id, None).await;
+        return Ok(DiscoveredModel {
+            model_id: key,
+            source: None,
+        });
     }
     // 过滤前的目录用于识别被显式禁用的条目，不能把它们重新发现为临时模型。
     {
@@ -352,14 +410,10 @@ pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResul
         .models_manager
         .register_runtime_model(source_key.0.as_ref(), &req.model_id)
         .map_err(|message| acp::Error::invalid_params().data(message))?;
-    switch_and_report(
-        agent,
-        sid,
-        registered,
-        &req.expected_model_id,
-        Some((source_key.0.to_string(), before.to_hex().to_string())),
-    )
-    .await
+    Ok(DiscoveredModel {
+        model_id: registered,
+        source: Some((source_key.0.to_string(), before.to_hex().to_string())),
+    })
 }
 
 /// 成功响应携带权威会话模型状态，客户端无须等待目录广播再猜测状态。

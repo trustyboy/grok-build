@@ -1,5 +1,113 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
+
+#[test]
+#[serial_test::serial]
+fn subagent_alias_raw_and_typed_config_agree() {
+    without_grok_subagents(|| {
+        let dir = tempfile::tempdir().unwrap();
+        for (source, model, effort, depth, enabled) in [
+            ("[subagent]\nmodel = 'new'\nenabled = false", Some("new"), None, None, false),
+            ("[subagents]\nmodel = 'old'\nenabled = false", Some("old"), None, None, false),
+            ("[subagents]\nmodel = 'old'\nreasoning_effort = 'high'\nmax_depth = 3\n[subagent]\nmodel = 'new'\nenabled = false", Some("new"), Some("high"), Some(3), false),
+            ("[subagents]\nmodel = 'old'\n[subagent]\nmodel = 42\nreasoning_effort = 'low'", None, Some("low"), None, true),
+        ] {
+            let raw: toml::Value = toml::from_str(source).unwrap();
+            let parsed = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+            let resolved = SubagentsConfig::resolve_base_with_sources(None, &raw, None, dir.path());
+            assert_eq!(parsed.subagents, resolved, "{source}");
+            assert_eq!(resolved.model.as_deref(), model);
+            assert_eq!(resolved.reasoning_effort.as_deref(), effort);
+            assert_eq!(resolved.max_depth, depth);
+            assert_eq!(resolved.enabled, enabled);
+            assert!(parsed.config_warnings.is_empty(), "{:?}", parsed.config_warnings);
+        }
+        let raw: toml::Value = toml::from_str("[subagents.toggle]\nplan = false\nexplore = false\n[subagent.toggle]\nexplore = true\n[subagents.personas.reviewer]\ninstructions = 'old'\n[subagent.personas.reviewer]\ninstructions = 'new'").unwrap();
+        let parsed = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+        assert!(!parsed.subagents.is_subagent_enabled("plan"));
+        assert!(parsed.subagents.is_subagent_enabled("explore"));
+        assert_eq!(parsed.subagents.personas.get("reviewer").unwrap().instructions.as_deref(), Some("new"));
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn subagent_bad_sibling_cannot_erase_disabled_flag() {
+    without_grok_subagents(|| {
+        let dir = tempfile::tempdir().unwrap();
+        for section in ["subagent", "subagents"] {
+            for bad in ["max_depth = 'bad'", "toggle = 42", "models = ['bad']"] {
+                let raw: toml::Value = toml::from_str(&format!("[{section}]\nenabled = false\n{bad}")).unwrap();
+                let resolved = SubagentsConfig::resolve_base_with_sources(None, &raw, None, dir.path());
+                assert!(!resolved.enabled, "{section}: {bad}");
+            }
+        }
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn subagent_requirements_pin_survives_cli_env_and_reresolution() {
+    with_grok_subagents("1", || {
+        for section in ["subagent", "subagents"] {
+            let raw: toml::Value = toml::from_str("[subagent]\nenabled = true\nmodel = 'new'\n[subagents]\nenabled = true").unwrap();
+            let req: toml::Value = toml::from_str(&format!("[{section}]\nenabled = false")).unwrap();
+            let source = RequirementSource::Requirements { path: std::path::PathBuf::from("requirements.toml") };
+            let mut config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+            config.resolve_subagents(Some(true), &raw);
+            assert!(config.subagents_enabled);
+            let enforced = apply_requirements_inner(&mut config, &req, &source);
+            assert!(!config.subagents.enabled);
+            assert!(!config.subagents_enabled);
+            assert!(enforced.iter().any(|field| field.path == "subagent.enabled"));
+            config.resolve_subagents(Some(true), &raw);
+            assert!(!config.subagents_enabled);
+            assert_eq!(config.subagent_default_model.as_deref(), Some("new"));
+        }
+    });
+}
+
+#[test]
+fn subagents_global_model_and_effort_are_independent() {
+    for (source, model, effort) in [
+        ("", None, None),
+        ("model = ' alias '", Some("alias"), None),
+        ("reasoning_effort = ' high '", None, Some("high")),
+        ("model = '  '\nreasoning_effort = '  '", None, None),
+        ("model = 'alias'\nreasoning_effort = 'invalid'", Some("alias"), Some("invalid")),
+        ("model = 'alias'\nreasoning_effort = 42", Some("alias"), None),
+        ("model = false\nreasoning_effort = 'low'", None, Some("low")),
+    ] {
+        let config: SubagentsConfig = toml::from_str(&format!(
+            "{source}\nmax_depth = 3\n[models]\nexplore = 'type-model'\n[toggle]\nexplore = false"
+        )).unwrap();
+        assert_eq!(config.model.as_deref(), model, "{source}");
+        assert_eq!(config.reasoning_effort.as_deref(), effort, "{source}");
+        assert_eq!(config.max_depth, Some(3));
+        assert_eq!(config.models.get("explore").map(String::as_str), Some("type-model"));
+        assert!(!config.is_subagent_enabled("explore"));
+    }
+}
+
+#[test]
+fn subagents_global_effort_accepts_all_canonical_values() {
+    for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let config: SubagentsConfig = toml::from_str(&format!("reasoning_effort = '{effort}'")).unwrap();
+        assert!(config.reasoning_effort.unwrap().parse::<xai_grok_sampling_types::ReasoningEffort>().is_ok());
+    }
+}
+
+#[test]
+fn subagents_runtime_config_preserves_valid_fields_with_invalid_effort() {
+    for (effort, expected) in [("'invalid'", Some("invalid")), ("42", None)] {
+        let raw: toml::Value = toml::from_str(&format!("[subagents]\nmodel = ' child '\nreasoning_effort = {effort}\nmax_depth = 3")).unwrap();
+        let mut config = crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap();
+        config.resolve_subagents(None, &raw);
+        assert_eq!(config.subagent_default_model.as_deref(), Some("child"));
+        assert_eq!(config.subagent_default_reasoning_effort.as_deref(), expected);
+        assert_eq!(config.subagents.max_depth, Some(3));
+    }
+}
 fn with_env_var<T>(name: &str, value: &str, f: impl FnOnce() -> T) -> T {
     let previous = std::env::var(name).ok();
     unsafe {

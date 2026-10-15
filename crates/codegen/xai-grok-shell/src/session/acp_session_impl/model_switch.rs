@@ -157,6 +157,7 @@ impl SessionActor {
                 max_request_bytes: sampling_config.max_request_bytes,
                 reasoning_effort: sampling_config.reasoning_effort,
                 reasoning_summary: sampling_config.reasoning_summary,
+                fast_mode: sampling_config.fast_mode,
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
             });
         let existing = self.chat_state_handle.get_credentials().await;

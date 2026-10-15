@@ -14,7 +14,7 @@ Agents and personas both customize behavior, but they operate at different level
 |---|---|---|
 | **What they configure** | The whole session: model, tools, prompt mode, system prompt | A behavioral overlay added to a subagent's prompt |
 | **Scope** | Primary session or subagent | Subagents only |
-| **How you set them** | At startup, or with agent definitions (`.md` files in `.grok/agents/` or `~/.grok/agents/`) | In `config.toml` (`[subagents.personas]`) or `.toml` files under `.grok/personas/`; applied during subagent resolution |
+| **How you set them** | At startup, or with agent definitions (`.md` files in `.grok/agents/` or `~/.grok/agents/`) | In `config.toml` (`[subagent.personas]`) or `.toml` files under `.grok/personas/`; applied during subagent resolution |
 | **What they control** | Model, tool availability, prompt body, skills | Tone, output format, task focus, and input/output contracts |
 | **Who edits them** | You -- create, delete, or toggle them in the agents modal or by editing files | You -- define custom personas in config or files; bundled personas are read-only |
 | **Examples** | `grok-build`, `explore`, `plan` | `researcher`, `concise` |
@@ -36,11 +36,11 @@ export GROK_SUBAGENTS=0              # Environment variable
 
 ```toml
 # ~/.grok/config.toml
-[subagents]
+[subagent]
 enabled = false
 ```
 
-Only an explicit `enabled = false` turns subagents off. A `[subagents]` table that sets `max_depth`, `[subagents.models]`, or `[subagents.toggle]` without an `enabled` key keeps them on.
+Only an explicit `enabled = false` turns subagents off. A `[subagent]` table that sets `max_depth`, `[subagent.models]`, or `[subagent.toggle]` without an `enabled` key keeps them on.
 
 ---
 
@@ -79,7 +79,7 @@ A persona is a named behavioral overlay. Its instructions are injected into the 
 Define personas in `config.toml` or in `.toml` files:
 
 ```toml
-[subagents.personas.researcher]
+[subagent.personas.researcher]
 instructions = "You are a thorough researcher. Always cite specific file paths."
 description = "Deep investigator."
 ```
@@ -113,13 +113,13 @@ Manage personas in the Personas tab of the agents modal (`/personas`). Bundled p
 A persona can declare the inputs it expects and the outputs it produces. The parent agent reads these to know what context to supply and what artifacts to expect. This lets you chain personas, so one persona's output file becomes the next persona's input:
 
 ```toml
-[[subagents.personas.reviewer.inputs]]
+[[subagent.personas.reviewer.inputs]]
 name = "review_file"
 io_type = "file"
 required = true
 description = "Path to the code under review"
 
-[[subagents.personas.reviewer.outputs]]
+[[subagent.personas.reviewer.outputs]]
 name = "summary_file"
 io_type = "file"
 required = false
@@ -130,14 +130,9 @@ Each field has a `name`, an `io_type` (defaults to `file`), a `required` flag, a
 
 ### Persona Resolution
 
-When a persona applies, Grok Build resolves the effective model and reasoning effort in this order, highest priority first:
+应用 persona 时，角色默认值优先于 persona 默认值。模型及推理强度还会结合父会话临时选择、全局子代理配置和 agent 定义，完整顺序见下方[模型与推理强度优先级](#模型与推理强度优先级)。
 
-1. Explicit spawn-time override
-2. Role default
-3. Persona default
-4. Parent session
-
-Isolation follows the same order for the first three steps but defaults to `none` (no worktree) rather than inheriting from the parent session.
+隔离模式仍按「单次显式指定 > 角色默认 > persona 默认 > `none`」解析，不继承父会话隔离模式。
 
 If a persona is requested but cannot be resolved -- it is not found, has no instructions, or its `instructions_file` is unreadable -- the spawn fails.
 
@@ -267,24 +262,131 @@ Grok Build manages worktrees through the `x.ai/git/worktree/*` extension methods
 
 ## Configuration
 
+正式名称为 `[subagent]` 及其 `models/roles/personas/toggle` 子表。旧 `[subagents]` 仍兼容读取，同键以单数为准，旧表独有键保留；`--no-subagents`、`GROK_SUBAGENTS`、内部目录与历史文件名不改名。
+
+### 全局默认模型与推理强度
+
+在用户级 `config.toml` 中为普通新建子代理设置统一默认值，不改变主会话的模型：
+
+```toml
+[subagent]
+model = "nd-gpt-astra"
+reasoning_effort = "high"
+```
+
+`model`、`reasoning_effort` 均可独立省略或留空。模型 ID 应已存在于配置或加载后的模型目录；沿用该模型自己的上游、API 协议、认证及能力。只设置 `reasoning_effort = "high"` 时，没有其他模型覆盖的子代理仍继承父会话当前模型。两项均省略保持原有规则。
+
+推理强度接受 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；不保证每个模型都支持所有档位。非法静态配置、未知静态模型、无推理能力或不支持具体档位时会提示原因并回退，其他有效字段继续生效。状态查询同时展示配置值和实际生效值，避免把配置意图误认成上游实际参数。
+
+### 主模型专属默认模型
+
+在已有主模型配置中添加目标目录 ID：
+
+```toml
+[model.cpa-deepseek-v4-flash]
+subagent_model = "nd-gpt-astra"
+```
+
+只指定 model，effort 继续应用原有全局/临时规则。使用父会话**实时模型目录键**查找，不按上游请求模型名或共享默认模型查找。省略或空白回退全局 `[subagent] model`，无效目标告警后回退全局；临时发现的主模型自身未配置时不借用上游来源模型字段。
+
+切主模型立即改变之后新建 child 的默认值，各父会话独立，child 沿用目标自身接口、凭据和能力。临时 set 保持不变；`inherit` 跳过主模型专属及全局模型配置，`reset` 恢复当前主模型规则。
+
+### 会话内临时选择
+
+正式命令是 `/subagent-model`，旧 `/subagents-model` 保留兼容别名。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/subagent-model` 或 `/subagent-model status` | 查询普通 `general-purpose` 的默认模型、实际 effort、窗口、来源和警告 |
+| `/subagent-model <模型ID或名称> [window] [effort]` | 临时覆盖当前父会话的新建子代理默认值，例如 `/subagent-model nd-gpt-astra 256k high` |
+| `/subagent-model <未知完整ID>` | 优先查询当前上游，再跨已配置可选连接发现，沿用命中来源的接口与认证 |
+| `/subagent-model inherit` | 动态跟随父模型，跳过较低优先级模型默认值 |
+| `/subagent-model reset` | 清除会话覆盖，恢复当前主模型专属、全局、按类型及角色等配置规则 |
+
+模型 ID 优先精确匹配，也支持显示名称和与 `/model` 相同的窗口、effort 参数顺序及补全。`status`、`inherit`、`reset` 为保留控制词。窗口和 effort 必须由目标模型声明支持；未知单 ID 需先单独发现，再为已加载目标配置参数。发现模型默认 `256000` 上下文、关闭原生视觉且不发送 effort，这只是保守能力默认值，不代表服务商保证的真实上限。
+
+设置经后端确认后，仅影响该父会话之后新建的子代理，不修改父模型、其他会话或磁盘默认配置。指定临时模型后，主模型切换不会改变该选择；`inherit` 则跟随父模型变化。临时窗口与 effort 只对最终采用同一临时目标模型的子代理生效。`inherit` 和 `reset` 一并清除临时窗口、effort，仍按配置解析全局 effort，因此 `inherit` 不等于完全复制父会话的所有参数，`reset` 也不等于强制继承父模型。
+
+已运行子代理保留启动时快照；`resume_from` 恢复时固定使用原子代理模型；内部复制父上下文的 fork-context 路径固定使用父模型。覆盖不跨进程重启或会话重新加载保存。命令失败时保留原选择。
+
+### 模型与推理强度优先级
+
+普通新建子代理的模型，从高到低：
+
+1. 单次启动显式模型，包括工作流显式参数。
+2. 当前父会话 `/subagent-model` 的指定模型或 `inherit`。
+3. role / persona 模型默认值（role 优先于 persona）。
+4. `[subagent.models]` 按类型指定。
+5. 当前主模型 `[model.<id>] subagent_model`。
+6. `[subagent] model` 统一默认值。
+7. agent 定义中的模型。
+8. 父会话当前模型与实时采样配置。
+
+推理强度在模型确定后独立解析，从高到低：
+
+1. 单次启动显式 effort。
+2. 当前父会话临时 effort，仅在最终采用该临时目标模型时应用。
+3. role / persona 默认 effort。
+4. `[subagent] reasoning_effort`。
+5. agent 定义中的 effort。
+6. 基础采样配置：继承模型时取父会话当前值，指定其他模型时取目标自身默认值。
+
+目标模型不支持选中的 effort 或具体档位时，告警并使用基础值。恢复子代理及内部 fork-context 的固定模型约束优先于以上普通模型选择规则。状态接口描述默认 `general-purpose`，不是任何具体角色或显式启动的最终预测。
+
+### ACP 接口与本地回归
+
+正式扩展为 `x.ai/session/subagent_model`，旧 `x.ai/session/subagents_model` 保留兼容别名（JSON-RPC 方法名加前缀 `_`）。参数为 `sessionId`、可选父模型快照 `expectedModelId`、`action: "status" | "inherit" | "reset" | "set"`；仅 `set` 使用 `modelId` 以及可选 `reasoningEffort`、`contextWindow`，如 `reasoningEffort: "high"`、`contextWindow: 256000`。
+
+返回默认状态包括 `modelId`、`modelSource`、`reasoningEffort`、`effortSource`、`contextWindow`、`configuredModel`、`configuredEffort`、`warning`、`availableModels`，新增可选 `parentModelId` 和 `parentConfiguredModel` 表示当前父会话模型及其专属配置。`configuredModel` 始终是全局 `[subagent] model`，不会被主模型专属值或临时选择覆盖；`modelSource="parent_model_config"` 在 UI 显示「主模型专属配置」。
+
+`reasoningEffort` 和配置/警告字段可以为 `null`，`availableModels` 为 ACP `ModelInfo` 列表；旧客户端可忽略新增可选字段。客户端应以实际值判断效果，请求失败不应显示为设置成功。
+
+仓库回归脚本为 `tools/test-subagents-model.py`，需要 Python 3.11+ 和已构建的 Release 程序。从仓库根目录运行：
+
+- 全部场景：`python tools/test-subagents-model.py`。
+- 定向场景：`python tools/test-subagents-model.py --scenario temporary-lifecycle --scenario discovery-auth --scenario resume-original`。
+- 指定产物：`python tools/test-subagents-model.py --exe target/release/xai-grok-pager.exe`。
+
+脚本不构建程序、不使用真实凭据或修改用户配置；隔离 `GROK_HOME`、用户目录和工作区，以本地假上游让真实 parent 调用 `spawn_subagent`。它核对 child 实际 HTTP 模型名、API、认证及 effort，并在响应暂停期间通过 ACP 查询真实 child 上下文窗口。每个场景使用临时目录，成功或失败均清理；失败仅输出请求摘要及相关日志尾部。
+
+| 场景参数 | 检查内容 |
+| --- | --- |
+| `default-inherit` | 两个全局字段省略时继承父模型、effort、窗口及父模型变化 |
+| `effort-only` | 只设全局 effort，模型继承、临时选择及 inherit |
+| `global-selection` | 全局模型和 effort，child Responses 与 parent Chat 的独立认证 |
+| `model-only` | 只设置全局模型，使用目标自身默认 effort，而非父会话 effort |
+| `legacy-section` / `mixed-sections` | 旧 `[subagents]` 读取，新旧同键单数优先、旧表独有 effort 保留 |
+| `parent-model-selection` | `parent→temporary`、`alternate→plain`，双父会话隔离与即时切换，目标独立凭据；全局和父模型配置值分开报告 |
+| `parent-model-only` | 专属字段只选 model，无全局 effort 时采用目标默认值；无专属配置回退 global |
+| `parent-model-fallback` | 专属字段省略/空白回退 global，无效目标告警回退且不触发发现 |
+| `parent-model-lifecycle` | 专属配置下 set 保持、inherit 跟随、reset 恢复当前主模型规则，显式模型优先及窗口/effort 清除 |
+| `parent-model-discovery` | 临时发现主模型不借用来源专属值，回退 global，保持认证和双会话隔离 |
+| `temporary-lifecycle` | set、窗口/effort、两父会话隔离、父模型变化、单次显式模型、inherit/reset |
+| `unsupported-effort` | 无推理模型、缺少指定档位的基础值回退和警告 |
+| `invalid-parameters` | 零/未声明窗口、非法或不支持的 effort、未知 ID 带参数、过期父模型快照失败后保持原值 |
+| `discovery-auth` | 未知 ID 跨上游发现、正确凭据/API、失败回滚、主模型不变 |
+| `resume-original` | 新建 child 使用新选择，恢复 child 仍使用原模型 |
+
+该脚本不覆盖 TUI 参数补全及旧命令别名、并发切换时序、完整 role/persona/type pins/definition 优先级、单次显式 effort、内部 fork-context、跨进程重载及全局静态空白/无效配置回退；这些需要命令层或 Rust 定向测试。跨上游发现的去重、并发上限及多命中顺序由 `tools/test-model-discovery.py` 单独回归。
+
 ### Per-Type Toggles and Model Overrides
 
 Disable specific agent types, or route them to a different model:
 
 ```toml
-[subagents.toggle]
+[subagent.toggle]
 explore = true                       # default -- omit to keep enabled
 plan = false                         # disable the plan subagent
 
-[subagents.models]
+[subagent.models]
 explore = "grok-4.6"                 # route explore to a specific model
 ```
 
-Per-type model overrides apply for any parent. Without an override, a subagent inherits the parent's model.
+按类型模型覆盖适用于所有父会话，但低于会话临时选择和 role/persona。未设置按类型覆盖时继续检查主模型 `subagent_model`、统一默认模型及 agent 定义，均无有效选择才继承父模型。
 
 ### Model Selection by the Agent
 
-The `spawn_subagent` tool offers the agent a `model` argument, and its description lists the models you can pick, for when you explicitly ask for a subagent on a different model. With `[features] subagent_model_inheritance = true` (or `GROK_SUBAGENT_MODEL_INHERITANCE=1`), both are hidden whenever every model in your picker is an xAI model: subagents then always inherit the parent's model, and a spawn that still names one fails with a message asking the agent to retry without it. Catalogs with a third-party model, a model with no declared family, or a catalog still loading keep the argument. `[subagents.models]` pins, roles, and personas are unaffected. Read when a session starts; changing it requires a restart. Precedence: a `requirements.toml`/MDM pin, then the environment variable, then `config.toml`, then remote settings, then the default (off).
+`spawn_subagent` 的 `model` 参数供主代理在用户明确要求时指定单次模型，工具说明会列出可选模型。开启 `[features] subagent_model_inheritance = true`（或 `GROK_SUBAGENT_MODEL_INHERITANCE=1`）且目录中所有可选模型均属 xAI 时，会隐藏模型参数及选择说明；仍发送该参数的调用会被拒绝并要求重试。包含第三方模型、未声明 family 的模型或目录仍在加载时保留参数。该功能限制模型发出的显式选择，不取消用户的会话临时选择、主模型专属默认、全局默认、按类型 pin、role/persona 等配置规则。此开关在会话启动时读取，修改后需要重启；优先级为 requirements/MDM pin、环境变量、config.toml、远端设置、默认关闭。
 
 You can also toggle it from `/settings` → Models → **Subagent model inheritance**:
 
@@ -299,7 +401,7 @@ The row shows the value that applies after restart. Toggling writes `[features] 
 Define custom roles with their own capability and model defaults:
 
 ```toml
-[subagents.roles.researcher]
+[subagent.roles.researcher]
 description = "Deep research agent"
 default_capability_mode = "read-only"
 model = "grok-4.6"
@@ -309,7 +411,7 @@ prompt_file = ".grok/prompts/researcher.md"
 Define custom personas with behavioral instructions:
 
 ```toml
-[subagents.personas.concise]
+[subagent.personas.concise]
 instructions = "Be concise. No filler words."
 # instructions_file = ".grok/personas/concise.md"  # or load from a file
 ```

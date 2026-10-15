@@ -615,6 +615,7 @@ pub(crate) async fn spawn_session_actor(
         max_request_bytes: sampling_config.max_request_bytes,
         reasoning_effort: sampling_config.reasoning_effort,
         reasoning_summary: sampling_config.reasoning_summary,
+        fast_mode: sampling_config.fast_mode,
         stream_tool_calls: Some(sampling_config.stream_tool_calls),
     };
     let actor_pruning_config = xai_chat_state::PruningConfig {
@@ -1838,6 +1839,7 @@ pub(crate) async fn spawn_session_actor(
         telemetry_enabled,
         supports_backend_search: std::cell::Cell::new(sampling_config.supports_backend_search),
         vision_overrides: Default::default(),
+        fast_mode_overrides: Default::default(),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: resolved_tool_overrides.clone(),
         compactions_remaining: std::cell::Cell::new(sampling_config.compactions_remaining),
@@ -2460,6 +2462,7 @@ pub(crate) async fn spawn_session_actor(
         upload_failures_since_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tool_context: tool_context_for_handle,
         model_id: session_model_id,
+        subagents_model: Default::default(),
         reasoning_effort: sampling_config.reasoning_effort,
         context_window_selection,
         yolo_mode: session_yolo_mode,

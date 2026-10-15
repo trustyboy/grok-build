@@ -1207,6 +1207,9 @@ pub struct SamplingConfig {
     /// Responses API `reasoning.summary`; `None` keeps the request builder's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<ReasoningSummary>,
+    /// 仅 Responses 请求启用优先服务；旧会话默认关闭。
+    #[serde(default)]
+    pub fast_mode: bool,
     /// When true, inject `stream_tool_calls: true` into the Responses API request body so the upstream emits per-chunk argument deltas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
@@ -1234,6 +1237,7 @@ impl Default for SamplingConfig {
             max_request_bytes: None,
             reasoning_effort: None,
             reasoning_summary: None,
+            fast_mode: false,
             stream_tool_calls: None,
         }
     }
@@ -1381,6 +1385,27 @@ impl From<crate::messages::MessagesRequest> for MessagesRequestWrapper {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sampling_config_fast_mode_defaults_to_false_and_round_trips() {
+        assert!(!SamplingConfig::default().fast_mode);
+        let mut old = serde_json::to_value(SamplingConfig::default()).unwrap();
+        old.as_object_mut().unwrap().remove("fast_mode");
+        assert!(
+            !serde_json::from_value::<SamplingConfig>(old)
+                .unwrap()
+                .fast_mode
+        );
+        for fast_mode in [false, true] {
+            let config = SamplingConfig {
+                fast_mode,
+                ..Default::default()
+            };
+            let restored: SamplingConfig =
+                serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+            assert_eq!(restored.fast_mode, fast_mode);
+        }
+    }
 
     #[test]
     fn reasoning_effort_serde_lowercase_round_trip() {

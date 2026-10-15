@@ -14,6 +14,7 @@ pub mod notifications;
 pub mod pending_interaction;
 pub mod prompt_queue;
 pub(crate) mod resume_status;
+pub mod subagents_model;
 pub mod two_pass;
 pub mod user_echo;
 pub mod visibility;

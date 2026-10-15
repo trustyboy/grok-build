@@ -349,6 +349,8 @@ struct ClientDefaults {
     request_compression: RequestCompression,
     stream_tool_calls: bool,
     reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
+    /// 仅在 Responses 默认值处理时使用，避免泄漏到其它后端。
+    fast_mode: bool,
     extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     /// Whether the endpoint accepts image content blocks; `false` strips
@@ -680,6 +682,7 @@ impl SamplingClient {
             request_compression: config.request_compression,
             stream_tool_calls: config.stream_tool_calls,
             reasoning_summary: config.reasoning_summary,
+            fast_mode: config.fast_mode,
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
             supports_vision: config.supports_vision,
@@ -1354,6 +1357,9 @@ impl SamplingClient {
         if request.inner.store.is_none() {
             request.inner.store = Some(false);
         }
+
+        // 关闭时不发送 service_tier，兼容不识别该参数的上游。
+        request.inner.service_tier = self.defaults.fast_mode.then_some(rs::ServiceTier::Priority);
 
         if let Some(summary) = self.defaults.reasoning_summary {
             let summary = summary.to_responses_api();
@@ -2793,6 +2799,7 @@ mod tests {
         backend: ApiBackend,
         streaming: bool,
         request_compression: RequestCompression,
+        fast_mode: bool,
         input: &str,
     ) -> (axum::http::HeaderMap, Bytes) {
         use xai_grok_sampling_types::{ContentPart, ConversationItem, UserItem};
@@ -2830,6 +2837,7 @@ mod tests {
             base_url: format!("http://{addr}/v1"),
             api_backend: backend.clone(),
             request_compression,
+            fast_mode,
             ..minimal_config()
         })
         .unwrap();
@@ -2865,6 +2873,40 @@ mod tests {
         captured
     }
 
+    #[tokio::test]
+    async fn fast_mode_only_adds_priority_to_responses_streaming_and_unary_requests() {
+        for backend in [
+            ApiBackend::Responses,
+            ApiBackend::ChatCompletions,
+            ApiBackend::Messages,
+        ] {
+            for streaming in [false, true] {
+                for fast_mode in [false, true] {
+                    let (_, body) = capture_request(
+                        backend.clone(),
+                        streaming,
+                        RequestCompression::None,
+                        fast_mode,
+                        "fast-mode-test",
+                    )
+                    .await;
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let route = format!("{backend:?} streaming={streaming} fast_mode={fast_mode}");
+                    if backend == ApiBackend::Responses && fast_mode {
+                        assert_eq!(
+                            body.get("service_tier"),
+                            Some(&serde_json::json!("priority")),
+                            "{route}"
+                        );
+                    } else {
+                        assert!(body.get("service_tier").is_none(), "{route}: {body}");
+                    }
+                    assert!(body.get("fast_mode").is_none(), "{route}: {body}");
+                }
+            }
+        }
+    }
+
     fn large_input() -> String {
         "x".repeat(2 * crate::request_compression::MIN_COMPRESS_BYTES)
     }
@@ -2883,9 +2925,14 @@ mod tests {
         ] {
             for streaming in [false, true] {
                 let route = format!("{backend:?} streaming={streaming}");
-                let (headers, body) =
-                    capture_request(backend.clone(), streaming, RequestCompression::Zstd, &input)
-                        .await;
+                let (headers, body) = capture_request(
+                    backend.clone(),
+                    streaming,
+                    RequestCompression::Zstd,
+                    false,
+                    &input,
+                )
+                .await;
                 assert_eq!(Some("zstd"), header(&headers, CONTENT_ENCODING), "{route}");
                 assert_eq!(
                     Some("application/json"),
@@ -2918,6 +2965,7 @@ mod tests {
             ApiBackend::Responses,
             false,
             RequestCompression::Zstd,
+            false,
             &input,
         )
         .await;
@@ -2932,6 +2980,7 @@ mod tests {
             ApiBackend::Responses,
             false,
             RequestCompression::Zstd,
+            false,
             "small-plain-body",
         )
         .await;
@@ -2951,6 +3000,7 @@ mod tests {
             ApiBackend::Responses,
             true,
             RequestCompression::None,
+            false,
             &input,
         )
         .await;

@@ -14,6 +14,45 @@ fn list(patterns: &[&str]) -> AllowlistPin {
 }
 
 #[test]
+fn subagent_requirements_aliases_do_not_drop_policy() {
+    for (source, expected) in [
+        ("[subagent]\nenabled = false", Some(false)),
+        ("[subagents]\nenabled = false", Some(false)),
+        (
+            "[subagents]\nenabled = true\n[subagent]\nenabled = false",
+            Some(false),
+        ),
+        (
+            "[subagents]\nenabled = false\n[subagent]\nmodel = 42",
+            Some(false),
+        ),
+        (
+            "subagents = false\n[subagent]\nenabled = false",
+            Some(false),
+        ),
+        (
+            "[subagents]\nenabled = false\n[subagent]\nenabled = true",
+            Some(true),
+        ),
+        (
+            "[subagents]\nenabled = false\n[subagent]\nenabled = 'bad'",
+            None,
+        ),
+        ("subagent = 42\n[subagents]\nenabled = false", None),
+    ] {
+        let text = format!("{source}\n[features]\nweb_fetch = false");
+        let raw: toml::Value = toml::from_str(&text).unwrap();
+        let parsed = parse(&text);
+        assert_eq!(parsed.subagents.enabled, expected, "{source}");
+        assert_eq!(parsed.features.web_fetch, Some(false), "{source}");
+        assert_eq!(parsed, RequirementsToml::from_value(&raw));
+        let normalized = crate::validation::normalize_requirements_value(raw, "test").unwrap();
+        assert!(normalized.get("subagents").is_none());
+        assert_eq!(RequirementsToml::from_value(&normalized), parsed);
+    }
+}
+
+#[test]
 fn malformed_allowed_models_fail_closed() {
     let cases = [
         (
@@ -207,7 +246,7 @@ mixpanel_token = \"mix-secret\"
         ("cli.use_leader", "true"),
         ("cli.show_tips", "false"),
         ("memory.enabled", "false"),
-        ("subagents.enabled", "true"),
+        ("subagent.enabled", "true"),
         ("managed_mcps.enabled", "false"),
         ("models.web_search", "https://search.example"),
         ("cli.channel", "stable"),
@@ -242,7 +281,7 @@ mixpanel_token = \"mix-secret\"
             ("cli.use_leader", Some(true)),
             ("cli.show_tips", Some(false)),
             ("memory.enabled", Some(false)),
-            ("subagents.enabled", Some(true)),
+            ("subagent.enabled", Some(true)),
             ("managed_mcps.enabled", Some(false)),
             ("telemetry.mixpanel_enabled", Some(true)),
         ],
@@ -251,7 +290,7 @@ mixpanel_token = \"mix-secret\"
             ("cli.use_leader", use_leader),
             ("cli.show_tips", show_tips),
             ("memory.enabled", memory_enabled),
-            ("subagents.enabled", Some(subagents_enabled)),
+            ("subagent.enabled", Some(subagents_enabled)),
             ("managed_mcps.enabled", Some(managed_mcps_enabled)),
             ("telemetry.mixpanel_enabled", Some(mixpanel_enabled)),
         ]

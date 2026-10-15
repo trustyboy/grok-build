@@ -548,6 +548,61 @@ mod tests {
         );
     }
 
+    /// 子代理模型字段独立解析，错误类型只跳过该字段。
+    #[test]
+    fn subagent_model_override_parses_without_changing_parent_route() {
+        for value in [None, Some("child"), Some("  ")] {
+            let field = value
+                .map(|v| format!("subagent_model = {v:?}"))
+                .unwrap_or_default();
+            let cfg = parse_cfg(&format!("[model.parent]\nmodel = 'parent-wire'\n{field}"));
+            assert!(cfg.config_warnings.is_empty());
+            assert_eq!(cfg.config_models["parent"].subagent_model.as_deref(), value);
+            let models = crate::agent::config::resolve_model_list(&cfg, None);
+            assert_eq!(models["parent"].info.model, "parent-wire");
+        }
+        let cfg = parse_cfg("[model.parent]\nmodel = 'parent-wire'\nsubagent_model = 7");
+        assert!(cfg.config_models["parent"].subagent_model.is_none());
+        assert_eq!(
+            cfg.config_models["parent"].model.as_deref(),
+            Some("parent-wire")
+        );
+        assert!(
+            cfg.config_warnings
+                .iter()
+                .any(|warning| warning.kind == ConfigWarningKind::InvalidValue
+                    && warning.field() == Some("subagent_model"))
+        );
+    }
+
+    #[test]
+    fn fast_mode_parses_and_reaches_the_resolved_model() {
+        for fast_mode in [None, Some(false), Some(true)] {
+            let field = fast_mode
+                .map(|value| format!("fast_mode = {value}"))
+                .unwrap_or_default();
+            let cfg = parse_cfg(&format!(
+                "[model.fast-test]\nmodel = \"fast-test\"\n{field}"
+            ));
+            assert!(cfg.config_warnings.is_empty());
+            assert_eq!(cfg.config_models["fast-test"].fast_mode, fast_mode);
+            let resolved = crate::agent::config::resolve_model_list(&cfg, None);
+            assert_eq!(
+                resolved["fast-test"].info.fast_mode,
+                fast_mode.unwrap_or(false)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_fast_mode_skips_field_keeps_model() {
+        let cfg = parse_cfg("[model.fast-test]\nfast_mode = \"true\"");
+        assert_eq!(cfg.config_models["fast-test"].fast_mode, None);
+        assert!(cfg.config_warnings.iter().any(|w| {
+            w.kind == ConfigWarningKind::InvalidValue && w.field() == Some("fast_mode")
+        }));
+    }
+
     #[test]
     fn invalid_reasoning_summary_skips_field_keeps_model() {
         let cfg = parse_cfg(
@@ -755,6 +810,7 @@ mod tests {
             max_retries: Some(3),
             rate_limit_retry_threshold: Some(4),
             subagent_rate_limit_max_attempts: Some(8),
+            subagent_model: Some("child-model".into()),
             hidden: Some(false),
             supported_in_api: Some(true),
             reasoning_effort: Some(ReasoningEffort::High),
@@ -773,6 +829,7 @@ mod tests {
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
             reasoning_summary: Some(ReasoningSummary::None),
+            fast_mode: Some(true),
         }
     }
 

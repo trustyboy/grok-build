@@ -16,7 +16,6 @@ use crate::agent::remote_config::task_model_policy::{
     TaskModelSelection, selection_telemetry_kind,
 };
 use crate::upload::trace::PromptMetadataParams;
-use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_telemetry::events::{SubagentModelOverrideRejected, SubagentModelRejectionReason};
 use xai_grok_telemetry::region;
 use xai_grok_telemetry::region::Parent;
@@ -814,82 +813,36 @@ pub(crate) async fn run_shell_child(
             )
         });
     }
-    if request.fork_context {
-        effective_runtime.model = Some(ctx.model_id.0.to_string());
-    }
-    let (mut effective_sampling_config, mut effective_model_id) = resolve_effective_model_config(
-        effective_runtime.model.as_deref(),
-        &request.subagent_type,
-        &definition.model,
-        &ctx,
-    )
-    .await;
-    let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
-    {
-        let model_str = &effective_sampling_config.model;
-        let model_unknown = !model_str.is_empty()
-            && !ctx.available_models.is_empty()
-            && !ctx.available_models.contains_key(model_str)
-            && !ctx
-                .available_models
-                .values()
-                .any(|e| e.info().has_model_id(model_str));
-        if model_unknown {
-            let (parent_config, parent_mid) = read_parent_sampling_config(&ctx).await;
-            tracing::warn!(
-                subagent_id = %request.id,
-                resolved_model = %model_str,
-                parent_model = %parent_config.model,
-                "Resolved subagent model not found in available models — \
-                 falling back to parent model"
-            );
-            effective_sampling_config = parent_config;
-            effective_model_id = parent_mid;
-        }
-    }
-    if let Some(ref source) = resume_source
-        && let Some(ref source_model) = source.model_id
-        && effective_model_id.0.as_ref() != source_model.as_str()
-    {
-        if let Some(resolved) = resolve_model_override_to_config(source_model, &ctx) {
-            tracing::info!(
-                subagent_id = %request.id,
-                resolved_model = %effective_model_id.0,
-                source_model = source_model,
-                "Pinning resumed child to source model"
-            );
-            effective_sampling_config = resolved.0;
-            effective_model_id = resolved.1;
-        } else {
-            let msg = format!(
-                "Cannot resume from subagent '{}': source model '{source_model}' \
-                 is no longer available in the model catalogue.",
-                source.subagent_id,
-            );
-            return child_run_output(failure_result(&request, &msg), completion_data, None);
-        }
-    }
-    if let Some(raw) = effective_runtime.reasoning_effort.as_deref()
-        && ctx
-            .models_manager
-            .model_supports_reasoning_effort(effective_model_id.0.as_ref())
-    {
-        match raw.parse::<ReasoningEffort>() {
-            Ok(eff) => ctx.models_manager.apply_supported_effort(
-                &mut effective_sampling_config,
-                Some(eff),
-                &acp::SessionId::new(request.id.clone()),
-                crate::sampling::EffortTarget::NewSession,
-            ),
-            Err(err) => {
-                tracing::warn!(
-                    value = raw,
-                    error = %err,
-                    "subagent reasoning_effort: parse failed, ignoring override"
-                )
+    let resolved_model = if resume_source.is_some() || request.fork_context {
+        match model_resolution::resolve_fixed_model(
+            resume_source.as_ref(),
+            effective_runtime.reasoning_effort.as_deref(),
+            &request.subagent_type,
+            &definition.model,
+            &ctx,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                return child_run_output(failure_result(&request, &message), completion_data, None);
             }
         }
-    }
+    } else {
+        model_resolution::resolve_ordinary_model(
+            &request.subagent_type,
+            &request.runtime_overrides,
+            &definition,
+            &ctx,
+        )
+        .await
+    };
+    let mut effective_sampling_config = resolved_model.sampling;
+    let effective_model_id = resolved_model.model_id;
+    effective_runtime.reasoning_effort = effective_sampling_config
+        .reasoning_effort
+        .map(|effort| effort.to_string());
+    let subagent_max_turns = resolve_subagent_max_turns(definition.max_turns, ctx.parent_max_turns);
     if effective_sampling_config.conversation_group_id.is_none() {
         let inherited_group_id = if let Some(parent_chat_state) = ctx.parent_chat_state.as_ref() {
             parent_chat_state

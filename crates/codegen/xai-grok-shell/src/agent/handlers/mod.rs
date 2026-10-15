@@ -1,7 +1,9 @@
 pub(crate) mod config_option;
+pub(crate) mod fast_mode;
 pub(crate) mod model_discovery;
 pub(crate) mod model_switch;
 pub(crate) mod support_vision;
+pub(crate) mod subagents_model;
 pub(crate) mod models;
 pub(crate) mod session;
 pub(crate) mod workspaces;

@@ -1212,13 +1212,14 @@ pub(super) fn make_test_handle(
     yolo: bool,
     client_id: Option<&str>,
 ) -> crate::session::SessionHandle {
+    let cwd = std::env::temp_dir();
     let (cmd_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
     let (hunk_event_tx, _hunk_event_rx) = tokio::sync::mpsc::unbounded_channel();
     let hunk_cancel = tokio_util::sync::CancellationToken::new();
     let hunk_tracker_handle = xai_hunk_tracker::HunkTrackerActor::spawn(
         "test".to_string(),
-        std::path::PathBuf::from("/tmp"),
+        cwd.clone(),
         hunk_event_tx,
         xai_hunk_tracker::TrackingMode::AllDirty,
         hunk_cancel,
@@ -1235,7 +1236,7 @@ pub(super) fn make_test_handle(
         active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         info: crate::session::info::Info {
             id: acp::SessionId::new("test"),
-            cwd: "/tmp".to_string(),
+            cwd: cwd.to_string_lossy().into_owned(),
         },
         max_turns: None,
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
@@ -1258,13 +1259,14 @@ pub(super) fn make_test_handle(
         upload_queue: Arc::new(OnceLock::new()),
         upload_failures_since_success: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tool_context: crate::tools::ToolContext::new_local_context(
-            xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap(),
+            xai_grok_paths::AbsPathBuf::new(cwd.clone()).unwrap(),
             std::sync::Arc::new(xai_grok_workspace::file_system::LocalFs::new(
-                std::path::PathBuf::from("/tmp"),
+                cwd.clone(),
             )),
             std::sync::Arc::new(crate::terminal::LocalTerminalRunner),
         ),
         model_id: acp::ModelId::new(model),
+        subagents_model: Default::default(),
         reasoning_effort: None,
         yolo_mode: yolo,
         origin_client: client_id.map(|s| crate::http::OriginClientInfo {
@@ -1275,7 +1277,7 @@ pub(super) fn make_test_handle(
         ask_user_question_enabled: true,
         non_interactive: false,
         plan_mode: std::sync::Arc::new(parking_lot::Mutex::new(
-            crate::session::plan_mode::PlanModeTracker::new(std::path::PathBuf::from("/tmp")),
+            crate::session::plan_mode::PlanModeTracker::new(cwd.clone()),
         )),
         force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         permission_handle: xai_grok_workspace::permission::PermissionHandle::allow_all(),
@@ -1389,6 +1391,53 @@ async fn model_switch_actor_rejection_keeps_session_and_default() {
         previous_model
     );
     assert_eq!(agent.models_manager.current_model_id(), previous_default);
+}
+
+/// 子代理设置只属于目标父会话，旧启动快照保持原选择。
+#[tokio::test(flavor = "current_thread")]
+async fn subagents_model_handler_is_session_scoped_and_validates_before_commit() {
+    use crate::session::subagents_model::SubagentsModelSelection;
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("subagents-model-first");
+    let other = acp::SessionId::new("subagents-model-second");
+    for id in [&sid, &other] {
+        let mut handle = make_test_handle("parent-model", false, None);
+        handle.info.id = id.clone();
+        agent.insert_resident(id, handle);
+    }
+    let mut entry = crate::agent::config::ModelEntry::fallback("child-model", &Default::default());
+    entry.info.user_selectable = true;
+    entry.info.supports_reasoning_effort = true;
+    agent.models_manager.insert_test_entry("child-model", entry);
+    let previous_default = agent.models_manager.current_model_id();
+    let old_ctx = agent.build_subagent_spawn_context(sid.0.as_ref());
+    let call = |params| acp::ExtRequest::new("x.ai/session/subagents_model",
+        serde_json::value::to_raw_value(&params).unwrap().into());
+    let result = crate::agent::handlers::subagents_model::handle(&agent, &call(serde_json::json!({
+        "sessionId":sid, "expectedModelId":"parent-model", "action":"set",
+        "modelId":"child-model", "reasoningEffort":"high",
+    }))).await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(result.0.get()).unwrap();
+    assert_eq!(body["result"]["modelId"], "child-model");
+    let selected = agent.resident_handle(&sid).unwrap().subagents_model.lock().clone();
+    assert!(matches!(selected, SubagentsModelSelection::Model { .. }));
+    assert_eq!(old_ctx.subagents_model, SubagentsModelSelection::Default);
+    assert_eq!(agent.build_subagent_spawn_context(sid.0.as_ref()).subagents_model, selected);
+    assert_eq!(*agent.resident_handle(&other).unwrap().subagents_model.lock(), SubagentsModelSelection::Default);
+    assert_eq!(agent.resident_handle(&sid).unwrap().model_id.0.as_ref(), "parent-model");
+    assert_eq!(agent.models_manager.current_model_id(), previous_default);
+    for params in [
+        serde_json::json!({"sessionId":sid, "expectedModelId":"stale", "action":"reset"}),
+        serde_json::json!({"sessionId":sid, "action":"set", "modelId":"child-model", "contextWindow":1}),
+        serde_json::json!({"sessionId":sid, "action":"set", "modelId":"child-model", "reasoningEffort":"max"}),
+    ] {
+        assert!(crate::agent::handlers::subagents_model::handle(&agent, &call(params)).await.is_err());
+        assert_eq!(*agent.resident_handle(&sid).unwrap().subagents_model.lock(), selected);
+    }
+    for (action, expected) in [("inherit", SubagentsModelSelection::Inherit), ("reset", SubagentsModelSelection::Default)] {
+        crate::agent::handlers::subagents_model::handle(&agent, &call(serde_json::json!({"sessionId":sid, "action":action}))).await.unwrap();
+        assert_eq!(*agent.resident_handle(&sid).unwrap().subagents_model.lock(), expected);
+    }
 }
 
 #[tokio::test]

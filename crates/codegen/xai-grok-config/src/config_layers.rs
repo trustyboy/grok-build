@@ -136,13 +136,14 @@ impl ConfigLayers {
             campaigns: _,
         } = self;
         let mut merged = system_managed.clone();
-        deep_merge_toml(&mut merged, managed);
-        deep_merge_toml(&mut merged, user);
+        crate::normalize_subagent_config(&mut merged);
+        merge_config_layer(&mut merged, managed);
+        merge_config_layer(&mut merged, user);
         if let (OverlayInclusion::Include, Some(overlay)) = (inclusion, env_overlay) {
-            deep_merge_toml(&mut merged, overlay);
+            merge_config_layer(&mut merged, overlay);
         }
         for req in self.requirements_in_order() {
-            deep_merge_toml(&mut merged, req);
+            merge_config_layer(&mut merged, req);
         }
         merged
     }
@@ -202,7 +203,7 @@ impl ConfigLayers {
     /// Campaigns are full-power (any field), so this is the structural guarantee that a lower-trust campaign can't override an admin-set field.
     fn reapply_requirements(&self, merged: &mut toml::Value) {
         for req in self.requirements_in_order() {
-            deep_merge_toml(merged, req);
+            merge_config_layer(merged, req);
         }
     }
 
@@ -214,7 +215,7 @@ impl ConfigLayers {
     ) {
         crate::campaigns::apply_active_campaign_patches(merged, active);
         if let Some(overlay) = &self.env_overlay {
-            deep_merge_toml(merged, overlay);
+            merge_config_layer(merged, overlay);
         }
         self.reapply_requirements(merged);
     }
@@ -250,6 +251,17 @@ impl ConfigLayers {
         self.system_managed
             .as_table()
             .is_some_and(|t| !t.is_empty())
+    }
+}
+
+/// 内存构造的层也先归一化；已归一化的磁盘层不额外复制。
+fn merge_config_layer(base: &mut toml::Value, layer: &toml::Value) {
+    if layer.get("subagents").is_some() {
+        let mut layer = layer.clone();
+        crate::normalize_subagent_config(&mut layer);
+        deep_merge_toml(base, &layer);
+    } else {
+        deep_merge_toml(base, layer);
     }
 }
 
@@ -329,11 +341,67 @@ mod tests {
         assert_eq!(
             layers
                 .effective_config_base()
-                .get("subagents")
+                .get("subagent")
                 .and_then(|section| section.get("enabled"))
                 .and_then(toml::Value::as_bool),
             Some(false),
         );
+    }
+
+    #[test]
+    fn subagent_alias_layers_and_campaigns_cannot_bypass_requirements() {
+        for (lower, higher) in [("subagent", "subagents"), ("subagents", "subagent")] {
+            let mut layers = ConfigLayers {
+                managed: toml::from_str(&format!("[{lower}]\nmodel = 'managed'\nmax_depth = 3"))
+                    .unwrap(),
+                user: toml::from_str(&format!("[{higher}]\nmodel = 'user'\nenabled = true"))
+                    .unwrap(),
+                ..Default::default()
+            };
+            let base = layers.effective_config_base();
+            assert_eq!(
+                toml_str(&base, "subagent", "model").as_deref(),
+                Some("user")
+            );
+            assert!(base.get("subagents").is_none());
+            layers.user_requirements =
+                Some(toml::from_str(&format!("[{lower}]\nenabled = false")).unwrap());
+            layers.campaigns.user = vec![crate::campaigns::CampaignEntry {
+                id: "subagent-alias".into(),
+                patch: toml::from_str(&format!("[{higher}]\nenabled = true\nmodel = 'campaign'"))
+                    .unwrap(),
+            }];
+            let mut merged = layers.effective_config_base();
+            layers.apply_campaign_overrides(&mut merged, &layers.campaigns.user);
+            assert_eq!(toml_bool(&merged, "subagent", "enabled"), Some(false));
+            assert_eq!(
+                toml_str(&merged, "subagent", "model").as_deref(),
+                Some("campaign")
+            );
+            assert_eq!(
+                merged
+                    .get("subagent")
+                    .and_then(|s| s.get("max_depth"))
+                    .and_then(toml::Value::as_integer),
+                Some(3)
+            );
+            layers.user_requirements =
+                Some(toml::from_str(&format!("[{lower}]\nenabled = true")).unwrap());
+            layers.system_requirements =
+                Some(toml::from_str(&format!("[{higher}]\nenabled = false")).unwrap());
+            assert_eq!(
+                toml_bool(&layers.effective_config_base(), "subagent", "enabled"),
+                Some(false)
+            );
+            layers.system_requirements =
+                Some(toml::from_str(&format!("[{higher}]\nenabled = true")).unwrap());
+            layers.mdm_requirements =
+                Some(toml::from_str(&format!("[{lower}]\nenabled = false")).unwrap());
+            assert_eq!(
+                toml_bool(&layers.effective_config_base(), "subagent", "enabled"),
+                Some(false)
+            );
+        }
     }
 
     #[test]

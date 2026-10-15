@@ -964,6 +964,8 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             super::model_requests::discover_and_switch(app, model_id)
         }
         Action::SupportVision { enabled } => super::model_requests::support_vision(app, enabled),
+        Action::FastMode { action } => super::model_requests::fast_mode(app, action),
+        Action::SubagentsModel { action } => super::model_requests::subagents_model(app, action),
         Action::NextModel => vec![],
         Action::SwitchModel(mut choice) => {
             let ActiveView::Agent(id) = app.active_view else {

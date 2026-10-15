@@ -157,6 +157,8 @@ mod hooks_plugins;
 mod mcp_argument_coercion;
 #[path = "acp_session_impl/mcp_failed_reminder.rs"]
 mod mcp_failed_reminder;
+#[path = "acp_session_impl/fast_mode.rs"]
+mod fast_mode;
 #[path = "acp_session_impl/model_switch.rs"]
 mod model_switch;
 #[path = "acp_session_impl/slash_exec.rs"]
@@ -805,6 +807,8 @@ pub(crate) struct SessionActor {
     pub(crate) supports_backend_search: std::cell::Cell<bool>,
     /// 按目录模型保存的会话内视觉覆盖，不写入配置或会话存档。
     pub(crate) vision_overrides: std::cell::RefCell<HashMap<String, bool>>,
+    /// 按目录模型保存 Fast 会话覆盖，执行中的轮次使用快照。
+    pub(crate) fast_mode_overrides: std::cell::RefCell<HashMap<String, bool>>,
     /// Per-turn override, set at promotion. Not persisted; a reload reverts to the definition seed.
     pub(crate) tool_overrides: std::cell::RefCell<Option<xai_grok_sampling_types::ToolOverrides>>,
     pub(crate) resolved_tool_overrides:

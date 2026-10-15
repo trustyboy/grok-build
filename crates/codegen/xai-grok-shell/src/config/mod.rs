@@ -45,14 +45,14 @@ fn resolve_standalone_memory_mode(
     MemoryConfig::resolve(false, false, config, remote).mode
 }
 /// Configuration for subagent (task tool) support.
-/// Parsed from the `[subagents]` section of `~/.grok/config.toml` or `.grok/config.toml`.
-/// Enabled by default; can be disabled via the `GROK_SUBAGENTS=0` env var or `[subagents] enabled = false` in config.toml.
+/// 读取全局 `[subagent]` 配置，兼容旧名 `[subagents]`。
+/// Enabled by default; can be disabled via the `GROK_SUBAGENTS=0` env var or `[subagent] enabled = false` in config.toml.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SubagentsConfig {
-    /// Whether subagent support is enabled. Defaults to `true`, so a `[subagents]` table that only tunes limits, models, or toggles keeps subagents on.
+    /// Whether subagent support is enabled. Defaults to `true`, so a `[subagent]` table that only tunes limits, models, or toggles keeps subagents on.
     pub enabled: bool,
-    /// Raw `[subagents] max_depth` (i64 so out-of-range parses; clamped to at least 1 at resolve).
+    /// Raw `[subagent] max_depth` (i64 so out-of-range parses; clamped to at least 1 at resolve).
     #[serde(default)]
     pub max_depth: Option<i64>,
     #[serde(default)]
@@ -65,9 +65,15 @@ pub struct SubagentsConfig {
     pub limit_behavior: Option<String>,
     #[serde(default)]
     pub workflow_max_concurrent: Option<i64>,
+    /// 所有子代理的默认模型；空白表示未设置。
+    #[serde(default, deserialize_with = "deserialize_subagent_model")]
+    pub model: Option<String>,
+    /// 全局推理强度原值；无效值保留供状态告警，解析时忽略。
+    #[serde(default, deserialize_with = "deserialize_subagent_effort")]
+    pub reasoning_effort: Option<String>,
     /// Per-subagent model ID overrides.
     /// Keys are agent names, values are model IDs that must exist in the available models registry.
-    /// Parsed from `[subagents.models]` in config.toml.
+    /// Parsed from `[subagent.models]` in config.toml.
     #[serde(default)]
     pub models: std::collections::HashMap<String, String>,
     /// Per-subagent enable/disable toggles.
@@ -83,6 +89,54 @@ pub struct SubagentsConfig {
     pub personas: std::collections::HashMap<String, SubagentPersona>,
 }
 use xai_grok_subagent_resolution::config::{SubagentPersona, SubagentRole};
+
+/// 字段独立降级，避免错误类型使整个子代理配置丢失。
+fn deserialize_subagent_string<'de, D>(
+    deserializer: D,
+    field: &str,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<toml::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(toml::Value::String(value)) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        }
+        Some(value) => {
+            tracing::warn!(
+                field,
+                kind = value.type_str(),
+                "子代理配置需要字符串，已忽略该字段"
+            );
+            None
+        }
+        None => None,
+    })
+}
+
+/// 归一化全局默认模型。
+fn deserialize_subagent_model<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_subagent_string(deserializer, "subagent.model")
+}
+
+/// 保留无效原值供查询展示，但不影响其他字段解析。
+fn deserialize_subagent_effort<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_subagent_string(deserializer, "subagent.reasoning_effort")?;
+    if let Some(raw) = value.as_deref()
+        && let Err(error) = raw.parse::<xai_grok_sampling_types::ReasoningEffort>()
+    {
+        tracing::warn!(value = raw, %error, "子代理全局 reasoning_effort 无效，解析时将回退");
+    }
+    Ok(value)
+}
 impl Default for SubagentsConfig {
     fn default() -> Self {
         SubagentsConfig {
@@ -92,6 +146,8 @@ impl Default for SubagentsConfig {
             sampling_limit: None,
             limit_behavior: None,
             workflow_max_concurrent: None,
+            model: None,
+            reasoning_effort: None,
             models: std::collections::HashMap::new(),
             toggle: std::collections::HashMap::new(),
             roles: std::collections::HashMap::new(),
@@ -240,7 +296,7 @@ impl SubagentsConfig {
         errors
     }
     /// Discover roles from `.grok/roles/` directory and merge with inline config. File-based roles are loaded from `{cwd}/.grok/roles/*.toml`.
-    /// Each file defines a single `SubagentRole` (same schema as inline `[subagents.roles.*]`). The file stem becomes the role name. Precedence: inline config roles override file-based roles with the same name.
+    /// Each file defines a single `SubagentRole` (same schema as inline `[subagent.roles.*]`). The file stem becomes the role name. Precedence: inline config roles override file-based roles with the same name.
     pub(crate) fn discover_roles(&mut self, cwd: &std::path::Path) {
         let roles_dir = cwd.join(".grok").join("roles");
         self.discover_roles_in_dir(&roles_dir);
@@ -313,7 +369,7 @@ impl SubagentsConfig {
     }
     /// Resolve the subagent turn-sampling limit, clamped to [`crate::agent::subagent::MAX_SUBAGENT_SAMPLING_LIMIT`].
     /// `default` is the resolved concurrent-subagent bound (`GROK_MAX_CONCURRENT_SUBAGENTS`).
-    /// A lower `GROK_SUBAGENT_SAMPLING_LIMIT`, `[subagents] sampling_limit`, or remote value caps sampling further.
+    /// A lower `GROK_SUBAGENT_SAMPLING_LIMIT`, `[subagent] sampling_limit`, or remote value caps sampling further.
     pub(crate) fn resolve_sampling_limit(
         env: Option<&str>,
         config: Option<i64>,
@@ -369,9 +425,9 @@ impl SubagentsConfig {
         LimitBehavior::Queue
     }
     /// Resolve the final subagents config from all sources (in priority order): CLI tri-state (`Some(false)` from `--no-subagents` force-disables, `Some(true)` force-enables, `None` defers)
-    /// `GROK_SUBAGENTS` env var: `1`/`true` enables, `0`/`false` force-disables; config file `[subagents] enabled`; Default (enabled).
-    /// `enabled` is deliberately not remotely gated. Only explicit local intent (CLI flag, `GROK_SUBAGENTS`, `[subagents] enabled`) changes the default.
-    /// A `[subagents]` table without an `enabled` key is not intent: it keeps the default so tuning `max_depth` or `[subagents.models]` cannot turn subagents off.
+    /// `GROK_SUBAGENTS` env var: `1`/`true` enables, `0`/`false` force-disables; config file `[subagent] enabled`; Default (enabled).
+    /// `enabled` is deliberately not remotely gated. Only explicit local intent (CLI flag, `GROK_SUBAGENTS`, `[subagent] enabled`) changes the default.
+    /// A `[subagent]` table without an `enabled` key is not intent: it keeps the default so tuning `max_depth` or `[subagent.models]` cannot turn subagents off.
     /// Project files are excluded from this trust-independent base; Task boundaries overlay them using the parent cwd's authoritative trust verdict.
     pub fn resolve(cli_flag: Option<bool>, config: &toml::Value) -> Self {
         let user_grok_root = xai_grok_config::user_grok_home();
@@ -388,14 +444,18 @@ impl SubagentsConfig {
         user_grok_root: Option<&std::path::Path>,
         bundled_root: &std::path::Path,
     ) -> Self {
-        let mut result: Self = config
-            .get("subagents")
+        let section = xai_grok_config::subagent_config_section(config);
+        let mut result: Self = section
+            .as_deref()
             .and_then(|v| v.clone().try_into().ok())
             .unwrap_or_default();
-        let has_local_enabled = config
-            .get("subagents")
-            .and_then(|v| v.as_table())
-            .is_some_and(|t| t.contains_key("enabled"));
+        // 独立读取开关，错误的兄弟字段不能吞掉 enabled=false。
+        let enabled = section
+            .as_deref()
+            .and_then(|v| v.get("enabled"))
+            .and_then(toml::Value::as_bool);
+        result.enabled = enabled.unwrap_or(result.enabled);
+        let has_local_enabled = enabled.is_some();
         let resolved = crate::agent::config::resolve_enabled(
             cli_flag,
             "GROK_SUBAGENTS",
@@ -1205,6 +1265,13 @@ fn apply_requirements_inner(
         },
         &mut push,
     );
+    if let Some(val) = parsed.subagents.enabled {
+        config
+            .requirements
+            .subagents_enabled
+            .pin(val, source.clone());
+        config.subagents_enabled = val;
+    }
     if let Some(val) = req_bool(req, "tools", "respect_gitignore") {
         config
             .requirements

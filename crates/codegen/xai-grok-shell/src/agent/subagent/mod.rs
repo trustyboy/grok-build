@@ -54,6 +54,8 @@ pub(crate) use xai_grok_tools::implementations::grok_build::task::coordinator::{
 mod attempt_store;
 mod child_runtime;
 mod handle_request;
+mod model_resolution;
+pub(crate) use model_resolution::subagents_model_state;
 mod prompt_turn_receipt;
 mod prompt_turn_result;
 mod resume_window;
@@ -286,6 +288,12 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_max_turns: Option<usize>,
     /// All available models for resolving model IDs from overrides.
     pub available_models: indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
+    /// 父会话临时子代理模型选择的启动快照。
+    pub subagents_model: crate::session::subagents_model::SubagentsModelSelection,
+    /// 全局默认模型，低于按类型配置。
+    pub subagent_default_model: Option<String>,
+    /// 全局推理强度原值，按最终模型校验。
+    pub subagent_default_reasoning_effort: Option<String>,
     /// Per-subagent model ID overrides from config.toml `[subagents.models]`.
     pub subagent_model_overrides: std::collections::HashMap<String, String>,
     /// Per-subagent enable/disable toggles from config.toml `[subagents.toggle]`.
@@ -394,7 +402,7 @@ impl SubagentSpawnContext {
     fn would_strip_fallback_key(&self, resolved_api_key: Option<&str>) -> bool {
         self.auth.is_none() && resolved_api_key.is_some()
     }
-    /// Resolve `auto_compact_threshold_percent` for the subagent's actual model id, picked by `resolve_subagent_sampling_config`, not the parent's.
+    /// Resolve `auto_compact_threshold_percent` for the subagent's actual model id, picked by the model resolver, not the parent's.
     /// Walks the same precedence as the main session's resolver: env > user [model.<id>] > user [session] > GB per-model > GB global > 85.
     /// The GB per-model tier is read from `available_models` (the same catalog used to pick the subagent's `SamplerConfig`). User TOML and GB global tiers are sourced from the parent's snapshot captured at spawn-context build time.
     pub(crate) fn resolve_auto_compact_threshold_percent(&self, subagent_model_id: &str) -> u8 {
@@ -612,80 +620,31 @@ impl SubagentPresentation {
         Arc::clone(&self.is_turn_active)
     }
 }
-/// Resolve the sampling config and model ID for a subagent. Precedence: `[subagents.models].{agent_name}` config override > explicit `AgentDefinition` model > the parent session's live sampling config.
-/// Unknown pins warn and fall through. The caller applies runtime model overrides before this runs.
-#[tracing::instrument(level = "debug", skip_all)]
+/// 模型优先级回归测试入口，复用生产解析。
+#[cfg(test)]
 async fn resolve_subagent_sampling_config(
     agent_name: &str,
-    agent_model: &xai_grok_agent::config::ModelOverride,
+    agent_model: &ModelOverride,
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
-    let (parent_config, parent_mid) = read_parent_sampling_config(ctx).await;
-    let try_pin = |model_id: &str, source: &'static str, unknown_msg: &'static str| {
-        match resolve_model_override_to_config(model_id, ctx) {
-            Some((config, canonical_id)) => {
-                log_subagent_model_resolution(
-                    agent_name,
-                    source,
-                    &config,
-                    &canonical_id,
-                    &parent_config,
-                );
-                Some((config, canonical_id))
-            }
-            None => {
-                tracing::warn!(agent = agent_name, model_id, "{unknown_msg}");
-                None
-            }
-        }
-    };
-    if let Some(model_id) = ctx.subagent_model_overrides.get(agent_name)
-        && let Some(resolved) = try_pin(
-            model_id,
-            "config_override",
-            "Subagent model override references unknown model, falling through to inherit",
-        )
-    {
-        return resolved;
-    }
-    if let ModelOverride::Override(model_id) = agent_model
-        && let Some(resolved) = try_pin(
-            model_id,
-            "agent_definition",
-            "Agent definition model references unknown model, falling through to inherit",
-        )
-    {
-        return resolved;
-    }
-    log_subagent_model_resolution(
-        agent_name,
-        "inherit_parent",
-        &parent_config,
-        &parent_mid,
-        &parent_config,
-    );
-    (parent_config, parent_mid)
+    resolve_effective_model_config(None, agent_name, agent_model, ctx).await
 }
-/// Resolve a subagent's effective sampling config and model id, honoring the model-resolution precedence.
-/// An explicit `runtime_override_model` is the goal role model or a persona override carried on `effective_runtime.model`.
-/// It is resolved HERE, BEFORE [`resolve_subagent_sampling_config`], where the user `[subagents.models]` pin and `AgentDefinition.model` apply. So a goal/persona override WINS over a user per-agent pin. An override that does not resolve to a known model warns and falls through to the pin path. Extracted from `run_shell_child` so the precedence is unit-testable without spawning a child session.
-#[tracing::instrument(level = "debug", skip_all)]
+
+/// 显式模型回归测试入口。
+#[cfg(test)]
 async fn resolve_effective_model_config(
     runtime_override_model: Option<&str>,
     subagent_type: &str,
-    definition_model: &xai_grok_agent::config::ModelOverride,
+    definition_model: &ModelOverride,
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
-    if let Some(model_id) = runtime_override_model {
-        if let Some(resolved) = resolve_model_override_to_config(model_id, ctx) {
-            return resolved;
-        }
-        tracing::warn!(
-            model_id,
-            "Runtime model override references unknown model, falling through"
-        );
-    }
-    resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
+    let overrides = SubagentRuntimeOverrides {
+        model: runtime_override_model.map(str::to_owned),
+        ..Default::default()
+    };
+    let resolved =
+        model_resolution::resolve_model(subagent_type, &overrides, definition_model, ctx).await;
+    (resolved.sampling, resolved.model_id)
 }
 /// Truncate an API key to a safe prefix for logging.
 /// Counts characters, not bytes: a configured key with a multi-byte character would panic a byte slice, and this only ever runs to build a log line.
@@ -814,6 +773,7 @@ async fn read_parent_sampling_config(
                 client_version: creds.client_version,
                 reasoning_effort: cfg.reasoning_effort,
                 reasoning_summary: cfg.reasoning_summary,
+                fast_mode: cfg.fast_mode,
                 force_http1: false,
                 max_retries: cfg.max_retries.or(ctx.sampling_config.max_retries),
                 rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,
@@ -909,12 +869,16 @@ fn subagent_auth_type(
         xai_chat_state::AuthType::ApiKey
     }
 }
-/// Resolve a model override string (config key or model ID) to a `(SamplerConfig, ModelId)` pair.
-fn resolve_model_override_to_config(
+/// 目录键优先匹配并保留现有组织模型限制。
+fn model_override_entry<'a>(
     model_id: &str,
-    ctx: &SubagentSpawnContext,
-) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
-    let entry = crate::agent::config::find_model_by_id(&ctx.available_models, model_id).cloned()?;
+    ctx: &'a SubagentSpawnContext,
+) -> Option<(&'a str, &'a crate::agent::config::ModelEntry)> {
+    let (catalog_key, entry) = ctx.available_models.get_key_value(model_id).or_else(|| {
+        ctx.available_models
+            .iter()
+            .find(|(_, entry)| entry.info.has_model_id(model_id))
+    })?;
     if !entry.info.user_selectable {
         let user_picker_only = ctx
             .agent_config
@@ -924,18 +888,23 @@ fn resolve_model_override_to_config(
             return None;
         }
     }
-    let canonical_model_id = if ctx.available_models.contains_key(model_id) {
-        acp::ModelId::new(model_id)
-    } else {
-        acp::ModelId::new(entry.info().model.clone())
-    };
+    Some((catalog_key, entry))
+}
+
+/// 按目录目标构造采样配置，保留该连接独立的认证和别名路由。
+fn resolve_model_override_to_config(
+    model_id: &str,
+    ctx: &SubagentSpawnContext,
+) -> Option<(xai_grok_sampler::SamplerConfig, acp::ModelId)> {
+    let (catalog_key, entry) = model_override_entry(model_id, ctx)?;
+    let canonical_model_id = acp::ModelId::new(catalog_key);
     let session_key = ctx.auth.as_ref().map(|a| a.key.as_str());
     let has_session_key = session_key.is_some();
-    let mut credentials = resolve_credentials(&entry, session_key);
-    credentials.auth_type = subagent_auth_type(Some(&entry), &ctx.auth_method_id);
+    let mut credentials = resolve_credentials(entry, session_key);
+    credentials.auth_type = subagent_auth_type(Some(entry), &ctx.auth_method_id);
     let resolved_auth_type = credentials.auth_type;
     let mut config = sampling_config_for_model(
-        &entry,
+        entry,
         credentials,
         ctx.alpha_test_key.clone(),
         ctx.sampling_config.client_version.clone(),

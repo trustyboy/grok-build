@@ -11,6 +11,7 @@ use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use std::num::NonZeroU64;
 use xai_grok_shell::sampling::types::ReasoningEffort;
+use xai_grok_shell::session::subagents_model::{SubagentsModelAction, SubagentsModelState};
 use xai_grok_shell::session::unified_list::SessionKind;
 /// 请求发出时的会话与模型快照，防止旧回包覆盖新状态。
 #[derive(Debug, Clone)]
@@ -33,6 +34,32 @@ pub struct SupportVisionState {
     pub model_id: String,
     /// 下一轮是否启用原生视觉。
     pub enabled: bool,
+}
+
+/// Fast 模式操作；无参命令由服务端原子翻转。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FastModeAction {
+    /// 翻转当前有效状态。
+    Toggle,
+    /// 开启优先服务。
+    On,
+    /// 关闭优先服务。
+    Off,
+    /// 只查询当前状态。
+    Status,
+}
+
+/// 服务端确认的会话模型 Fast 状态。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FastModeState {
+    /// 状态所属的模型。
+    pub model_id: String,
+    /// 下一轮是否请求优先服务。
+    pub enabled: bool,
+    /// 当前 API 协议是否支持 Fast 模式。
+    pub supported: bool,
 }
 
 /// Typed error for model switch failures.
@@ -448,6 +475,16 @@ pub enum Action {
     /// 查询或修改当前会话当前模型的视觉输入能力。
     SupportVision {
         enabled: Option<bool>,
+    },
+    /// 查询或修改当前会话当前模型的 Fast 模式。
+    FastMode {
+        /// 服务端执行的操作。
+        action: FastModeAction,
+    },
+    /// 查询或设置新建子代理的会话级模型。
+    SubagentsModel {
+        /// 服务端执行的操作，不修改主模型。
+        action: SubagentsModelAction,
     },
     /// Cancel the currently running turn.
     CancelTurn,
@@ -1665,6 +1702,20 @@ pub enum Effect {
         request: ModelRequestContext,
         enabled: Option<bool>,
     },
+    /// 向服务端请求会话模型的 Fast 状态。
+    FastMode {
+        /// 发起请求时的归属和过期保护。
+        request: ModelRequestContext,
+        /// 服务端执行的操作。
+        action: FastModeAction,
+    },
+    /// 请求新建子代理的会话级模型状态。
+    SubagentsModel {
+        /// 发起请求时的归属和过期保护。
+        request: ModelRequestContext,
+        /// 服务端执行的操作。
+        action: SubagentsModelAction,
+    },
     /// Fetch changelog from CDN (both markdown and structured JSON).
     /// Runs off the render path via `spawn_blocking`.
     /// Result is cached on `AppView` so `/release-notes` and the welcome screen share it.
@@ -2734,6 +2785,20 @@ pub enum TaskResult {
     SupportVisionComplete {
         request: ModelRequestContext,
         result: Result<SupportVisionState, String>,
+    },
+    /// Fast 查询或修改完成。
+    FastModeComplete {
+        /// 发起请求时的归属和过期保护。
+        request: ModelRequestContext,
+        /// 服务端确认状态或错误原因。
+        result: Result<FastModeState, String>,
+    },
+    /// 子代理模型查询或设置完成。
+    SubagentsModelComplete {
+        /// 发起请求时的归属和过期保护。
+        request: ModelRequestContext,
+        /// 服务端确认状态或错误原因。
+        result: Result<SubagentsModelState, String>,
     },
     /// Changelog fetched from CDN (both formats).
     ChangelogFetched {

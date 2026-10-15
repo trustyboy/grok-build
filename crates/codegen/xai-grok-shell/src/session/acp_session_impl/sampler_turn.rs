@@ -16,6 +16,8 @@ pub(super) struct TurnSamplingState {
     pub(super) credentials: xai_chat_state::Credentials,
     /// 本轮 hook 与采样器共同使用的视觉值。
     pub(super) supports_vision: bool,
+    /// 本轮固定的 Fast 开关，命令覆盖在下一轮生效。
+    pub(super) fast_mode: bool,
 }
 
 tokio::task_local! {
@@ -703,6 +705,9 @@ impl SessionActor {
             let supports_vision = self
                 .session_vision_state(config.as_ref().map_or("", |config| config.model.as_str()))
                 .enabled;
+            let fast_mode = config
+                .as_ref()
+                .is_some_and(|cfg| self.session_fast_mode_state(cfg).enabled);
             let credentials = self.chat_state_handle.get_credentials().await;
             let current = self.chat_state_handle.get_sampling_config().await;
             let identity = |cfg: &xai_grok_sampling_types::SamplingConfig| {
@@ -713,6 +718,7 @@ impl SessionActor {
                     config,
                     credentials,
                     supports_vision,
+                    fast_mode,
                 };
             }
         }
@@ -775,11 +781,16 @@ impl SessionActor {
             max_request_bytes: None,
             reasoning_effort: None,
             reasoning_summary: None,
+            fast_mode: false,
             stream_tool_calls: None,
         });
         let supports_vision = snapshot.as_ref().map_or_else(
             || self.session_vision_state(&cfg.model).enabled,
             |state| state.supports_vision,
+        );
+        let fast_mode = snapshot.as_ref().map_or_else(
+            || self.session_fast_mode_state(&cfg).enabled,
+            |state| state.fast_mode,
         );
         let mut creds = match snapshot.as_ref() {
             Some(state)
@@ -906,6 +917,7 @@ impl SessionActor {
             client_version: creds.client_version,
             reasoning_effort: cfg.reasoning_effort,
             reasoning_summary: cfg.reasoning_summary,
+            fast_mode,
             force_http1: false,
             max_retries: cfg.max_retries.or(Some(self.max_retries)),
             rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,

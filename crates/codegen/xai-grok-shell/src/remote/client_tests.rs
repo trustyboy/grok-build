@@ -256,6 +256,24 @@ fn parse_model_field_takes_priority_over_id() {
     assert_eq!(result.name.as_deref(), Some("Display Name"));
 }
 #[test]
+fn parse_fast_mode_defaults_to_false_and_accepts_both_spellings() {
+    let base = serde_json::json!({"id": "fast-test", "context_window": 200_000});
+    assert!(
+        !parse_remote_model_value(&base, "https://default.url")
+            .unwrap()
+            .fast_mode
+    );
+    for key in ["fastMode", "fast_mode"] {
+        for fast_mode in [false, true] {
+            let mut value = base.clone();
+            value[key] = serde_json::json!(fast_mode);
+            let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+            assert_eq!(result.fast_mode, fast_mode);
+        }
+    }
+}
+
+#[test]
 fn parse_reads_rate_limit_retry_threshold() {
     let value = serde_json::json!({
         "model": "grok-4.5",

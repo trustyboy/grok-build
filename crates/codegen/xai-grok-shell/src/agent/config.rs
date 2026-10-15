@@ -305,6 +305,8 @@ pub struct Requirements {
     pub respect_gitignore: Constrained<bool>,
     pub remote_fetch: Constrained<bool>,
     pub title_refresh: Constrained<bool>,
+    /// 子代理开关策略在环境覆盖及运行时重解析后仍生效。
+    pub subagents_enabled: Constrained<bool>,
     /// Fleet-pinned `[models] allowed_models`. Replace, not union — a user
     /// list cannot widen the set once this is set. [`AllowlistPin::FailClosed`]
     /// is a present-but-unreadable pin (nothing selectable).
@@ -812,7 +814,7 @@ pub struct Config {
     pub disabled_mcp_servers: Vec<String>,
     #[serde(default, skip_serializing)]
     pub disabled_mcp_tools: std::collections::HashMap<String, Vec<String>>,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing, rename = "subagent", alias = "subagents")]
     pub subagents: crate::config::SubagentsConfig,
     #[serde(default, skip_serializing)]
     pub memory: crate::config::MemorySettings,
@@ -901,7 +903,7 @@ pub struct Config {
     #[serde(skip)]
     pub cli_agent_overrides: CliAgentOverrides,
     /// Whether subagent (task tool) support is enabled.
-    /// Enabled by default; disabled only via `GROK_SUBAGENTS=0` or `[subagents] enabled = false`.
+    /// Enabled by default; disabled only via `GROK_SUBAGENTS=0` or `[subagent] enabled = false`.
     /// Not remotely gated.
     #[serde(skip)]
     pub subagents_enabled: bool,
@@ -921,12 +923,18 @@ pub struct Config {
     pub workflow_max_concurrent_agents: usize,
     #[serde(skip)]
     pub media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits,
-    /// Per-subagent model ID overrides from `[subagents.models]` in config.toml.
+    /// `[subagent] model` 的全局默认值。
+    #[serde(skip)]
+    pub subagent_default_model: Option<String>,
+    /// `[subagent] reasoning_effort` 原值，按最终模型独立校验。
+    #[serde(skip)]
+    pub subagent_default_reasoning_effort: Option<String>,
+    /// Per-subagent model ID overrides from `[subagent.models]` in config.toml.
     /// Keys are agent names, values are model IDs.
     /// Set alongside `subagents_enabled` from `SubagentsConfig::resolve()`.
     #[serde(skip)]
     pub subagent_model_overrides: std::collections::HashMap<String, String>,
-    /// Per-subagent enable/disable toggles from `[subagents.toggle]` in config.toml.
+    /// Per-subagent enable/disable toggles from `[subagent.toggle]` in config.toml.
     /// Keys are agent names, values are booleans. Omitted agents default to enabled.
     #[serde(skip)]
     pub subagent_toggle: std::collections::HashMap<String, bool>,
@@ -1201,6 +1209,8 @@ impl Default for Config {
                 crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
             media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits::default(
             ),
+            subagent_default_model: None,
+            subagent_default_reasoning_effort: None,
             subagent_model_overrides: std::collections::HashMap::new(),
             subagent_toggle: std::collections::HashMap::new(),
             subagent_roles: std::collections::HashMap::new(),
@@ -1401,7 +1411,9 @@ impl Config {
         Ok((config, unrecognized_keys))
     }
     pub fn new_from_toml_cfg(raw_config: &toml::Value) -> Result<Self, String> {
-        let raw_config = &xai_grok_login::expand_auth_alias(raw_config);
+        let mut normalized = xai_grok_login::expand_auth_alias(raw_config);
+        xai_grok_config::normalize_subagent_config(&mut normalized);
+        let raw_config = &normalized;
         let super::config_model_override_parse::ParsedModelOverrides {
             models: config_models,
             warnings: config_warnings,
@@ -1628,7 +1640,13 @@ impl Config {
         let sa = crate::config::SubagentsConfig::resolve(cli_flag, raw_config);
         let remote_settings = self.remote_settings.clone();
         self.resolve_subagent_limits(&sa, remote_settings.as_ref());
-        self.subagents_enabled = sa.enabled;
+        self.subagents_enabled = self
+            .requirements
+            .subagents_enabled
+            .pinned()
+            .unwrap_or(sa.enabled);
+        self.subagent_default_model = sa.model;
+        self.subagent_default_reasoning_effort = sa.reasoning_effort;
         self.subagent_model_overrides = sa.models;
         self.subagent_toggle = sa.toggle;
         self.subagent_roles = sa.roles;
@@ -1679,29 +1697,30 @@ impl Config {
         self.session_summary_model_override = ctx.cli_session_summary_model.map(|s| s.to_owned());
         self.resolve_subagents(ctx.cli_subagents, ctx.raw_config);
         let env = std::env::var(crate::config::SubagentsConfig::ENV_MAX_DEPTH).ok();
-        let toml_max = ctx
-            .raw_config
-            .get("subagents")
+        let subagent_section = xai_grok_config::subagent_config_section(ctx.raw_config);
+        let toml_max = subagent_section
+            .as_deref()
             .and_then(|s| s.get("max_depth"))
             .and_then(|v| v.as_integer());
         let remote = ctx.remote_settings.and_then(|r| r.subagents_max_depth);
         self.subagents_max_depth =
             crate::config::SubagentsConfig::resolve_max_depth(env.as_deref(), toml_max, remote);
         let subagents_toml = crate::config::SubagentsConfig {
-            max_concurrent: ctx
-                .raw_config
-                .get("subagents")
+            max_concurrent: subagent_section
+                .as_deref()
                 .and_then(|s| s.get("max_concurrent"))
                 .and_then(|v| v.as_integer()),
-            limit_behavior: ctx
-                .raw_config
-                .get("subagents")
+            sampling_limit: subagent_section
+                .as_deref()
+                .and_then(|s| s.get("sampling_limit"))
+                .and_then(|v| v.as_integer()),
+            limit_behavior: subagent_section
+                .as_deref()
                 .and_then(|s| s.get("limit_behavior"))
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
-            workflow_max_concurrent: ctx
-                .raw_config
-                .get("subagents")
+            workflow_max_concurrent: subagent_section
+                .as_deref()
                 .and_then(|s| s.get("workflow_max_concurrent"))
                 .and_then(|v| v.as_integer()),
             ..Default::default()
@@ -2327,7 +2346,7 @@ impl Config {
         }
     }
     /// Planner role model: `[goal]` config then remote. No env layer (only the kill-switch reads env). An `Explicit` pair is applied as `runtime_overrides.model`, resolved before `resolve_subagent_sampling_config`.
-    /// It therefore wins over a user `[subagents.models]` pin. `InheritCurrent` hands precedence back to that pin.
+    /// It therefore wins over a user `[subagent.models]` pin. `InheritCurrent` hands precedence back to that pin.
     pub(crate) fn resolve_goal_planner_model(
         &self,
         use_current_only: bool,
@@ -3176,6 +3195,9 @@ struct DefaultModelJson {
     /// Whether the model accepts image content blocks; defaults to `true`.
     #[serde(default = "default_true")]
     supports_vision: bool,
+    /// 内置模型默认关闭优先服务。
+    #[serde(default)]
+    fast_mode: bool,
     #[serde(default)]
     compactions_remaining: Option<CompactionsRemaining>,
     #[serde(default)]
@@ -3262,6 +3284,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 stream_tool_calls: None,
                 supports_vision: m.supports_vision,
                 reasoning_summary: None,
+                fast_mode: m.fast_mode,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3399,6 +3422,9 @@ pub struct ModelEntryConfig {
     /// `none` omits the field for BYOK gateways that reject it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<ReasoningSummary>,
+    /// 仅 Responses 请求启用优先服务；默认关闭。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fast_mode: bool,
     /// Per-model Layer-3 LazinessDetector configuration.
     /// Defaults to the all-disabled state via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "is_default_laziness_detector")]
@@ -3451,6 +3477,7 @@ impl Default for ModelEntryConfig {
             stream_tool_calls: None,
             supports_vision: true,
             reasoning_summary: None,
+            fast_mode: false,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -3510,6 +3537,8 @@ pub struct ConfigModelOverride {
     pub max_retries: Option<u32>,
     pub rate_limit_retry_threshold: Option<u32>,
     pub subagent_rate_limit_max_attempts: Option<u32>,
+    /// 此主模型的新建子代理默认模型，按父会话目录键读取。
+    pub subagent_model: Option<String>,
     pub hidden: Option<bool>,
     pub supported_in_api: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -3525,6 +3554,8 @@ pub struct ConfigModelOverride {
     /// 覆盖模型视觉能力；关闭时仅发送文本和图片路径。
     pub supports_vision: Option<bool>,
     pub reasoning_summary: Option<ReasoningSummary>,
+    /// 未配置时继承模型默认值，显式 false 可关闭优先服务。
+    pub fast_mode: Option<bool>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -3656,6 +3687,9 @@ impl ConfigModelOverride {
         if self.reasoning_summary.is_some() {
             entry.info.reasoning_summary = self.reasoning_summary;
         }
+        if let Some(v) = self.fast_mode {
+            entry.info.fast_mode = v;
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -3766,6 +3800,9 @@ pub struct ModelInfo {
     /// Responses API `reasoning.summary` override; `None` keeps the request builder's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<ReasoningSummary>,
+    /// 仅 Responses 请求启用优先服务；默认关闭。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fast_mode: bool,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to the all-disabled state.
     /// The feature is per-model opt-in, with a second-step `max_nudges_per_session > 0` opt-in for actually injecting nudges.
     /// See [`LazinessDetectorPerModelConfig`].
@@ -3825,6 +3862,7 @@ impl ModelInfo {
             stream_tool_calls: None,
             supports_vision: true,
             reasoning_summary: None,
+            fast_mode: false,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -3871,6 +3909,7 @@ impl ModelInfo {
             stream_tool_calls: entry.stream_tool_calls,
             supports_vision: entry.supports_vision,
             reasoning_summary: entry.reasoning_summary,
+            fast_mode: entry.fast_mode,
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -4635,6 +4674,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 stream_tool_calls: None,
                 supports_vision: true,
                 reasoning_summary: None,
+                fast_mode: false,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             mtls_cert_dir: None,
@@ -4783,6 +4823,7 @@ pub(crate) fn sampling_config_for_model(
         client_version,
         reasoning_effort: info.reasoning_effort,
         reasoning_summary: info.reasoning_summary,
+        fast_mode: info.fast_mode,
         force_http1: false,
         max_retries: info.max_retries,
         rate_limit_retry_threshold: info.rate_limit_retry_threshold,
@@ -4875,6 +4916,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             stream_tool_calls: None,
             supports_vision: true,
             reasoning_summary: None,
+            fast_mode: false,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         mtls_cert_dir: None,

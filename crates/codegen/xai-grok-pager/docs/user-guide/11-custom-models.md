@@ -104,6 +104,40 @@ query_params = { api-version = "2026-07-22" } # Query params appended to every r
 env_http_headers = { "X-Tenant" = "TENANT_TOKEN" }    # Headers from env vars, resolved at client build (optional)
 ```
 
+### Fast 快速模式
+
+`[model.<id>].fast_mode` 默认为 `false`。仅 `api_backend = "responses"` 使用该配置；开启后发送 `service_tier: "priority"`（OpenAI Fast 兼容值），关闭时省略字段，沿用上游默认服务等级。Chat Completions 和 Messages 不发送此字段。
+
+需要长期默认开启时，在已有的 Responses 模型配置中加入 `fast_mode = true`，例如：
+
+```toml
+[model.my-responses]
+model = "your-model-id"
+base_url = "https://api.example.com/v1"
+api_backend = "responses"
+env_key = "PROVIDER_API_KEY"
+fast_mode = true  # 长期默认开启；false 或省略时默认关闭
+```
+
+会话内 `/fast` 无参翻转，`/fast on` 开启，`/fast off` 关闭，`/fast status` 只查询。会话覆盖优先于配置默认值，从下一轮开始生效，不改变正在运行的一轮。覆盖按「会话 + 模型」隔离，切走再切回仍保留，不修改配置，不影响其他会话，也不跨进程保存。非 Responses 模型查询时显示仅 Responses 支持，修改请求由后端拒绝。
+
+**优先服务账单更高**。实际可用性、速度和费用取决于上游服务、模型和账户；选择 Responses 协议本身不保证服务商支持 `priority`。若上游拒绝该字段，可用 `/fast off` 恢复上游默认。Fast 不改变模型 ID、思考级别或上下文窗口。
+
+### 主模型专属子代理模型
+
+在已有主模型配置中添加 `subagent_model`，目标使用已配置或已加载目录中的模型 ID：
+
+```toml
+[model.cpa-deepseek-v4-flash]
+subagent_model = "nd-gpt-astra"
+```
+
+该字段只选择模型，不设置子代理 effort；effort 继续遵循全局 `[subagent] reasoning_effort`、会话临时值等既有规则。child 使用目标自己的 API、凭据和能力，不复用主模型凭据。
+
+按当前父会话的**实时模型目录键**取值，而非上游请求中的 `model` 名称。普通模型优先级为「单次显式 > 会话 > role/persona > 按类型 > 主模型 `subagent_model` > 全局 `[subagent] model` > agent 定义 > 父模型」。省略/空白回退全局，无效目标告警并回退全局；临时发现模型若自身未配置，不借用其上游来源模型的该字段。
+
+切主模型立即影响后续新建 child，但不会覆盖 `/subagent-model` 的临时 set；`inherit` 跳过主模型专属及全局模型规则，`reset` 恢复当前主模型规则。状态来源显示「主模型专属配置」，全局配置值与当前主模型专属值分别显示；已运行 child 不切换。详见[子代理指南](16-subagents.md#主模型专属默认模型)。
+
 ### Credential Resolution
 
 Grok resolves the API key in this order:

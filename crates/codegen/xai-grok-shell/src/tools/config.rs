@@ -220,6 +220,7 @@ impl ShellToolsetConfig {
             client_version: None,
             reasoning_effort: None,
             reasoning_summary: None,
+            fast_mode: false,
             force_http1: false,
             max_retries: None,
             rate_limit_retry_threshold: None,

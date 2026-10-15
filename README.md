@@ -56,6 +56,64 @@ for the version of the code present in this tree.
 
 运行时模型在后台进程退出后不再保留；视觉覆盖也不跨进程保存。用户主动查询已配置的自定义上游不会开启后台远端设置获取，管理层的远程访问禁令仍然优先。
 
+## Fast 快速模式（本分支）
+
+在会话中使用 `/fast` 切换当前模型的快速模式。该功能仅支持 Responses API，请先确认上游服务、模型和账户支持优先服务；开启后账单更高，实际加速和计费以服务商为准。
+
+| 命令 | 用途 |
+| --- | --- |
+| `/fast` | 翻转当前快速模式状态 |
+| `/fast on` | 开启快速模式 |
+| `/fast off` | 关闭快速模式 |
+| `/fast status` | 只查询，不修改状态；不支持时提示仅 Responses API 支持 |
+
+修改由后端确认，从下一轮生效，不改变正在运行的一轮。开关按「会话 + 模型」隔离：切换到其他模型不会携带当前模型的覆盖值，切回时仍保留该模型的选择；不会影响其他会话，也不写入 `config.toml`。运行时覆盖不跨进程保存。非 Responses 后端拒绝修改请求。
+
+模型配置项 `[model.<id>].fast_mode` 默认为 `false`；需要长期默认开启时，在已有的 Responses 模型配置中设置 `fast_mode = true`。会话内仍可用 `/fast off` 临时覆盖，不修改这个配置默认值。
+
+开启时仅 Responses 请求携带 `service_tier: "priority"`（OpenAI Fast 兼容值）；关闭时省略 `service_tier` 字段，沿用上游默认服务等级。Fast 不改变模型、思考级别或上下文窗口，也不能让不支持优先服务的上游自动获得该能力。
+
+详见[命令说明](crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md)和[模型配置](crates/codegen/xai-grok-pager/docs/user-guide/11-custom-models.md)。
+
+## 子代理默认模型与临时切换（本分支）
+
+普通新建子代理可以使用统一默认模型及推理强度，二者均可独立省略。在用户级 `config.toml` 中配置，模型 ID 需已存在于模型目录：
+
+```toml
+[subagent]
+model = "nd-gpt-astra"
+reasoning_effort = "high"
+```
+
+还可在已有主模型配置中添加专属子代理模型（目标 ID 需已配置）：
+
+```toml
+[model.cpa-deepseek-v4-flash]
+subagent_model = "nd-gpt-astra"
+```
+
+该字段只指定模型，不新增 effort 规则。按父会话**实时模型目录键**读取，主模型切换后立即影响后续新建 child；省略或空白回退全局 `[subagent] model`，无效目标告警后回退全局。临时发现的主模型若自身未配置该字段，也回退全局，不借用其上游来源模型的设置。
+
+只设置 `reasoning_effort` 且无其他模型规则时，子代理仍跟随父会话当前模型。模型不支持推理强度或指定档位时，提示原因并使用基础配置。`[subagent]` 及其 `models`、`roles`、`personas`、`toggle` 子表为正式名称；旧 `[subagents]` 仍兼容读取，新旧同键以单数为准，旧表独有键保留。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/subagent-model` 或 `/subagent-model status` | 查询普通 `general-purpose` 新建子代理的默认模型、实际 effort、窗口、来源及警告 |
+| `/subagent-model <模型ID或名称> [window] [effort]` | 当前父会话临时选择；例如 `/subagent-model nd-gpt-astra 256k high`，参数须由目标模型声明支持 |
+| `/subagent-model <未知完整ID>` | 先查询当前上游，未命中或失败再跨已配置可选上游发现；沿用命中来源的接口与认证 |
+| `/subagent-model inherit` | 临时直接跟随父模型，并清除临时窗口和 effort |
+| `/subagent-model reset` | 清除会话覆盖，恢复配置规则 |
+
+模型优先级：**单次显式指定 > 父会话临时选择 > role/persona > 按类型 `[subagent.models]` > 主模型 `subagent_model` > 全局 `[subagent] model` > agent 定义 > 父模型**。effort 独立解析：**单次显式 > 同一临时目标模型的会话 effort > role/persona > 全局 effort > agent 定义 > 基础采样配置**。基础值在继承路径取父会话当前值，其他模型取自身默认值。
+
+临时设置只影响当前父会话之后**新建**的子代理，不改变主模型、其他父会话或磁盘配置。切主模型保留临时 set；`inherit` 跳过主模型专属和全局模型配置，仍应用有效的全局 effort；`reset` 恢复当前主模型对应的配置规则。已启动子代理不切换；恢复固定原模型，内部复制父上下文固定父模型。临时选择不跨进程重启或会话重新加载保存。
+
+正式 ACP 入口为 `x.ai/session/subagent_model`；旧 `/subagents-model` 和 `x.ai/session/subagents_model` 仍是兼容别名。状态中 `configuredModel` 保持全局值，可选 `parentModelId`、`parentConfiguredModel` 表示当前父模型及其专属配置；`modelSource="parent_model_config"` 显示为「主模型专属配置」。
+
+未知 ID 必须先单独发现，再为已加载模型设置其支持的参数；发现模型默认窗口为 `256000`、不支持原生视觉和 effort，该窗口不是服务商保证的上限。失败不替换已有选择。更多细节见[子代理指南](crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md)和[配置参考](crates/codegen/xai-grok-pager/docs/user-guide/26-config-reference.md)。
+
+本地回归使用 Python 3.11+，先由正式入口构建 Release，再运行 `python tools/test-subagents-model.py`。脚本不触发构建，不访问真实模型服务或修改用户配置；真实后端由本地假上游驱动 `spawn_subagent`，检查实际请求、认证、effort 和运行中 child 的窗口。支持重复指定 `--scenario`，新增 `parent-model-selection`、`parent-model-only`、`parent-model-fallback`、`parent-model-lifecycle`、`parent-model-discovery` 检查专属配置及回退，`legacy-section`、`mixed-sections` 检查旧表兼容与同键单数优先；`--exe target/release/xai-grok-pager.exe` 可指定产物。配置、会话和失败日志均放系统临时目录，结束后清理。
+
 ## 第三方模型工具调用兼容（本分支）
 
 Chat Completions 流式工具调用支持后续片段将 `function.name` 留空、设为 `null` 或省略的接口。程序会保留已收到的有效工具名并继续拼接参数，解决部分 DeepSeek 兼容网关触发的空工具名 `Tool not found` 错误。该兼容处理自动生效，使用包含修复的新构建即可。

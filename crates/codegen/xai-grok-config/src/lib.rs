@@ -90,7 +90,8 @@ pub use loader::{
     apply_version_overrides_with_registered, deep_merge_toml, expand_env_vars_in_string,
     expand_env_vars_in_toml, hook_config_layers, hook_config_layers_at, load_config_file,
     load_from_disk, load_managed_config, load_system_managed_config, load_toml_file,
-    managed_config_layers, managed_config_layers_at, toml_error_detail,
+    managed_config_layers, managed_config_layers_at, normalize_subagent_config,
+    subagent_config_section, toml_error_detail,
 };
 pub use macos_managed::MDM_REQUIREMENTS_SOURCE;
 pub use managed_cache::{

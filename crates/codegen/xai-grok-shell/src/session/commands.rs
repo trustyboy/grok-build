@@ -361,6 +361,29 @@ pub struct SupportVisionState {
     pub enabled: bool,
 }
 
+/// 当前会话模型下一轮使用的 Fast 设置。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FastModeState {
+    /// 会话实际使用的模型 ID。
+    pub model_id: String,
+    /// Responses 后端是否开启优先处理。
+    pub enabled: bool,
+    /// 当前接口是否为 Responses。
+    pub supported: bool,
+}
+
+/// Fast 操作由 actor 原子执行，避免查询与切换之间发生竞争。
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastModeAction {
+    Toggle,
+    On,
+    Off,
+    #[default]
+    Status,
+}
+
 pub struct SessionModelSwitch {
     pub sampling_config: xai_grok_sampler::SamplerConfig,
     pub use_concise: bool,
@@ -492,6 +515,12 @@ pub enum SessionCommand {
         enabled: Option<bool>,
         expected_model_id: Option<String>,
         responds_to: oneshot::Sender<Result<SupportVisionState, acp::Error>>,
+    },
+    /// 查询或修改当前模型的会话内 Fast 覆盖，从下一轮生效。
+    FastMode {
+        action: FastModeAction,
+        expected_model_id: Option<String>,
+        responds_to: oneshot::Sender<Result<FastModeState, acp::Error>>,
     },
     /// Zero-turn harness rebuild: build a brand-new `Agent` from the session's `AgentRebuildSpec` and the new `AgentDefinition`.
     /// Re-register MCP tools, swap the live `Agent`, and rewrite the system message in the conversation.

@@ -103,6 +103,9 @@ pub struct SessionHandle {
     /// The model this session was created with (or switched to via setModel).
     /// Per-session tracking prevents cross-client contamination in leader mode where `MvpAgent.current_model_id` is shared mutable state.
     pub model_id: acp::ModelId,
+    /// 当前父会话的子代理临时选择；句柄副本共享，重新加载后恢复默认。
+    pub subagents_model:
+        std::sync::Arc<parking_lot::Mutex<super::subagents_model::SubagentsModelSelection>>,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The selected context window in tokens, 0 for none, shared with the session actor.
     pub context_window_selection: std::sync::Arc<std::sync::atomic::AtomicU64>,

@@ -21,6 +21,7 @@ pub mod effort_levels;
 pub mod exit;
 pub mod expand;
 pub mod export;
+pub mod fast;
 pub mod feedback;
 pub mod find;
 pub mod fork;
@@ -56,6 +57,7 @@ pub mod screen_mode_switch;
 pub mod session_info;
 pub mod settings_cmd;
 pub mod share;
+pub mod subagents_model;
 pub mod support_vision;
 pub mod tasks;
 pub mod theme;
@@ -90,7 +92,9 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(effort::EffortCommand),
         Arc::new(context_window::ContextWindowCommand),
         Arc::new(model::ModelCommand),
+        Arc::new(subagents_model::SubagentsModelCommand),
         Arc::new(support_vision::SupportVisionCommand),
+        Arc::new(fast::FastCommand),
         Arc::new(context::ContextCommand),
         Arc::new(compact::CompactCommand),
         Arc::new(fork::ForkCommand),
@@ -222,7 +226,10 @@ mod tests {
         assert!(reg.get("new").is_some());
         assert!(reg.get("compact").is_some());
         assert!(reg.get("model").is_some());
+        assert_eq!(reg.get("subagent-model").unwrap().name(), "subagent-model");
+        assert_eq!(reg.get("subagents-model").unwrap().name(), "subagent-model");
         assert!(reg.get("support_vision").is_some());
+        assert!(reg.get("fast").is_some());
         assert!(reg.get("home").is_some());
         assert!(reg.get("view-plan").is_some());
         reg.set_available_tools(std::collections::HashSet::from([

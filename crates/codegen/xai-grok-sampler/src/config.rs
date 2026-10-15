@@ -87,6 +87,9 @@ pub struct SamplerConfig {
     /// Overrides the Responses API `reasoning.summary` the request builder sets; `None` leaves it as built.
     #[serde(default)]
     pub reasoning_summary: Option<ReasoningSummary>,
+    /// 仅 Responses 请求启用优先服务；默认关闭。
+    #[serde(default)]
+    pub fast_mode: bool,
 
     // Client identity
     pub origin_client: Option<OriginClientInfo>,
@@ -164,6 +167,7 @@ impl Default for SamplerConfig {
             idle_timeout_secs: None,
             reasoning_effort: None,
             reasoning_summary: None,
+            fast_mode: false,
             origin_client: None,
             client_identifier: None,
             deployment_id: None,
@@ -254,6 +258,7 @@ mod tests {
         object.remove("supports_vision");
         object.remove("request_compression");
         object.remove("reasoning_summary");
+        object.remove("fast_mode");
         object.remove("max_request_bytes");
         let config: SamplerConfig = serde_json::from_value(stripped).unwrap();
         assert!(config.doom_loop_recovery.is_none());
@@ -264,9 +269,12 @@ mod tests {
         assert!(SamplerConfig::default().supports_vision);
         assert_eq!(config.request_compression, RequestCompression::None);
         assert!(config.reasoning_summary.is_none());
+        assert!(!config.fast_mode);
+        assert!(!SamplerConfig::default().fast_mode);
         assert!(config.max_request_bytes.is_none());
 
         let with_policy = SamplerConfig {
+            fast_mode: true,
             doom_loop_recovery: Some(DoomLoopRecoveryPolicy {
                 max_threshold: 8,
                 max_retries: 2,
@@ -276,6 +284,7 @@ mod tests {
         };
         let round_tripped: SamplerConfig =
             serde_json::from_value(serde_json::to_value(&with_policy).unwrap()).unwrap();
+        assert!(round_tripped.fast_mode);
         assert_eq!(
             round_tripped.doom_loop_recovery,
             with_policy.doom_loop_recovery

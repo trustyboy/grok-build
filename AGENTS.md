@@ -73,6 +73,26 @@
 - `/support_vision [on|off]` 的覆盖只属于当前会话和模型；hook 与 sampler 使用 `session/acp_session_impl/sampler_turn.rs` 的同一轮次快照，禁止改回读取共享 `current_model_id`。
 - 本地端到端验证：先完成 Release 构建，再运行 `python tools/test-model-discovery.py`。脚本使用临时配置和本地假上游，不需要真实凭据。
 
+## GPT Fast 模式
+
+- 模型配置 `fast_mode` 默认 `false`；`/fast [on|off|status]` 仅覆盖当前会话和当前模型，无参切换，下一轮生效。
+- 仅 Responses 请求在开启时发送 `service_tier: "priority"`（OpenAI Fast 的兼容值）；关闭时省略字段，Chat Completions 与 Messages 不发送。
+- 会话覆盖位于 `session/acp_session_impl/fast_mode.rs`，采样器与视觉开关共用轮次快照。保持模型切换、会话隔离及执行中轮次归属。
+- Release 构建后运行 `python tools/test-fast-mode.py`，使用临时配置和本地假上游校验实际请求。
+
+## 子代理模型配置与会话覆盖
+
+- `[subagent] model`、`reasoning_effort` 独立可选；`/subagent-model [status|inherit|reset|模型ID或名称 [window] [effort]]` 只改变当前父会话后续新建子代理，不改主模型或磁盘配置。状态描述默认 `general-purpose`，不是所有角色的最终结果。
+- 用户可见正式名称为 `[subagent]` 及 `models/roles/personas/toggle` 子表、`/subagent-model`、`x.ai/session/subagent_model`。旧 `[subagents]` 兼容读取，同键单数优先、旧表独有键保留；旧命令与旧 endpoint 保留别名。内部复数目录、集合和历史文件名无需改名。
+- 普通模型优先级：单次显式 > 会话 > role/persona > type pins > 主模型 `subagent_model` > global > agent definition > parent。effort：单次显式 > 会话（最终采用同一临时目标）> role/persona > global > definition > 基础配置。主模型专属字段只指定 model；目标不支持 effort 或具体档位时告警并回退基础值。
+- `[model.cpa-deepseek-v4-flash] subagent_model = "nd-gpt-astra"` 按父会话实时模型目录键读取；省略/空白回退 global，无效目标告警回退 global。切主模型立即改变后续 child，临时 set 保持；临时发现模型自身未配置时不得借用上游来源模型字段。
+- 状态可选字段 `parentModelId`、`parentConfiguredModel` 分别描述当前父模型及其专属配置，`configuredModel` 始终保留全局值；`modelSource="parent_model_config"` 的中文展示为「主模型专属配置」。
+- `inherit` 直接使用父会话实时模型，跳过主模型专属及全局模型配置，仍应用有效全局 effort；`reset` 清除覆盖恢复当前主模型规则，两者均清除临时窗口及 effort。已有子代理保持启动快照，resume 固定原模型，内部 fork-context 固定父模型，不允许会话覆盖接管这些路径。
+- ACP 扩展 `x.ai/session/subagent_model` 使用 `sessionId`、可选 `expectedModelId`、`action`；`set` 接受 `modelId`、可选 `reasoningEffort/contextWindow`。未知单 ID 复用跨上游发现，只注册临时目录并更新子代理选择，不切换父模型；失败保持原值。
+- Release 构建后运行 `python tools/test-subagents-model.py`（Python 3.11+）；可重复指定 `--scenario`。脚本复用模型发现 `Rpc`，隔离配置及本地假上游驱动真实 parent 工具调用，校验 child 模型/API/认证/effort 以及 `x.ai/subagent/list_running` 的实际窗口，临时资源始终清理。
+- 脚本保留原有继承/全局/临时/发现/resume 场景；新增 `parent-model-selection/only/fallback/lifecycle/discovery`，覆盖主模型专属路由、不同凭据、双会话隔离、切主模型与 set/inherit/reset、空白/无效回退及临时发现不借用来源配置，同时核对全局和父模型状态值。`legacy-section/mixed-sections` 覆盖旧表读取及同键单数优先、旧表独有字段保留。
+- role/persona/type pins/definition 完整优先级、显式 effort、内部 fork-context、并发时序和 TUI 补全/旧命令别名需另行定向测试，不以该 ACP 脚本代替。
+
 ## Chat Completions 工具调用兼容
 
 - `xai-grok-sampler/src/stream/chat_completions.rs` 按工具调用 `index` 合并响应片段；后续 `function.name` 为空字符串、null 或缺省时保留已有名称，流式事件也应跳过空名称更新。部分 DeepSeek 兼容接口会持续返回空名称占位符，合并上游时需保留此处理。

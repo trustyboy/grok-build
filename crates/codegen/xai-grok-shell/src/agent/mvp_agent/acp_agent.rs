@@ -2011,6 +2011,12 @@ impl acp::Agent for MvpAgent {
             "x.ai/models/discover_and_switch" => {
                 crate::agent::handlers::model_discovery::handle(self, &args).await
             }
+            "x.ai/session/subagent_model" | "x.ai/session/subagents_model" => {
+                crate::agent::handlers::subagents_model::handle(self, &args).await
+            }
+            "x.ai/session/fast_mode" => {
+                crate::agent::handlers::fast_mode::handle(self, &args).await
+            }
             "x.ai/session/support_vision" => {
                 crate::agent::handlers::support_vision::handle(self, &args).await
             }

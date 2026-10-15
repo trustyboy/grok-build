@@ -2280,6 +2280,51 @@ fn model_defaults_preserve_vision_and_reasoning_summary_override() {
 }
 
 #[test]
+fn fast_mode_defaults_and_explicit_false_override_reach_sampler() {
+    assert!(!DefaultModelJson::default().fast_mode);
+    let entry = ModelEntryConfig::default();
+    assert!(!entry.fast_mode);
+    assert!(!ModelInfo::default().fast_mode);
+    assert!(!ModelInfo::from_config(&entry).fast_mode);
+    let old_entry: ModelEntryConfig = serde_json::from_value(serde_json::json!({
+        "model": "fast-test", "base_url": "https://test.api/v1", "context_window": 200_000
+    }))
+    .unwrap();
+    assert!(!old_entry.fast_mode);
+    let mut old_info = serde_json::to_value(ModelInfo::default()).unwrap();
+    old_info.as_object_mut().unwrap().remove("fast_mode");
+    assert!(
+        !serde_json::from_value::<ModelInfo>(old_info)
+            .unwrap()
+            .fast_mode
+    );
+
+    let base = ModelEntry::from_config_entry(&ModelEntryConfig {
+        fast_mode: true,
+        ..old_entry
+    });
+    assert!(base.info.fast_mode);
+    for override_value in [None, Some(true), Some(false)] {
+        let model = ConfigModelOverride {
+            fast_mode: override_value,
+            ..Default::default()
+        }
+        .apply("fast-test", Some(base.clone()), &EndpointsConfig::default());
+        let expected = override_value.unwrap_or(true);
+        assert_eq!(model.info.fast_mode, expected);
+        let sampler = sampling_config_for_model(
+            &model,
+            resolve_credentials(&model, None),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(sampler.fast_mode, expected);
+    }
+}
+
+#[test]
 fn model_info_from_config_propagates_use_concise() {
     let entry = ModelEntryConfig {
         model: "test".to_string(),
