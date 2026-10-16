@@ -84,6 +84,7 @@ impl SessionActor {
             }
             None => session_config,
         };
+        config.responses_compact_threshold = None;
         if self
             .models_manager
             .model_supports_reasoning_effort_value(&config.model, settings.reasoning_effort)

@@ -536,6 +536,9 @@ pub fn stream_messages<'a>(
         };
 
         let assistant_item = ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: std::sync::Arc::<str>::from(assistant_text),
             tool_calls: assistant_tool_calls,
             model_id: Some(model_id),

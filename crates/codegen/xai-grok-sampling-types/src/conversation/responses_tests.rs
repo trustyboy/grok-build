@@ -656,6 +656,9 @@ fn test_encrypted_reasoning_included_in_responses_api_request() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "The answer is 4.".into(),
             tool_calls: vec![],
             model_id: Some("grok-3".to_string()),
@@ -714,6 +717,9 @@ fn test_only_encrypted_reasoning_included_in_request() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "Hi!".into(),
             tool_calls: vec![],
             model_id: None,
@@ -980,6 +986,9 @@ fn test_transform_cwd_rewrites_reasoning_sibling() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: format!("I edited {worktree}/src/main.rs").into(),
             tool_calls: vec![],
             model_id: Some("grok-3".to_string()),
@@ -1171,6 +1180,9 @@ fn empty_reason_reasoning_only() {
                 status: None,
             }),
             ConversationItem::Assistant(AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: String::new().into(),
                 tool_calls: Vec::new(),
                 model_id: None,
@@ -1571,6 +1583,9 @@ fn empty_content_assistant_with_tool_calls_and_reasoning() {
         ConversationItem::user("u1"),
         reasoning_sibling("r1", "must call a tool", Some("enc_pre_tool")),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: Arc::<str>::from(""),
             tool_calls: vec![ToolCall {
                 id: Arc::<str>::from("call_1"),
@@ -1648,4 +1663,577 @@ fn serialized_body_contains_no_placeholder_strings() {
         2,
         "both reasoning siblings must be present"
     );
+}
+
+/// 最小响应保留原始输出通道，typed output 可为空。
+fn raw_history_response(output: serde_json::Value) -> rs::Response {
+    let mut response: rs::Response = serde_json::from_value(serde_json::json!({
+        "id":"resp_raw", "object":"response", "created_at":1,
+        "model":"test", "status":"completed", "output":[]
+    }))
+    .expect("response fixture");
+    // 模拟适配器：可识别输出仍进入 typed 通道，原始通道保留完整数据。
+    response.output = output
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .collect();
+    response.metadata = Some(std::collections::HashMap::from([(
+        RESPONSE_RAW_OUTPUT_METADATA_KEY.to_owned(),
+        output.to_string(),
+    )]));
+    response
+}
+
+/// 使用真实请求序列化路径验证补丁。
+fn patched_history(items: Vec<ConversationItem>) -> serde_json::Value {
+    let req = ConversationRequest::from_items(items);
+    let mut body = serde_json::to_value(rs::CreateResponse::from(&req)).unwrap();
+    patch_responses_input(&mut body, &req);
+    body
+}
+
+#[test]
+fn responses_raw_history_preserves_boundaries_refusal_and_function_identity() {
+    let raw = serde_json::json!([
+        {"type":"message","id":"m1","role":"assistant","status":"completed",
+         "phase":"commentary","content":[{"type":"output_text","text":"checking","annotations":[],"logprobs":[]}]},
+        {"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}",
+         "namespace":"fs","caller":{"type":"direct"},"status":"completed","extra_output":true},
+        {"type":"message","id":"m2","role":"assistant","status":"completed",
+         "phase":"final_answer","content":[{"type":"refusal","refusal":"cannot comply"}]}
+    ]);
+    let items = response_to_conversation_items(raw_history_response(raw.clone()));
+    let ConversationItem::Assistant(assistant) = items.last().unwrap() else {
+        panic!()
+    };
+    assert_eq!(assistant.content.as_ref(), "checking\ncannot comply");
+    assert_eq!(
+        serde_json::to_value(&assistant.responses_output).unwrap(),
+        raw
+    );
+    let persisted = serde_json::to_string(&items).unwrap();
+    let restored: Vec<ConversationItem> = serde_json::from_str(&persisted).unwrap();
+    let body = patched_history(restored);
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 3);
+    assert_eq!(body["input"][0]["phase"], "commentary");
+    assert_eq!(body["input"][1]["namespace"], "fs");
+    assert_eq!(body["input"][1]["caller"]["type"], "direct");
+    assert!(body["input"][1].get("status").is_none());
+    assert!(body["input"][1].get("extra_output").is_none());
+    assert!(body["input"][0]["content"][0].get("logprobs").is_none());
+    assert_eq!(body["input"][2]["content"][0]["refusal"], "cannot comply");
+    let messages = conversation_to_chat_messages(items);
+    assert!(
+        serde_json::to_string(&messages)
+            .unwrap()
+            .contains("cannot comply")
+    );
+}
+
+#[test]
+fn responses_raw_history_filters_unknown_and_client_tools_but_retains_storage() {
+    let raw = serde_json::json!([
+        {"type":"future_output","payload":{"opaque":true}},
+        {"type":"computer_call","id":"computer1","action":{"type":"click"}},
+        {"type":"custom_tool_call","id":"custom1","name":"execute","input":"danger"},
+        {"type":"compaction","id":"compact1","encrypted_content":"opaque","status":"completed"},
+        {"type":"mcp_call","id":"mcp1","name":"lookup","arguments":"{}","server_label":"docs","output":"found","error":null}
+    ]);
+    let items = response_to_conversation_items(raw_history_response(raw.clone()));
+    let ConversationItem::Assistant(assistant) = items.last().unwrap() else {
+        panic!()
+    };
+    assert!(assistant.tool_calls.is_empty());
+    assert_eq!(assistant.responses_output.as_ref().unwrap().len(), 5);
+    let body = patched_history(items);
+    assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    assert_eq!(body["input"][0]["type"], "mcp_call");
+}
+
+#[test]
+fn responses_raw_history_deduplicates_siblings_and_keeps_old_history() {
+    let reasoning =
+        serde_json::json!({"type":"reasoning","id":"r1","summary":[],"encrypted_content":"secret"});
+    let mut items = vec![ConversationItem::assistant("old")];
+    items.extend(response_to_conversation_items(raw_history_response(
+        serde_json::json!([
+            {"type":"message","id":"m1","role":"assistant","status":"completed",
+             "content":[{"type":"output_text","text":"before","annotations":[]}]},
+            reasoning,
+            {"type":"message","id":"m2","role":"assistant","status":"completed",
+             "content":[{"type":"output_text","text":"after","annotations":[]}]}
+        ]),
+    )));
+    let body = patched_history(items);
+    assert_eq!(body["input"].as_array().unwrap().len(), 4);
+    assert_eq!(body["input"][0]["content"], "old");
+    assert_eq!(body["input"][2]["type"], "reasoning");
+    let old: AssistantItem =
+        serde_json::from_value(serde_json::json!({"content":"legacy"})).unwrap();
+    assert!(old.responses_output.is_none());
+}
+
+#[test]
+fn responses_typed_refusal_without_raw_metadata_is_visible() {
+    let mut response = raw_history_response(serde_json::json!([]));
+    response.metadata = None;
+    response.output = serde_json::from_value(serde_json::json!([
+        {"type":"message","id":"refusal1","role":"assistant","status":"completed",
+         "content":[{"type":"refusal","refusal":"not allowed"}]}
+    ]))
+    .unwrap();
+    let items = response_to_conversation_items(response);
+    assert_eq!(items.last().unwrap().text_content(), "not allowed");
+    let body = patched_history(items);
+    assert_eq!(body["input"][0]["content"][0]["refusal"], "not allowed");
+}
+
+#[test]
+fn responses_empty_raw_output_keeps_streaming_fallback() {
+    let mut items = response_to_conversation_items(raw_history_response(serde_json::json!([])));
+    let Some(ConversationItem::Assistant(assistant)) = items.last_mut() else {
+        panic!()
+    };
+    assistant.content = "streamed text".into();
+    let body = patched_history(items);
+    assert_eq!(body["input"][0]["content"], "streamed text");
+}
+
+#[test]
+fn responses_x_search_history_supports_all_hosted_names() {
+    for name in [
+        "x_search",
+        "x_keyword_search",
+        "x_semantic_search",
+        "x_user_search",
+        "x_thread_fetch",
+    ] {
+        let raw = serde_json::json!([{"type":"custom_tool_call", "id":"xs1", "call_id":"xc1", "name":name, "input":"query"}]);
+        let items = response_to_conversation_items(raw_history_response(raw));
+        assert!(
+            matches!(items.first(), Some(ConversationItem::BackendToolCall(_))),
+            "{name}"
+        );
+        let body = patched_history(items.clone());
+        assert_eq!(body["input"].as_array().unwrap().len(), 1, "{name}");
+        assert_eq!(body["input"][0]["name"], name);
+        let legacy: Vec<_> = items
+            .into_iter()
+            .map(|mut item| {
+                if let ConversationItem::Assistant(a) = &mut item {
+                    a.responses_output = None;
+                }
+                item
+            })
+            .collect();
+        assert_eq!(patched_history(legacy)["input"][0]["name"], name);
+    }
+}
+
+#[test]
+fn responses_modified_history_never_replays_stale_snapshot() {
+    let raw = serde_json::json!([
+        {"type":"message","id":"m1","role":"assistant","status":"completed",
+         "content":[{"type":"output_text","text":"original long text","annotations":[]}]},
+        {"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}"},
+        {"type":"compaction","id":"compact1","encrypted_content":"stale secret"}
+    ]);
+    for change in ["text", "clear", "arguments", "id"] {
+        let mut items = response_to_conversation_items(raw_history_response(raw.clone()));
+        let Some(ConversationItem::Assistant(a)) = items.last_mut() else {
+            panic!()
+        };
+        match change {
+            "text" => a.content = "short".into(),
+            "clear" => a.tool_calls.clear(),
+            "arguments" => a.tool_calls.first_mut().unwrap().arguments = "{\"new\":true}".into(),
+            "id" => a.tool_calls.first_mut().unwrap().id = "repaired".into(),
+            _ => unreachable!(),
+        }
+        repair_dangling_tool_calls(&mut items, DanglingToolCallReason::UserCancelled);
+        let body = patched_history(items);
+        let serialized = body.to_string();
+        assert!(!serialized.contains("stale secret"), "{change}");
+        if change == "text" {
+            assert!(!serialized.contains("original long text"));
+        }
+        if change == "clear" {
+            assert!(!serialized.contains("function_call"));
+        }
+        if change == "id" {
+            assert!(!serialized.contains("\"c1\""));
+        }
+    }
+}
+
+#[test]
+fn responses_removed_or_changed_siblings_are_not_restored() {
+    let raw = serde_json::json!([
+        {"type":"reasoning","id":"r1","summary":[{"type":"summary_text","text":"old reasoning"}],"encrypted_content":"old cipher"},
+        {"type":"custom_tool_call","id":"xs1","call_id":"xc1","name":"x_search","input":"query"},
+        {"type":"message","id":"m1","role":"assistant","status":"completed",
+         "content":[{"type":"output_text","text":"answer","annotations":[]}]}
+    ]);
+    let mut items = response_to_conversation_items(raw_history_response(raw));
+    items.retain(|item| !matches!(item, ConversationItem::BackendToolCall(_)));
+    let Some(ConversationItem::Reasoning(reasoning)) = items.first_mut() else {
+        panic!()
+    };
+    reasoning.encrypted_content = None;
+    reasoning.summary.clear();
+    let body = patched_history(items.clone());
+    assert!(!body.to_string().contains("old cipher"));
+    assert!(!body.to_string().contains("old reasoning"));
+    assert!(!body.to_string().contains("custom_tool_call"));
+    items.retain(|item| !matches!(item, ConversationItem::Reasoning(_)));
+    assert!(
+        !patched_history(items)["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+    );
+}
+
+#[test]
+fn responses_mcp_and_compaction_are_sdk_input_items() {
+    let raw = serde_json::json!([
+        {"type":"mcp_call","id":"mc1","name":"lookup","arguments":"{}","server_label":"docs","output":"found","output_only":true},
+        {"type":"mcp_list_tools","id":"ml1","server_label":"docs","tools":[],"output_only":true},
+        {"type":"mcp_approval_request","id":"ma1","name":"lookup","arguments":"{}","server_label":"docs","output_only":true},
+        {"type":"compaction","id":"co1","encrypted_content":"opaque","output_only":true}
+    ]);
+    for item in raw.as_array().unwrap() {
+        serde_json::from_value::<rs::Item>(item.clone())
+            .expect("fixed SDK supports this input type");
+    }
+    let body = patched_history(response_to_conversation_items(raw_history_response(raw)));
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 3);
+    assert!(input.iter().all(|item| item.get("type").and_then(|value| value.as_str()) != Some("compaction")));
+    for item in input {
+        assert!(item.get("output_only").is_none());
+        serde_json::from_value::<rs::Item>(item.clone())
+            .expect("replayed item remains legal SDK input");
+    }
+}
+
+/// 模拟客户端使用发送前的本地历史签发压缩来源。
+fn append_checkpoint(req: &mut ConversationRequest, raw: serde_json::Value, source: &str) {
+    let mut response = raw_history_response(raw);
+    let metadata = response.metadata.as_mut().unwrap();
+    metadata.insert(RESPONSE_SOURCE_METADATA_KEY.into(), source.into());
+    metadata.insert(
+        RESPONSE_INPUT_FINGERPRINT_METADATA_KEY.into(),
+        responses_input_fingerprint(req, source),
+    );
+    req.items.extend(response_to_conversation_items(response));
+}
+
+/// 原生压缩入口不依赖 SDK 是否支持 compaction 类型。
+fn source_history(req: &ConversationRequest, source: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({});
+    patch_responses_input_for_source(&mut body, req, source);
+    body["input"].clone()
+}
+
+#[test]
+fn responses_checkpoint_latest_boundary_and_system_instructions() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("old"),
+    ]);
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"message","id":"before","role":"assistant","content":[{"type":"output_text","text":"before","annotations":[]}]},
+            {"type":"compaction","encrypted_content":"first"},
+            {"type":"message","id":"after","role":"assistant","content":[{"type":"output_text","text":"after","annotations":[]}]}
+        ]),
+        "source",
+    );
+    let input = source_history(&req, Some("source"));
+    assert_eq!(input[0]["content"], "sys");
+    assert_eq!(input[1]["encrypted_content"], "first");
+    assert_eq!(input[2]["id"], "after");
+    req.items.push(ConversationItem::system("new instruction"));
+    req.items.push(ConversationItem::user("next"));
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"compaction","encrypted_content":"second"}
+        ]),
+        "source",
+    );
+    let input = source_history(&req, Some("source"));
+    assert_eq!(input.as_array().unwrap().len(), 3);
+    assert_eq!(input[1]["content"], "new instruction");
+    assert_eq!(input[2]["encrypted_content"], "second");
+}
+
+#[test]
+fn responses_checkpoint_history_edits_and_source_fail_closed() {
+    let mut req = ConversationRequest::from_items(vec![ConversationItem::user("private")]);
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"compaction","encrypted_content":"opaque"}
+        ]),
+        "source",
+    );
+    for source in [None, Some("other")] {
+        assert!(!source_history(&req, source).to_string().contains("opaque"));
+    }
+    let mut edited = req.clone();
+    edited.items[0] = ConversationItem::user("edited");
+    assert!(
+        !source_history(&edited, Some("source"))
+            .to_string()
+            .contains("opaque")
+    );
+    req.items.remove(0);
+    assert!(
+        !source_history(&req, Some("source"))
+            .to_string()
+            .contains("opaque")
+    );
+}
+
+#[test]
+fn responses_checkpoint_tool_boundary_must_be_paired() {
+    let mut req = ConversationRequest::from_items(vec![ConversationItem::user("task")]);
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}"},
+            {"type":"compaction","encrypted_content":"unsafe"}
+        ]),
+        "source",
+    );
+    req.items
+        .push(ConversationItem::tool_result("c1", "result"));
+    let input = source_history(&req, Some("source"));
+    assert!(!input.to_string().contains("unsafe"));
+    assert!(input.to_string().contains("function_call_output"));
+}
+
+#[test]
+fn responses_checkpoint_incomplete_response_and_legacy_are_not_trusted() {
+    for status in ["incomplete", "failed", "cancelled", "in_progress"] {
+        let mut response = raw_history_response(serde_json::json!([]));
+        response.status = serde_json::from_value(serde_json::json!(status)).unwrap();
+        response
+            .metadata
+            .as_mut()
+            .unwrap()
+            .insert(RESPONSE_SOURCE_METADATA_KEY.into(), "source".into());
+        let items = response_to_conversation_items(response);
+        let ConversationItem::Assistant(assistant) = items.last().unwrap() else {
+            panic!()
+        };
+        assert!(assistant.responses_source.is_none());
+        assert!(assistant.responses_input_fingerprint.is_none());
+    }
+    let old: AssistantItem =
+        serde_json::from_value(serde_json::json!({"content":"legacy"})).unwrap();
+    assert!(old.responses_source.is_none());
+    assert!(old.responses_input_fingerprint.is_none());
+}
+
+#[test]
+fn responses_checkpoint_image_removal_and_sibling_edits_invalidate() {
+    let image_user: ConversationItem = serde_json::from_value(serde_json::json!({
+        "type":"user", "content":[{"type":"text","text":"look"},
+        {"type":"image","url":"data:image/png;base64,old"}]
+    }))
+    .unwrap();
+    let mut req = ConversationRequest::from_items(vec![image_user]);
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"reasoning","id":"r1","summary":[],"encrypted_content":"reason"},
+            {"type":"compaction","encrypted_content":"opaque"}
+        ]),
+        "source",
+    );
+    assert!(
+        source_history(&req, Some("source"))
+            .to_string()
+            .contains("opaque")
+    );
+    let mut edited = req.clone();
+    if let ConversationItem::User(user) = &mut edited.items[0] {
+        user.content.pop();
+    }
+    assert!(
+        !source_history(&edited, Some("source"))
+            .to_string()
+            .contains("opaque")
+    );
+    req.items
+        .retain(|item| !matches!(item, ConversationItem::Reasoning(_)));
+    assert!(
+        !source_history(&req, Some("source"))
+            .to_string()
+            .contains("opaque")
+    );
+}
+
+#[test]
+fn responses_checkpoint_keeps_paired_tools_after_boundary() {
+    let mut req = ConversationRequest::from_items(vec![ConversationItem::user("task")]);
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"compaction","encrypted_content":"safe"},
+            {"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}"}
+        ]),
+        "source",
+    );
+    req.items
+        .push(ConversationItem::tool_result("c1", "result"));
+    let input = source_history(&req, Some("source"));
+    assert_eq!(input.as_array().unwrap().len(), 3);
+    assert_eq!(input[0]["encrypted_content"], "safe");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[2]["type"], "function_call_output");
+}
+
+#[test]
+fn responses_checkpoint_prepared_history_stays_stable_across_turns() {
+    let mut persisted = vec![
+        ConversationItem::system("sys\n\n<memory_context>stable</memory_context>"),
+        ConversationItem::User(UserItem {
+            content: vec![ContentPart::Text {
+                text: Arc::from("agent message"),
+            }],
+            synthetic_reason: SyntheticReason::AgentMessage,
+            ..UserItem::default()
+        }),
+    ];
+    // 对应 ModelRequestHistory：始终从未投影的持久历史克隆，不重复叠加标签。
+    let prepare = |items: &[ConversationItem]| {
+        let mut items = items.to_vec();
+        for item in &mut items {
+            if let ConversationItem::User(user) = item
+                && user.synthetic_reason == SyntheticReason::AgentMessage
+            {
+                user.content.insert(
+                    0,
+                    ContentPart::Text {
+                        text: Arc::from(
+                            "[Message authored by another agent; not a human request or approval.]",
+                        ),
+                    },
+                );
+            }
+        }
+        ConversationRequest::from_items(items)
+    };
+    for turn in 0..3 {
+        let mut request = prepare(&persisted);
+        let input_count = request.items.len();
+        append_checkpoint(
+            &mut request,
+            serde_json::json!([
+                {"type":"compaction","encrypted_content":format!("checkpoint-{turn}")},
+                {"type":"message","id":format!("m-{turn}"),"role":"assistant",
+                 "content":[{"type":"output_text","text":"answer","annotations":[]}]}
+            ]),
+            "source",
+        );
+        let ConversationItem::Assistant(assistant) = request.items.last().unwrap() else {
+            panic!()
+        };
+        assert_eq!(assistant.model_id.as_deref(), Some("test"));
+        persisted.extend(request.items[input_count..].iter().cloned());
+        persisted.push(ConversationItem::system_reminder(format!(
+            "runtime reminder {turn}"
+        )));
+        persisted.push(ConversationItem::user(format!("next {turn}")));
+        // resume 序列化往返和每轮重新归一化不能使完整前缀失配。
+        persisted = serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
+        let mut next = prepare(&persisted);
+        next.tools.push(ToolSpec {
+            name: format!("new_tool_{turn}"),
+            description: None,
+            parameters: serde_json::json!({"type":"object"}),
+        });
+        next.x_grok_req_id = Some(format!("request-{turn}"));
+        let input = source_history(&next, Some("source"));
+        assert_eq!(input[1]["encrypted_content"], format!("checkpoint-{turn}"));
+        assert_eq!(input.as_array().unwrap().len(), 5);
+    }
+}
+
+#[test]
+fn responses_checkpoint_changed_system_recovers_after_new_checkpoint() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::system("old memory"),
+        ConversationItem::user("task"),
+    ]);
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"compaction","encrypted_content":"old_checkpoint"}
+        ]),
+        "source",
+    );
+    req.items[0] = ConversationItem::system("new memory");
+    let input = source_history(&req, Some("source"));
+    assert!(!input.to_string().contains("old_checkpoint"));
+    assert_eq!(input[0]["content"], "new memory");
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"compaction","encrypted_content":"fresh_checkpoint"}
+        ]),
+        "source",
+    );
+    let input = source_history(&req, Some("source"));
+    assert_eq!(input[1]["encrypted_content"], "fresh_checkpoint");
+    assert_eq!(input.as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn responses_checkpoint_tool_image_cleanup_invalidates_entire_chain() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: Arc::from("c1"),
+            name: "read_file".into(),
+            arguments: Arc::from("{}"),
+        }]),
+        ConversationItem::ToolResult(ToolResultItem {
+            tool_call_id: "c1".into(),
+            content: Arc::from("image result"),
+            images: vec![ContentPart::Image {
+                url: Arc::from("data:image/png;base64,old"),
+            }],
+        }),
+    ]);
+    for id in ["first_checkpoint", "second_checkpoint"] {
+        append_checkpoint(
+            &mut req,
+            serde_json::json!([
+                {"type":"compaction","encrypted_content":id}
+            ]),
+            "source",
+        );
+    }
+    assert_eq!(
+        source_history(&req, Some("source"))[0]["encrypted_content"],
+        "second_checkpoint"
+    );
+    let ConversationItem::ToolResult(result) = &mut req.items[1] else {
+        panic!()
+    };
+    result.images.clear();
+    let input = source_history(&req, Some("source"));
+    assert!(!input.to_string().contains("checkpoint"));
+    assert!(!input.to_string().contains("base64"));
+    assert_eq!(input[0]["type"], "function_call");
+    assert_eq!(input[1]["type"], "function_call_output");
 }

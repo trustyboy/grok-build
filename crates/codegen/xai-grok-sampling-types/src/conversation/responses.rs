@@ -1,8 +1,103 @@
 use super::*;
 
+/// 流适配器通过 metadata 传递完整 output 数组的 JSON 字符串。
+pub const RESPONSE_RAW_OUTPUT_METADATA_KEY: &str = "__grok_responses_raw_output";
+/// 客户端覆盖的来源哈希；不得直接信任上游 metadata。
+pub const RESPONSE_SOURCE_METADATA_KEY: &str = "__grok_responses_source";
+/// 客户端发送前计算的本地历史指纹。
+pub const RESPONSE_INPUT_FINGERPRINT_METADATA_KEY: &str = "__grok_responses_input_fingerprint";
+
+/// 对准备完成的完整请求历史和来源求指纹，而非已裁剪的线上 input。
+/// 调用前须完成提示注入、历史归一化及图片过滤；工具定义不属于历史。
+/// 已有提示或内容变化时保守失效，新追加的提示不影响此前压缩点。
+pub fn responses_input_fingerprint(req: &ConversationRequest, source: &str) -> String {
+    responses_history_fingerprint(&req.items, source)
+}
+
+/// 保留图片、原始输出及 sibling 内容，任何删除或改写均使指纹失效。
+fn responses_history_fingerprint(items: &[ConversationItem], source: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&("responses-history-v1", source, items))
+        .expect("conversation history is serializable");
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// X 搜索服务端工具名；保留旧历史中的聚合名称。
+pub fn is_responses_x_search_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "x_search" | "x_keyword_search" | "x_semantic_search" | "x_user_search" | "x_thread_fetch"
+    )
+}
+
+/// 原始消息投影与跨协议通用文本保持一致。
+fn responses_output_text(raw: &[serde_json::Value]) -> String {
+    raw.iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|part| match part.get("type").and_then(|v| v.as_str()) {
+            Some("output_text") => part.get("text").and_then(|v| v.as_str()),
+            Some("refusal") => part.get("refusal").and_then(|v| v.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 通用历史被裁剪或修复后，旧协议快照不得覆盖当前内容。
+fn responses_output_matches_assistant(
+    raw: &[serde_json::Value],
+    assistant: &AssistantItem,
+) -> bool {
+    if responses_output_text(raw) != assistant.content.as_ref() {
+        return false;
+    }
+    let mut calls = assistant.tool_calls.iter();
+    for item in raw
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+    {
+        let Some(call) = calls.next() else {
+            return false;
+        };
+        if item.get("call_id").and_then(|v| v.as_str()) != Some(call.id.as_ref())
+            || item.get("name").and_then(|v| v.as_str()) != Some(call.name.as_str())
+            || item.get("arguments").and_then(|v| v.as_str()) != Some(call.arguments.as_ref())
+        {
+            return false;
+        }
+    }
+    calls.next().is_none()
+}
+
 /// Flatten `response.output` into `ConversationItem`s, preserving emission order.
 /// Replaying that order byte for byte on the next turn is what keeps the server-side prefix cache hot.
 pub fn response_to_conversation_items(response: rs::Response) -> Vec<ConversationItem> {
+    let responses_output = response
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(RESPONSE_RAW_OUTPUT_METADATA_KEY))
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
+        .or_else(|| {
+            serde_json::to_value(&response.output)
+                .ok()
+                .and_then(|raw| raw.as_array().cloned())
+        });
+    // 不完整响应即使携带内部字段也不能提交压缩点。
+    let completed = serde_json::to_value(&response.status).ok()
+        == Some(serde_json::Value::String("completed".into()));
+    let trusted_metadata = |key: &str| {
+        completed
+            .then(|| response.metadata.as_ref()?.get(key).cloned())
+            .flatten()
+            .filter(|value| !value.is_empty())
+    };
+    let responses_source = trusted_metadata(RESPONSE_SOURCE_METADATA_KEY);
+    let responses_input_fingerprint = trusted_metadata(RESPONSE_INPUT_FINGERPRINT_METADATA_KEY);
     let model_id = response.model.clone();
     let model_fingerprint = response
         .metadata
@@ -51,7 +146,7 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
                     kind: BackendToolKind::WebSearch(ws),
                 }));
             }
-            rs::OutputItem::CustomToolCall(ct) => {
+            rs::OutputItem::CustomToolCall(ct) if is_responses_x_search_tool(&ct.name) => {
                 backend_tool_count += 1;
                 items.push(ConversationItem::BackendToolCall(BackendToolCallItem {
                     kind: BackendToolKind::XSearch(ct),
@@ -77,8 +172,15 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
         );
     }
 
+    // 原始消息包含 SDK 尚不能表达的拒绝和分阶段文本。
+    if let Some(raw) = &responses_output {
+        content = responses_output_text(raw);
+    }
     tracing::info!(model_id = %model_id, ?model_fingerprint, ?reasoning_effort, "response_to_conversation_items setting model metadata on AssistantItem");
     items.push(ConversationItem::Assistant(AssistantItem {
+        responses_output,
+        responses_source,
+        responses_input_fingerprint,
         content: Arc::<str>::from(content),
         tool_calls,
         model_id: Some(model_id),
@@ -188,6 +290,296 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
                     .or_insert_with(|| serde_json::Value::String("reasoning_text".into()));
             }
         }
+    }
+}
+
+/// 序列化后恢复 Responses 历史；不影响其他请求字段及跨协议转换。
+pub fn patch_responses_input(body: &mut serde_json::Value, req: &ConversationRequest) {
+    patch_responses_history(body, req, None, true);
+}
+
+/// 仅启用且来源、完整本地前缀均匹配时重放最新安全压缩点。
+/// `None` 表示关闭原生压缩，使用通用历史。
+pub fn patch_responses_input_for_source(
+    body: &mut serde_json::Value,
+    req: &ConversationRequest,
+    source: Option<&str>,
+) {
+    patch_responses_history(body, req, source.filter(|s| !s.is_empty()), false);
+}
+
+/// 检查裁剪边界两侧是否产生孤立调用或结果。
+fn responses_calls_paired(input: &[serde_json::Value]) -> bool {
+    let mut pending = std::collections::HashSet::new();
+    for item in input {
+        match item.get("type").and_then(|v| v.as_str()) {
+            Some("function_call") => {
+                let Some(id) = item.get("call_id").and_then(|v| v.as_str()) else {
+                    return false;
+                };
+                if !pending.insert(id) {
+                    return false;
+                }
+            }
+            Some("function_call_output") => {
+                let Some(id) = item.get("call_id").and_then(|v| v.as_str()) else {
+                    return false;
+                };
+                if !pending.remove(id) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    pending.is_empty()
+}
+
+/// 检查响应自身的 sibling 未被删除或改写，不能由原始快照恢复。
+fn responses_siblings_match(raw: &[serde_json::Value], siblings: &[serde_json::Value]) -> bool {
+    let expected: Vec<_> = raw
+        .iter()
+        .filter(|entry| responses_owned_sibling(entry))
+        .filter_map(responses_output_to_input)
+        .collect();
+    expected == siblings
+}
+
+/// SDK 可表达且作为本地独立历史保存的输出。
+fn responses_owned_sibling(entry: &serde_json::Value) -> bool {
+    matches!(
+        entry.get("type").and_then(|v| v.as_str()),
+        Some("reasoning" | "web_search_call" | "code_interpreter_call")
+    ) || entry.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call")
+        && entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .is_some_and(is_responses_x_search_tool)
+}
+
+/// 原始历史兼容投影与来源校验共用排序逻辑。
+fn patch_responses_history(
+    body: &mut serde_json::Value,
+    req: &ConversationRequest,
+    source: Option<&str>,
+    legacy: bool,
+) {
+    let mut input = Vec::new();
+    let mut checkpoints = Vec::new();
+    let mut siblings = Vec::new();
+    let mut sibling_start = None;
+    for (index, item) in req.items.iter().enumerate() {
+        if matches!(
+            item,
+            ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_)
+        ) {
+            sibling_start.get_or_insert(index);
+            siblings.extend(
+                conversation_item_to_input_items(item)
+                    .into_iter()
+                    .filter_map(|item| serde_json::to_value(item).ok()),
+            );
+            continue;
+        }
+        if let ConversationItem::Assistant(assistant) = item
+            && let Some(raw) = &assistant.responses_output
+            && (legacy || source.is_some())
+            && responses_output_matches_assistant(raw, assistant)
+        {
+            let valid_checkpoint = source.is_some_and(|source| {
+                assistant.responses_source.as_deref() == Some(source)
+                    && assistant.responses_input_fingerprint.as_deref()
+                        == Some(
+                            responses_history_fingerprint(
+                                &req.items[..sibling_start.unwrap_or(index)],
+                                source,
+                            )
+                            .as_str(),
+                        )
+                    && responses_siblings_match(raw, &siblings)
+            });
+            if !legacy
+                && !valid_checkpoint
+                && raw
+                    .iter()
+                    .any(|entry| entry.get("type").and_then(|v| v.as_str()) == Some("compaction"))
+            {
+                input.append(&mut siblings);
+                input.extend(
+                    conversation_item_to_input_items(item)
+                        .into_iter()
+                        .filter_map(|item| serde_json::to_value(item).ok()),
+                );
+                sibling_start = None;
+                continue;
+            }
+            // 原有 sibling 是裁剪后的权威数据；原始输出只恢复其顺序。
+            let mut replay = Vec::new();
+            let mut replay_checkpoints = Vec::new();
+            for entry in raw {
+                let kind = entry.get("type").and_then(|v| v.as_str());
+                let owned_sibling = matches!(
+                    kind,
+                    Some("reasoning" | "web_search_call" | "code_interpreter_call")
+                ) || kind == Some("custom_tool_call")
+                    && entry
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(is_responses_x_search_tool);
+                if owned_sibling {
+                    if let Some(position) =
+                        siblings.iter().position(|sibling: &serde_json::Value| {
+                            entry.get("type") == sibling.get("type")
+                                && entry.get("id").is_some()
+                                && entry.get("id") == sibling.get("id")
+                        })
+                    {
+                        replay.push(siblings.remove(position));
+                    }
+                } else if kind == Some("compaction") {
+                    if valid_checkpoint && let Some(item) = responses_output_to_input(entry) {
+                        replay_checkpoints.push(replay.len());
+                        replay.push(item);
+                    }
+                } else if let Some(item) = responses_output_to_input(entry) {
+                    replay.push(item);
+                }
+            }
+            input.append(&mut siblings);
+            checkpoints.extend(
+                replay_checkpoints
+                    .into_iter()
+                    .map(|offset| input.len() + offset),
+            );
+            input.append(&mut replay);
+        } else {
+            input.append(&mut siblings);
+            input.extend(
+                conversation_item_to_input_items(item)
+                    .into_iter()
+                    .filter_map(|item| serde_json::to_value(item).ok()),
+            );
+        }
+        sibling_start = None;
+    }
+    input.append(&mut siblings);
+    // 只保留所选边界的加密项，其他来源或较旧压缩项均不发送。
+    let is_compaction =
+        |item: &serde_json::Value| item.get("type").and_then(|v| v.as_str()) == Some("compaction");
+    let mut selected = None;
+    for boundary in checkpoints.into_iter().rev() {
+        let prefix: Vec<_> = input[..boundary]
+            .iter()
+            .filter(|item| !is_compaction(item))
+            .cloned()
+            .collect();
+        let suffix: Vec<_> = input[boundary..]
+            .iter()
+            .enumerate()
+            .filter(|(offset, item)| *offset == 0 || !is_compaction(item))
+            .map(|(_, item)| item.clone())
+            .collect();
+        if responses_calls_paired(&prefix) && responses_calls_paired(&suffix) {
+            let mut projected: Vec<_> = input[..boundary]
+                .iter()
+                .filter(|item| item.get("role").and_then(|v| v.as_str()) == Some("system"))
+                .cloned()
+                .collect();
+            projected.extend(suffix);
+            selected = Some(projected);
+            break;
+        }
+    }
+    if let Some(projected) = selected {
+        input = projected;
+    } else {
+        input.retain(|item| !is_compaction(item));
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert("input".into(), serde_json::Value::Array(input));
+    }
+    patch_reasoning_text_types(body);
+}
+
+/// 只放行已知输入类型；原始未知数据只持久化，不猜测协议语义。
+fn responses_output_to_input(raw: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::{Value, json};
+    let kind = raw.get("type")?.as_str()?;
+    match kind {
+        "message" => {
+            if raw.get("role")?.as_str()? != "assistant" {
+                return None;
+            }
+            let content: Vec<_> = raw.get("content")?.as_array()?.iter().filter_map(|part| {
+                match part.get("type")?.as_str()? {
+                    "output_text" => Some(json!({"type":"output_text", "text":part.get("text")?.as_str()?,
+                        "annotations":part.get("annotations").cloned().unwrap_or_else(|| json!([]))})),
+                    "refusal" => Some(json!({"type":"refusal", "refusal":part.get("refusal")?.as_str()?})),
+                    _ => None,
+                }
+            }).collect();
+            if content.is_empty() {
+                return None;
+            }
+            let mut message = json!({"type":"message", "role":"assistant", "content":content});
+            for key in ["id", "phase", "status"] {
+                if let Some(value) = raw.get(key) {
+                    message[key] = value.clone();
+                }
+            }
+            Some(message)
+        }
+        "function_call" => {
+            let id = raw.get("call_id")?.as_str()?;
+            let name = raw.get("name")?.as_str()?;
+            let arguments =
+                sanitize_tool_arguments(id, name, Arc::from(raw.get("arguments")?.as_str()?));
+            let mut call = json!({"type":"function_call", "call_id":id, "name":name, "arguments":arguments.as_ref()});
+            for key in ["id", "namespace", "caller"] {
+                if let Some(value) = raw.get(key) {
+                    call[key] = value.clone();
+                }
+            }
+            Some(call)
+        }
+        "compaction" => {
+            let encrypted = raw.get("encrypted_content")?.as_str()?;
+            if encrypted.trim().is_empty() {
+                return None;
+            }
+            let mut item = json!({"type":"compaction", "encrypted_content":encrypted});
+            if let Some(id) = raw.get("id") {
+                item["id"] = id.clone();
+            }
+            Some(item)
+        }
+        "reasoning"
+        | "web_search_call"
+        | "file_search_call"
+        | "code_interpreter_call"
+        | "image_generation_call"
+        | "mcp_call"
+        | "mcp_list_tools"
+        | "mcp_approval_request" => {
+            // SDK 输入模型负责过滤输出专用及未知字段。
+            let mut value = raw.clone();
+            if kind == "reasoning" {
+                value.as_object_mut()?.remove("status");
+            }
+            let item = serde_json::from_value::<rs::Item>(value).ok()?;
+            serde_json::to_value(item).ok()
+        }
+        "custom_tool_call"
+            if raw
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(is_responses_x_search_tool) =>
+        {
+            serde_json::from_value::<rs::Item>(raw.clone())
+                .ok()
+                .and_then(|item| serde_json::to_value(item).ok())
+        }
+        _ => None,
     }
 }
 

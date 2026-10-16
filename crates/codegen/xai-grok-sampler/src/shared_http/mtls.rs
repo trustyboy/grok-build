@@ -33,10 +33,19 @@ struct MtlsClientCache {
     entries: HashMap<MtlsClientCacheKey, MtlsClientCacheEntry>,
 }
 
+/// 保留仅获取客户端的调用接口。
 pub(crate) fn client(
     cert_dir: &Path,
     force_http1: bool,
 ) -> xai_grok_sampling_types::Result<reqwest::Client> {
+    client_with_identity_digest(cert_dir, force_http1).map(|(client, _)| client)
+}
+
+/// 客户端与身份指纹使用同一份证书及私钥快照，避免轮换时错配。
+pub(crate) fn client_with_identity_digest(
+    cert_dir: &Path,
+    force_http1: bool,
+) -> xai_grok_sampling_types::Result<(reqwest::Client, [u8; 32])> {
     let (cert_path, key_path) = identity_paths(cert_dir)?;
     let cert_pem = read_identity_file(&cert_path)?;
     let key_pem = read_identity_file(&key_path)?;
@@ -80,11 +89,13 @@ pub(crate) fn client(
             ))
         })
     };
-    if sharing_disabled() {
+    let identity_digest = cache_key.identity_digest;
+    let client = if sharing_disabled() {
         build()
     } else {
         cached_client(cache_key, build)
-    }
+    }?;
+    Ok((client, identity_digest))
 }
 
 fn client_cache_key(cert_pem: &[u8], key_pem: &[u8], force_http1: bool) -> MtlsClientCacheKey {

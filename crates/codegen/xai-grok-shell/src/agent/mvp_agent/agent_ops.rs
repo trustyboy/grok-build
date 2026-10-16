@@ -127,6 +127,7 @@ impl MvpAgent {
             None => {
                 let mut fallback = primary.clone();
                 fallback.model = slug;
+                fallback.responses_compact_threshold = None;
                 fallback
             }
         };

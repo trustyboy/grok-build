@@ -187,6 +187,234 @@ fn observe_for_recovery(capture: &FailedResponseCapture, event: &rs::ResponseStr
     }
 }
 
+/// 只追加完整快照尚未显示的后缀；冲突不能用追加修正。
+fn reconcile_snapshot(current: &mut String, snapshot: &str) -> String {
+    if let Some(suffix) = snapshot.strip_prefix(current.as_str()) {
+        let suffix = suffix.to_owned();
+        *current = snapshot.to_owned();
+        suffix
+    } else {
+        tracing::warn!("Responses 完整内容与已显示片段不一致，保留最终响应作为历史");
+        String::new()
+    }
+}
+
+/// 每个输出项独立保存正文和参数，done 快照不重复发送。
+#[derive(Default)]
+struct ContentState {
+    text: BTreeMap<(u32, u32), String>,
+    item_indices: BTreeMap<String, u32>,
+    tools: BTreeMap<u32, ToolState>,
+    next_tool_index: u32,
+}
+
+#[derive(Default)]
+struct ToolState {
+    index: Option<u32>,
+    id: String,
+    name: String,
+    arguments: String,
+    emitted_arguments: String,
+}
+
+impl ContentState {
+    /// 无 added 时先缓存参数，获得调用身份后再发送。
+    fn tool_update(
+        &mut self,
+        output_index: u32,
+        identity: Option<(&str, &str)>,
+        arguments: Option<(&str, bool)>,
+        request_id: &RequestId,
+    ) -> Vec<SamplingEvent> {
+        let tool = self.tools.entry(output_index).or_default();
+        let mut events = Vec::new();
+        if let Some((id, name)) = identity {
+            if !id.is_empty() && tool.id.is_empty() {
+                tool.id = id.to_owned();
+            }
+            if !name.is_empty() && tool.name.is_empty() {
+                tool.name = name.to_owned();
+            }
+        }
+        if let Some((arguments, complete)) = arguments {
+            if complete {
+                tool.arguments = arguments.to_owned();
+            } else {
+                tool.arguments.push_str(arguments);
+            }
+        }
+        if tool.index.is_none() && !tool.id.is_empty() && !tool.name.is_empty() {
+            let index = self.next_tool_index;
+            self.next_tool_index += 1;
+            tool.index = Some(index);
+            events.push(SamplingEvent::ToolCallDelta {
+                request_id: request_id.clone(),
+                tool_index: index,
+                id: Some(tool.id.clone()),
+                name: Some(tool.name.clone()),
+                arguments_delta: None,
+            });
+        }
+        if let Some(index) = tool.index {
+            let suffix = reconcile_snapshot(&mut tool.emitted_arguments, &tool.arguments);
+            if !suffix.is_empty() {
+                events.push(SamplingEvent::ToolCallDelta {
+                    request_id: request_id.clone(),
+                    tool_index: index,
+                    id: None,
+                    name: None,
+                    arguments_delta: Some(suffix),
+                });
+            }
+        }
+        events
+    }
+
+    /// 消费消息及函数的完整快照，不重复创建客户端工具调用。
+    fn item_snapshot(
+        &mut self,
+        output_index: u32,
+        item: &rs::OutputItem,
+        request_id: &RequestId,
+        text: &mut Vec<String>,
+    ) -> Vec<SamplingEvent> {
+        let id = match item {
+            rs::OutputItem::Message(message) => Some(message.id.as_str()),
+            rs::OutputItem::FunctionCall(call) => {
+                if let Some(index) = call
+                    .id
+                    .as_ref()
+                    .and_then(|id| self.item_indices.get(id))
+                    .copied()
+                {
+                    self.item_indices
+                        .entry(call.call_id.clone())
+                        .or_insert(index);
+                }
+                Some(call.call_id.as_str())
+            }
+            _ => None,
+        };
+        let output_index = id
+            .map(|id| {
+                *self
+                    .item_indices
+                    .entry(id.to_owned())
+                    .or_insert(output_index)
+            })
+            .unwrap_or(output_index);
+        match item {
+            rs::OutputItem::Message(message) => {
+                for (index, part) in message.content.iter().enumerate() {
+                    let snapshot = match part {
+                        rs::OutputMessageContent::OutputText(value) => &value.text,
+                        rs::OutputMessageContent::Refusal(value) => &value.refusal,
+                    };
+                    text.push(reconcile_snapshot(
+                        self.text.entry((output_index, index as u32)).or_default(),
+                        snapshot,
+                    ));
+                }
+                Vec::new()
+            }
+            rs::OutputItem::FunctionCall(call) => self.tool_update(
+                output_index,
+                Some((&call.call_id, &call.name)),
+                Some((&call.arguments, true)),
+                request_id,
+            ),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// 仅已有 X 搜索子工具属于服务端托管调用。
+fn is_x_search(name: &str) -> bool {
+    matches!(
+        name,
+        "x_search" | "x_keyword_search" | "x_semantic_search" | "x_user_search" | "x_thread_fetch"
+    )
+}
+
+/// 服务端结果只显示固定摘要，不转发可能包含二进制的原始载荷。
+fn hosted_result_summary(item: &rs::OutputItem) -> Option<(&str, &'static str, &'static str)> {
+    match item {
+        rs::OutputItem::FileSearchCall(call) => Some((
+            &call.id,
+            "file_search",
+            "服务端文件搜索已返回；详细结果保留在响应历史中。",
+        )),
+        rs::OutputItem::McpCall(call) => Some((
+            &call.id,
+            "mcp_call",
+            "服务端 MCP 调用已返回；详细结果保留在响应历史中。",
+        )),
+        rs::OutputItem::ImageGenerationCall(call) => Some((
+            &call.id,
+            "image_generation",
+            "服务端图像生成已返回；当前客户端不展示图像载荷。",
+        )),
+        _ => None,
+    }
+}
+
+/// 仅识别未展示的内容类型，不把提示写入原始响应。
+fn unsupported_output_notice(response: &rs::Response) -> Option<&'static str> {
+    let raw = response
+        .metadata
+        .as_ref()?
+        .get(xai_grok_sampling_types::RESPONSE_RAW_OUTPUT_METADATA_KEY)?;
+    let output: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+    let mut audio = false;
+    let mut unknown = false;
+    for item in &output {
+        let kind = item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if kind == "message" {
+            for part in item
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                match part
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                {
+                    "output_text" | "refusal" => {}
+                    "audio" | "output_audio" => audio = true,
+                    _ => unknown = true,
+                }
+            }
+        } else if matches!(kind, "audio" | "output_audio") {
+            audio = true;
+        } else if !matches!(
+            kind,
+            "reasoning"
+                | "compaction"
+                | "function_call"
+                | "web_search_call"
+                | "custom_tool_call"
+                | "code_interpreter_call"
+                | "file_search_call"
+                | "mcp_call"
+                | "image_generation_call"
+        ) {
+            unknown = true;
+        }
+    }
+    if audio {
+        Some("[客户端能力提示] 上游返回了音频内容，当前客户端暂不支持播放或展示；原始响应已保留。")
+    } else if unknown {
+        Some("[客户端能力提示] 上游返回了当前客户端不支持展示的内容类型；原始响应已保留。")
+    } else {
+        None
+    }
+}
+
 /// Transform a raw Responses API event stream into a stream of [`SamplingEvent`]s.
 /// `None` (check disabled) leaves the response untouched.
 pub fn stream_responses<'a>(
@@ -248,11 +476,10 @@ pub(crate) fn stream_responses_tracked<'a>(
         let mut reasoning_acc = String::new();
         let mut last_content_chunk_at = Instant::now();
 
-        // Maps Responses API `output_index` to our tool-only `tool_index`.
-        // Populated when `ResponseOutputItemAdded` carries a `FunctionCall`
-        // Later `ResponseFunctionCallArgumentsDelta` events look up `output_index` here to find the matching `tool_index`
-        let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
-        let mut next_tool_index: u32 = 0;
+        let mut content_state = ContentState::default();
+        let mut x_search_items = std::collections::BTreeSet::new();
+        let mut x_search_started = std::collections::BTreeSet::new();
+        let mut hosted_results_shown = std::collections::BTreeSet::new();
 
         let mut stream = raw_stream;
         loop {
@@ -331,28 +558,108 @@ pub(crate) fn stream_responses_tracked<'a>(
             // Track whether ResponseIncomplete should break the loop after the content-aware idle check below
             let mut should_break = false;
 
-            match event {
-                ResponseStreamEvent::ResponseOutputTextDelta(text_delta_event) => {
-                    let delta = text_delta_event.delta;
-                    if !delta.is_empty() {
-                        if !first_token_emitted {
-                            first_token_emitted = true;
-                            yield SamplingEvent::FirstToken {
-                                request_id: request_id.clone(),
-                            };
-                        }
-                        chunk_timestamps.push(Instant::now());
-                        chunk_index += 1;
-                        message_chunk_count += 1;
-                        yield SamplingEvent::ChannelToken {
-                            request_id: request_id.clone(),
-                            channel: SamplingChannel::Text,
-                            text: delta,
-                            chunk_index,
-                        };
+            let hosted_items: &[rs::OutputItem] = match &event {
+                ResponseStreamEvent::ResponseOutputItemDone(ev) => std::slice::from_ref(&ev.item),
+                ResponseStreamEvent::ResponseCompleted(ev) => &ev.response.output,
+                ResponseStreamEvent::ResponseIncomplete(ev) => &ev.response.output,
+                _ => &[],
+            };
+            for item in hosted_items {
+                if let Some((id, name, summary)) = hosted_result_summary(item)
+                    && hosted_results_shown.insert((name.to_owned(), id.to_owned()))
+                {
+                    yield SamplingEvent::BackendToolCallStarted {
+                        request_id: request_id.clone(), call_id: id.to_owned(), name: name.to_owned(),
+                    };
+                    yield SamplingEvent::BackendToolCallCompleted {
+                        request_id: request_id.clone(), call_id: id.to_owned(), name: name.to_owned(),
+                        result: Some(serde_json::Value::String(summary.to_owned())),
+                    };
+                }
+            }
+
+            let mut text_updates = Vec::new();
+            let tool_updates = match &event {
+                ResponseStreamEvent::ResponseOutputTextDelta(ev) => {
+                    content_state.item_indices.entry(ev.item_id.clone()).or_insert(ev.output_index);
+                    content_state.text.entry((ev.output_index, ev.content_index)).or_default().push_str(&ev.delta);
+                    text_updates.push(ev.delta.clone());
+                    Vec::new()
+                }
+                ResponseStreamEvent::ResponseRefusalDelta(ev) => {
+                    content_state.item_indices.entry(ev.item_id.clone()).or_insert(ev.output_index);
+                    content_state.text.entry((ev.output_index, ev.content_index)).or_default().push_str(&ev.delta);
+                    text_updates.push(ev.delta.clone());
+                    Vec::new()
+                }
+                ResponseStreamEvent::ResponseOutputTextDone(ev) => {
+                    content_state.item_indices.entry(ev.item_id.clone()).or_insert(ev.output_index);
+                    text_updates.push(reconcile_snapshot(content_state.text.entry((ev.output_index, ev.content_index)).or_default(), &ev.text));
+                    Vec::new()
+                }
+                ResponseStreamEvent::ResponseRefusalDone(ev) => {
+                    content_state.item_indices.entry(ev.item_id.clone()).or_insert(ev.output_index);
+                    text_updates.push(reconcile_snapshot(content_state.text.entry((ev.output_index, ev.content_index)).or_default(), &ev.refusal));
+                    Vec::new()
+                }
+                ResponseStreamEvent::ResponseOutputItemAdded(ev) => {
+                    if let rs::OutputItem::CustomToolCall(call) = &ev.item
+                        && is_x_search(&call.name)
+                    {
+                        x_search_items.insert(call.id.clone());
+                    }
+                    if let rs::OutputItem::FunctionCall(call) = &ev.item {
+                        content_state.item_indices.entry(call.call_id.clone()).or_insert(ev.output_index);
+                        content_state.tool_update(ev.output_index, Some((&call.call_id, &call.name)),
+                            (!call.arguments.is_empty()).then_some((call.arguments.as_str(), true)), &request_id)
+                    } else {
+                        content_state.item_snapshot(ev.output_index, &ev.item, &request_id, &mut text_updates)
                     }
                 }
+                ResponseStreamEvent::ResponseOutputItemDone(ev) => {
+                    content_state.item_snapshot(ev.output_index, &ev.item, &request_id, &mut text_updates)
+                }
+                ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(ev) => {
+                    content_state.item_indices.entry(ev.item_id.clone()).or_insert(ev.output_index);
+                    content_state.tool_update(ev.output_index, None, Some((&ev.delta, false)), &request_id)
+                }
+                ResponseStreamEvent::ResponseFunctionCallArgumentsDone(ev) => {
+                    content_state.item_indices.entry(ev.item_id.clone()).or_insert(ev.output_index);
+                    content_state.tool_update(ev.output_index, ev.name.as_deref().map(|name| ("", name)), Some((&ev.arguments, true)), &request_id)
+                }
+                ResponseStreamEvent::ResponseCompleted(ev) => {
+                    let mut updates = Vec::new();
+                    for (index, item) in ev.response.output.iter().enumerate() {
+                        updates.extend(content_state.item_snapshot(index as u32, item, &request_id, &mut text_updates));
+                    }
+                    updates
+                }
+                ResponseStreamEvent::ResponseIncomplete(ev) => {
+                    let mut updates = Vec::new();
+                    for (index, item) in ev.response.output.iter().enumerate() {
+                        updates.extend(content_state.item_snapshot(index as u32, item, &request_id, &mut text_updates));
+                    }
+                    updates
+                }
+                _ => Vec::new(),
+            };
+            for text in text_updates.into_iter().filter(|text| !text.is_empty()) {
+                if !first_token_emitted {
+                    first_token_emitted = true;
+                    yield SamplingEvent::FirstToken { request_id: request_id.clone() };
+                }
+                chunk_timestamps.push(Instant::now());
+                chunk_index += 1;
+                message_chunk_count += 1;
+                yield SamplingEvent::ChannelToken {
+                    request_id: request_id.clone(), channel: SamplingChannel::Text, text, chunk_index,
+                };
+            }
+            for update in tool_updates {
+                yield update;
+            }
 
+            match event {
                 ResponseStreamEvent::ResponseReasoningSummaryTextDelta(summary_event) => {
                     let delta = summary_event.delta;
                     if !delta.is_empty() {
@@ -392,43 +699,9 @@ pub(crate) fn stream_responses_tracked<'a>(
                     }
                 }
 
-                // Start of a Responses FunctionCall: emit the initial id and name, and remember the output_index to tool_index mapping
-                ResponseStreamEvent::ResponseOutputItemAdded(added_event) => {
-                    if let rs::OutputItem::FunctionCall(fc) = added_event.item {
-                        let tool_index = next_tool_index;
-                        next_tool_index += 1;
-                        output_to_tool_index.insert(added_event.output_index, tool_index);
-
-                        yield SamplingEvent::ToolCallDelta {
-                            request_id: request_id.clone(),
-                            tool_index,
-                            id: Some(fc.call_id),
-                            name: Some(fc.name),
-                            arguments_delta: None,
-                        };
-                    }
-                }
-
-                // Continuation chunk for a streaming FunctionCall's args.
-                // The delta is dropped silently when no preceding OutputItemAdded mapped its output_index
-                ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(args_event) => {
-                    let delta = args_event.delta;
-                    if !delta.is_empty()
-                        && let Some(&tool_index) =
-                            output_to_tool_index.get(&args_event.output_index)
-                    {
-                        yield SamplingEvent::ToolCallDelta {
-                            request_id: request_id.clone(),
-                            tool_index,
-                            id: None,
-                            name: None,
-                            arguments_delta: Some(delta),
-                        };
-                    }
-                }
-
                 ResponseStreamEvent::ResponseCompleted(completed_event) => {
                     final_response = Some(completed_event.response);
+                    should_break = true;
                 }
 
                 ResponseStreamEvent::ResponseIncomplete(incomplete_event) => {
@@ -533,7 +806,12 @@ pub(crate) fn stream_responses_tracked<'a>(
                         // X search results arrive as CustomToolCall with names like x_keyword_search, x_semantic_search, etc
                         // Use "x_search" consistently (matching the Started event)
                         // The specific sub-type is in the serialized result payload and extracted by the pager from raw_output.name
-                        rs::OutputItem::CustomToolCall(ct) => {
+                        rs::OutputItem::CustomToolCall(ct) if is_x_search(&ct.name) => {
+                            if x_search_started.insert(ct.id.clone()) {
+                                yield SamplingEvent::BackendToolCallStarted {
+                                    request_id: request_id.clone(), call_id: ct.id.clone(), name: "x_search".to_string(),
+                                };
+                            }
                             let result = serde_json::to_value(ct).ok();
                             yield SamplingEvent::BackendToolCallCompleted {
                                 request_id: request_id.clone(),
@@ -557,9 +835,9 @@ pub(crate) fn stream_responses_tracked<'a>(
                     }
                 }
 
-                // CustomToolCallInputDelta is x_search in-progress streaming.
-                // Emit a started event on first delta per item_id.
-                ResponseStreamEvent::ResponseCustomToolCallInputDone(ev) => {
+                // 只有已确认名称的托管 X 工具才发送开始事件。
+                ResponseStreamEvent::ResponseCustomToolCallInputDone(ev)
+                    if x_search_items.contains(&ev.item_id) && x_search_started.insert(ev.item_id.clone()) => {
                     yield SamplingEvent::BackendToolCallStarted {
                         request_id: request_id.clone(),
                         call_id: ev.item_id.clone(),
@@ -611,6 +889,27 @@ pub(crate) fn stream_responses_tracked<'a>(
                 return;
             }
         };
+
+        // 能力提示只走显示通道；最终历史仍使用未经改写的响应。
+        if message_chunk_count == 0
+            && content_state.tools.is_empty()
+            && hosted_results_shown.is_empty()
+            && !response.output.iter().any(|item| matches!(item,
+                rs::OutputItem::WebSearchCall(_) | rs::OutputItem::CustomToolCall(_) |
+                rs::OutputItem::CodeInterpreterCall(_)))
+            && let Some(notice) = unsupported_output_notice(&response)
+        {
+            if !first_token_emitted {
+                yield SamplingEvent::FirstToken { request_id: request_id.clone() };
+            }
+            chunk_timestamps.push(Instant::now());
+            chunk_index += 1;
+            message_chunk_count += 1;
+            yield SamplingEvent::ChannelToken {
+                request_id: request_id.clone(), channel: SamplingChannel::Text,
+                text: notice.to_owned(), chunk_index,
+            };
+        }
 
         // Billing fields (`prompt_tokens`, `completion_tokens`, `cached_prompt_tokens`, `reasoning_tokens`) are the cumulative wire values
         // The SSE decoder (`deserialize_response_event`) has already rewritten `u.total_tokens` to `context_details.input + output`
@@ -1317,7 +1616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_stream_marks_non_forwarded_refusal_as_output() {
+    async fn tracked_stream_marks_refusal_as_output() {
         let output_observed = Arc::new(AtomicBool::new(false));
         let refusal =
             rs::ResponseStreamEvent::ResponseRefusalDelta(rs_types::ResponseRefusalDeltaEvent {
@@ -1399,6 +1698,320 @@ mod tests {
         assert_eq!(call_id, "ci-1");
         let result = result.expect("serialized code-interpreter payload");
         assert_eq!(result.get("code"), Some(&serde_json::json!("print(1)")));
+    }
+
+    /// 从协议 JSON 构造帧，覆盖可选字段省略。
+    fn wire_event(value: serde_json::Value) -> rs::ResponseStreamEvent {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// 收集一次无网络的 Responses 消费结果。
+    async fn consume(events: Vec<rs::ResponseStreamEvent>) -> Vec<SamplingEvent> {
+        collect(stream_responses(
+            stream::iter(events.into_iter().map(Ok)).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await
+    }
+
+    /// 提取用户可见正文，不包含推理通道。
+    fn visible_text(events: &[SamplingEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Text,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 构造包含完整正文的消息项。
+    fn message_item(text: &str) -> serde_json::Value {
+        serde_json::json!({"type":"message", "id":"item-1", "role":"assistant", "status":"completed",
+            "content":[{"type":"output_text", "text":text, "annotations":[]}]})
+    }
+
+    /// 构造带完整输出的终态帧。
+    fn terminal_with(output: serde_json::Value) -> rs::ResponseStreamEvent {
+        let mut response = empty_completed_response();
+        response.output = serde_json::from_value(output).unwrap();
+        rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+            response,
+            sequence_number: 9,
+        })
+    }
+
+    #[tokio::test]
+    async fn text_done_item_done_and_terminal_only_append_missing_suffixes() {
+        let events = consume(vec![
+            text_delta_event("你"),
+            wire_event(serde_json::json!({"type":"response.output_text.done", "sequence_number":1,
+                "item_id":"item-1", "output_index":0, "content_index":0, "text":"你好", "logprobs":[]})),
+            wire_event(serde_json::json!({"type":"response.output_item.done", "sequence_number":2,
+                "output_index":0, "item":message_item("你好世界")})),
+            terminal_with(serde_json::json!([message_item("你好世界！")])),
+        ]).await;
+        assert_eq!(visible_text(&events), "你好世界！");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SamplingEvent::FirstToken { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_delta_done_and_message_snapshot_are_visible_once() {
+        let events = consume(vec![
+            wire_event(serde_json::json!({"type":"response.refusal.delta", "sequence_number":0,
+                "item_id":"item-1", "output_index":0, "content_index":0, "delta":"不能"})),
+            wire_event(serde_json::json!({"type":"response.refusal.done", "sequence_number":1,
+                "item_id":"item-1", "output_index":0, "content_index":0, "refusal":"不能提供"})),
+            terminal_with(serde_json::json!([{"type":"message", "id":"item-1", "role":"assistant", "status":"completed",
+                "content":[{"type":"refusal", "refusal":"不能提供"}]}])),
+        ]).await;
+        assert_eq!(visible_text(&events), "不能提供");
+    }
+
+    #[tokio::test]
+    async fn terminal_snapshot_is_authoritative_when_stream_text_conflicts() {
+        let events = consume(vec![
+            text_delta_event("old"),
+            terminal_with(serde_json::json!([message_item("new")])),
+        ])
+        .await;
+        assert_eq!(visible_text(&events), "old");
+        let Some(SamplingEvent::Completed { response, .. }) = events.last() else {
+            panic!("missing completed")
+        };
+        assert!(response.items.iter().any(
+            |item| matches!(item, ConversationItem::Assistant(a) if a.content.as_ref() == "new")
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_only_message_and_function_call_are_forwarded() {
+        let events = consume(vec![terminal_with(serde_json::json!([
+            message_item("final"),
+            {"type":"function_call", "id":"fc-1", "call_id":"call-1", "name":"run", "arguments":"{}", "status":"completed"}
+        ]))]).await;
+        assert_eq!(visible_text(&events), "final");
+        let deltas = tool_call_deltas(&events);
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].1.as_deref(), Some("call-1"));
+        assert_eq!(deltas[1].3.as_deref(), Some("{}"));
+    }
+
+    #[tokio::test]
+    async fn arguments_done_and_item_done_fill_missing_added_without_duplicates() {
+        let item = serde_json::json!({"type":"function_call", "id":"fc-1", "call_id":"call-1", "name":"run", "arguments":"{\"x\":1}", "status":"completed"});
+        let events = consume(vec![
+            function_call_args_delta_event(0, "{\"x\":"),
+            wire_event(serde_json::json!({"type":"response.function_call_arguments.done", "sequence_number":1,
+                "item_id":"fc-1", "output_index":0, "name":"run", "arguments":"{\"x\":1}"})),
+            wire_event(serde_json::json!({"type":"response.output_item.done", "sequence_number":2, "output_index":0, "item":item.clone()})),
+            wire_event(serde_json::json!({"type":"response.output_item.done", "sequence_number":3, "output_index":0, "item":item.clone()})),
+            terminal_with(serde_json::json!([item])),
+        ]).await;
+        let deltas = tool_call_deltas(&events);
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[1].3.as_deref(), Some("{\"x\":1}"));
+        let Some(SamplingEvent::Completed { response, .. }) = events.last() else {
+            panic!("missing completed")
+        };
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    ConversationItem::Assistant(a) => Some(a.tool_calls.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn arguments_done_only_emits_suffix_after_live_deltas() {
+        let events = consume(vec![
+            function_call_added_event(0, "call-1", "run"),
+            function_call_added_event(0, "call-1", "run"),
+            function_call_args_delta_event(0, "{"),
+            wire_event(serde_json::json!({"type":"response.function_call_arguments.done", "sequence_number":1,
+                "item_id":"fc-1", "output_index":0, "name":"run", "arguments":"{}"})),
+            completed_event(),
+        ]).await;
+        let deltas = tool_call_deltas(&events);
+        assert_eq!(deltas.len(), 3);
+        assert_eq!(deltas[2].3.as_deref(), Some("}"));
+    }
+
+    #[tokio::test]
+    async fn final_filtered_output_keeps_original_function_identity() {
+        let item = serde_json::json!({"type":"function_call", "id":"fc-1", "call_id":"call-1", "name":"run", "arguments":"{}"});
+        let events = consume(vec![
+            function_call_added_event(3, "call-1", "run"),
+            function_call_args_delta_event(3, "{}"),
+            terminal_with(serde_json::json!([item])),
+        ])
+        .await;
+        assert_eq!(tool_call_deltas(&events).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn done_only_refusal_is_visible_but_does_not_replace_terminal_event() {
+        let events = consume(vec![wire_event(serde_json::json!({
+            "type":"response.refusal.done", "sequence_number":0, "item_id":"item-1",
+            "output_index":0, "content_index":0, "refusal":"拒绝"
+        }))])
+        .await;
+        assert_eq!(visible_text(&events), "拒绝");
+        assert!(matches!(events.last(), Some(SamplingEvent::Failed { .. })));
+    }
+
+    #[test]
+    fn conflicting_snapshots_never_reemit_already_displayed_content() {
+        let mut shown = "original".to_owned();
+        assert!(reconcile_snapshot(&mut shown, "different").is_empty());
+        assert!(reconcile_snapshot(&mut shown, "different").is_empty());
+        assert_eq!(shown, "original");
+    }
+
+    #[tokio::test]
+    async fn hosted_results_show_bounded_summaries_once_without_client_calls() {
+        let payload = "A".repeat(100_000);
+        for item in [
+            serde_json::json!({"type":"file_search_call", "id":"fs-1", "status":"completed", "queries":["query"], "results":[]}),
+            serde_json::json!({"type":"mcp_call", "id":"mcp-1", "name":"remote", "server_label":"server", "arguments":"{}", "output":payload.clone()}),
+            serde_json::json!({"type":"image_generation_call", "id":"img-1", "status":"completed", "result":payload.clone()}),
+        ] {
+            for done in [false, true] {
+                let mut frames = Vec::new();
+                if done {
+                    frames.push(wire_event(
+                        serde_json::json!({"type":"response.output_item.done", "sequence_number":1,
+                        "output_index":0, "item":item.clone()}),
+                    ));
+                }
+                frames.push(terminal_with(serde_json::json!([item.clone()])));
+                let events = consume(frames).await;
+                assert!(tool_call_deltas(&events).is_empty());
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(
+                            event,
+                            SamplingEvent::BackendToolCallStarted { .. }
+                        ))
+                        .count(),
+                    1
+                );
+                let results: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        SamplingEvent::BackendToolCallCompleted { result, .. } => Some(result),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(results.len(), 1);
+                let summary = results[0].as_ref().unwrap().as_str().unwrap();
+                assert!(summary.len() < 256);
+                assert!(!summary.contains(&payload));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_only_output_emits_notice_without_changing_history() {
+        for raw in [
+            serde_json::json!([{"type":"message", "id":"audio-1", "role":"assistant", "content":[{"type":"output_audio", "data":"SECRET_BASE64"}]}]),
+            serde_json::json!([{"type":"future_output", "data":"SECRET_BASE64"}]),
+        ] {
+            let mut response = empty_completed_response();
+            response.metadata = Some(std::collections::HashMap::from([(
+                xai_grok_sampling_types::RESPONSE_RAW_OUTPUT_METADATA_KEY.to_owned(),
+                raw.to_string(),
+            )]));
+            let events = consume(vec![rs::ResponseStreamEvent::ResponseCompleted(
+                rs_types::ResponseCompletedEvent {
+                    response,
+                    sequence_number: 1,
+                },
+            )])
+            .await;
+            let text = visible_text(&events);
+            assert!(text.contains("客户端能力提示"));
+            assert!(!text.contains("SECRET_BASE64"));
+            let Some(SamplingEvent::Completed { response, .. }) = events.last() else {
+                panic!("missing completed")
+            };
+            let assistant = response
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    ConversationItem::Assistant(assistant) => Some(assistant),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(assistant.content.is_empty());
+            assert_eq!(assistant.responses_output.as_ref(), raw.as_array());
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_output_with_visible_text_does_not_add_notice() {
+        let mut response = empty_completed_response();
+        response.metadata = Some(std::collections::HashMap::from([(
+            xai_grok_sampling_types::RESPONSE_RAW_OUTPUT_METADATA_KEY.to_owned(),
+            serde_json::json!([{"type":"output_audio", "data":"SECRET_BASE64"}]).to_string(),
+        )]));
+        let events = consume(vec![
+            text_delta_event("正文"),
+            rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+                response,
+                sequence_number: 1,
+            }),
+        ])
+        .await;
+        assert_eq!(visible_text(&events), "正文");
+    }
+
+    #[tokio::test]
+    async fn only_known_custom_tools_emit_x_search_events() {
+        for (name, expected) in [
+            ("custom_executor", 0),
+            ("x_unknown", 0),
+            ("x_keyword_search", 2),
+            ("x_search", 2),
+        ] {
+            let events = consume(vec![
+                wire_event(serde_json::json!({"type":"response.custom_tool_call_input.done", "sequence_number":0,
+                    "item_id":"custom-1", "output_index":0, "input":"{}"})),
+                wire_event(serde_json::json!({"type":"response.output_item.done", "sequence_number":1, "output_index":0,
+                    "item":{"type":"custom_tool_call", "id":"custom-1", "call_id":"call-1", "name":name, "input":"{}"}})),
+                completed_event(),
+            ]).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        SamplingEvent::BackendToolCallStarted { .. }
+                            | SamplingEvent::BackendToolCallCompleted { .. }
+                    ))
+                    .count(),
+                expected
+            );
+        }
     }
 
     fn function_call_added_event(

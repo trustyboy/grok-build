@@ -262,6 +262,9 @@ pub fn stream_chat_completions<'a>(
                 ));
             }
             items.push(ConversationItem::Assistant(AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: std::sync::Arc::<str>::from(content_acc),
                 tool_calls,
                 model_id: Some(model),

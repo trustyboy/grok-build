@@ -3198,6 +3198,8 @@ struct DefaultModelJson {
     /// 内置模型默认关闭优先服务。
     #[serde(default)]
     fast_mode: bool,
+    /// Responses 原生压缩触发 token 数；缺省关闭。
+    responses_compact_threshold: Option<NonZeroU64>,
     #[serde(default)]
     compactions_remaining: Option<CompactionsRemaining>,
     #[serde(default)]
@@ -3285,6 +3287,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 supports_vision: m.supports_vision,
                 reasoning_summary: None,
                 fast_mode: m.fast_mode,
+                responses_compact_threshold: m.responses_compact_threshold,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3425,6 +3428,9 @@ pub struct ModelEntryConfig {
     /// 仅 Responses 请求启用优先服务；默认关闭。
     #[serde(default, skip_serializing_if = "is_false")]
     pub fast_mode: bool,
+    /// Responses 原生压缩触发 token 数；缺省关闭。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_compact_threshold: Option<NonZeroU64>,
     /// Per-model Layer-3 LazinessDetector configuration.
     /// Defaults to the all-disabled state via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "is_default_laziness_detector")]
@@ -3478,6 +3484,7 @@ impl Default for ModelEntryConfig {
             supports_vision: true,
             reasoning_summary: None,
             fast_mode: false,
+            responses_compact_threshold: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -3556,6 +3563,8 @@ pub struct ConfigModelOverride {
     pub reasoning_summary: Option<ReasoningSummary>,
     /// 未配置时继承模型默认值，显式 false 可关闭优先服务。
     pub fast_mode: Option<bool>,
+    /// 未配置时继承模型的原生压缩阈值。
+    pub responses_compact_threshold: Option<NonZeroU64>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -3690,6 +3699,9 @@ impl ConfigModelOverride {
         if let Some(v) = self.fast_mode {
             entry.info.fast_mode = v;
         }
+        if self.responses_compact_threshold.is_some() {
+            entry.info.responses_compact_threshold = self.responses_compact_threshold;
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -3803,6 +3815,9 @@ pub struct ModelInfo {
     /// 仅 Responses 请求启用优先服务；默认关闭。
     #[serde(default, skip_serializing_if = "is_false")]
     pub fast_mode: bool,
+    /// Responses 原生压缩触发 token 数；缺省关闭。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_compact_threshold: Option<NonZeroU64>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to the all-disabled state.
     /// The feature is per-model opt-in, with a second-step `max_nudges_per_session > 0` opt-in for actually injecting nudges.
     /// See [`LazinessDetectorPerModelConfig`].
@@ -3863,6 +3878,7 @@ impl ModelInfo {
             supports_vision: true,
             reasoning_summary: None,
             fast_mode: false,
+            responses_compact_threshold: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -3910,6 +3926,7 @@ impl ModelInfo {
             supports_vision: entry.supports_vision,
             reasoning_summary: entry.reasoning_summary,
             fast_mode: entry.fast_mode,
+            responses_compact_threshold: entry.responses_compact_threshold,
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -4602,7 +4619,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
     let catalog_entry = runtime_entry.or_else(|| find_model_by_id(models, model_id).cloned());
     if let Some(entry) = &catalog_entry {
         let credentials = resolve_credentials_enforced(entry, session_key, disable_api_key_auth);
-        let sampler = sampling_config_for_model(
+        let mut sampler = sampling_config_for_model(
             entry,
             credentials,
             alpha_test_key.clone(),
@@ -4610,6 +4627,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
             None,
             None,
         );
+        sampler.responses_compact_threshold = None;
         if sampler.api_key.is_some() {
             return Some(sampler);
         }
@@ -4675,6 +4693,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 supports_vision: true,
                 reasoning_summary: None,
                 fast_mode: false,
+                responses_compact_threshold: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             mtls_cert_dir: None,
@@ -4709,6 +4728,7 @@ pub(crate) fn stamp_session_local_sampler_fields(
     client_identifier: Option<String>,
     max_retries: Option<u32>,
 ) {
+    cfg.responses_compact_threshold = None;
     cfg.client_identifier = client_identifier;
     cfg.conversation_group_id = active_session_config.conversation_group_id.clone();
     cfg.attribution_callback = active_session_config.attribution_callback.clone();
@@ -4739,7 +4759,9 @@ pub(crate) fn finalize_image_describe_sampler_config(
         }
         None => {
             let model = active_session_config.model.clone();
-            (model, active_session_config.clone())
+            let mut config = active_session_config.clone();
+            config.responses_compact_threshold = None;
+            (model, config)
         }
     }
 }
@@ -4824,6 +4846,7 @@ pub(crate) fn sampling_config_for_model(
         reasoning_effort: info.reasoning_effort,
         reasoning_summary: info.reasoning_summary,
         fast_mode: info.fast_mode,
+        responses_compact_threshold: info.responses_compact_threshold,
         force_http1: false,
         max_retries: info.max_retries,
         rate_limit_retry_threshold: info.rate_limit_retry_threshold,
@@ -4917,6 +4940,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             supports_vision: true,
             reasoning_summary: None,
             fast_mode: false,
+            responses_compact_threshold: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         mtls_cert_dir: None,

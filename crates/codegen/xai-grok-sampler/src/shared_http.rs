@@ -14,6 +14,7 @@ use std::time::Duration;
 mod mtls;
 
 pub(crate) use mtls::client as mtls_client;
+pub(crate) use mtls::client_with_identity_digest as mtls_client_with_identity_digest;
 
 static SHARED_H2: OnceLock<reqwest::Client> = OnceLock::new();
 static SHARED_HTTP1: OnceLock<reqwest::Client> = OnceLock::new();

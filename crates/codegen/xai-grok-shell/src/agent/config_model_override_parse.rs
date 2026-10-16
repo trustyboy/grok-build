@@ -595,6 +595,38 @@ mod tests {
     }
 
     #[test]
+    fn responses_compact_threshold_parses_and_invalid_values_keep_model() {
+        let cfg = parse_cfg(
+            "[model.compact]\napi_backend = \"responses\"\ncontext_window = 200000\nresponses_compact_threshold = 100000",
+        );
+        assert_eq!(
+            cfg.config_models["compact"].responses_compact_threshold,
+            std::num::NonZeroU64::new(100_000)
+        );
+        let resolved = crate::agent::config::resolve_model_list(&cfg, None);
+        assert_eq!(
+            resolved["compact"].info.responses_compact_threshold,
+            std::num::NonZeroU64::new(100_000)
+        );
+        for value in ["0", "-1", "\"100000\"", "true", "1.5"] {
+            let cfg = parse_cfg(&format!(
+                "[model.compact]\nname = \"kept\"\nresponses_compact_threshold = {value}"
+            ));
+            assert_eq!(
+                cfg.config_models["compact"].responses_compact_threshold,
+                None
+            );
+            assert_eq!(cfg.config_models["compact"].name.as_deref(), Some("kept"));
+            assert!(
+                cfg.config_warnings
+                    .iter()
+                    .any(|warning| warning.kind == ConfigWarningKind::InvalidValue
+                        && warning.field() == Some("responses_compact_threshold"))
+            );
+        }
+    }
+
+    #[test]
     fn invalid_fast_mode_skips_field_keeps_model() {
         let cfg = parse_cfg("[model.fast-test]\nfast_mode = \"true\"");
         assert_eq!(cfg.config_models["fast-test"].fast_mode, None);
@@ -830,6 +862,7 @@ mod tests {
             stream_tool_calls: Some(false),
             reasoning_summary: Some(ReasoningSummary::None),
             fast_mode: Some(true),
+            responses_compact_threshold: std::num::NonZeroU64::new(100_000),
         }
     }
 

@@ -330,6 +330,9 @@ fn test_tool_result_with_images_to_anthropic() {
     let req = ConversationRequest::from_items(vec![
         ConversationItem::user("Read this"),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: String::new().into(),
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),

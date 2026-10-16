@@ -50,6 +50,11 @@
 - `resolve_bundled_rg()` 在 Windows 下必须给解出的文件补 `.exe` 后缀，否则 `CreateProcessW` 无法执行。
 - 排查 grep 异常时，先看会话 `updates.jsonl` 中 `rawOutput.stderr` 的字节数组 —— 解出 `program not found` 即为此问题。
 
+## Windows 会话临时目录
+
+- `xai-grok-workspace/src/session/tool_config.rs` 的 `session_tmp_root()` 统一供工具产物与绑定环境使用；Windows 使用 `std::env::temp_dir()/grok/sessions/<id>`，Unix 保持 `/tmp/sessions/<id>`。
+- Windows 的 `/tmp` 会解析到当前盘符根目录；生产会话路径不得绕过上述入口硬编码 `/tmp`。旧目录清理需要用户许可。
+
 ## 文件编码
 
 - 非 UTF-8 文本文件（GBK/Big5 等）的读写由 `computer/transcoding_fs.rs` 的装饰器在 fs 抽象层统一处理，工具层无需感知。设计见 `docs/非UTF8文件编码支持实现计划.md`，合并见同名合并指南。
@@ -92,6 +97,22 @@
 - Release 构建后运行 `python tools/test-subagents-model.py`（Python 3.11+）；可重复指定 `--scenario`。脚本复用模型发现 `Rpc`，隔离配置及本地假上游驱动真实 parent 工具调用，校验 child 模型/API/认证/effort 以及 `x.ai/subagent/list_running` 的实际窗口，临时资源始终清理。
 - 脚本保留原有继承/全局/临时/发现/resume 场景；新增 `parent-model-selection/only/fallback/lifecycle/discovery`，覆盖主模型专属路由、不同凭据、双会话隔离、切主模型与 set/inherit/reset、空白/无效回退及临时发现不借用来源配置，同时核对全局和父模型状态值。`legacy-section/mixed-sections` 覆盖旧表读取及同键单数优先、旧表独有字段保留。
 - role/persona/type pins/definition 完整优先级、显式 effort、内部 fork-context、并发时序和 TUI 补全/旧命令别名需另行定向测试，不以该 ACP 脚本代替。
+
+## Responses 协议兼容
+
+- `xai-grok-sampler/src/responses_compat.rs` 负责扩展事件及嵌套输出适配；已知事件继续严格解析，未知进度不会代替终止事件。未支持的客户端执行能力明确失败，不伪造工具结果。
+- 原始 output 通过 `RESPONSE_RAW_OUTPUT_METADATA_KEY` 传给历史转换，保存至 `AssistantItem.responses_output`；`patch_responses_input` 恢复合法输入及 phase/refusal，避免重复 reasoning/backend siblings。调用链经 `CreateResponseWrapper.responses_input` 接入流式及非流式请求。
+- 原始历史不能绕过上下文裁剪、工具配对修复或跨协议通用内容；新增输出类型应同时核对合法输入结构。禁止直接修改 Cargo 缓存 SDK。
+- `stream/responses.rs` 的完成事件补齐需要保持正文和参数去重；保留缺少终止帧及已知格式损坏的错误检查。
+- 定向测试使用 Release 的 sampling-types/sampler `responses` 过滤；正式构建后运行 `python tools/test-responses-compat.py`。
+
+## Responses 原生自动压缩
+
+- 模型配置 `responses_compact_threshold` 为可选正整数，默认关闭；仅 Responses 且小于实际窗口有效，统一通过 `effective_responses_compact_threshold` 校验。无能力探测，参数被拒绝时明确报错。辅助摘要/分类请求关闭该字段。
+- 来源绑定实际请求模型、连接及认证快照哈希；`responses_source` 和 `responses_input_fingerprint` 只由客户端在成功完成响应写入。切连接/模型/认证或前缀改写时旧加密项不得重放。
+- `patch_responses_input_for_source` 仅在同来源完整前缀匹配、工具配对安全时采用最新压缩点；保留必要系统指令，仅裁请求，不主动替换本地历史。普通兼容投影不发送无来源 compaction。
+- 原生模式跳过常规百分比摘要及后台预压缩，保留手动压缩和硬溢出保护。上下文估计与上游计费用量分离，不能按加密字节宣称精确 token。
+- Release 构建后运行 `python tools/test-responses-auto-compaction.py`，使用本地假上游覆盖启用、来源隔离、裁剪、工具配对和参数拒绝。
 
 ## Chat Completions 工具调用兼容
 

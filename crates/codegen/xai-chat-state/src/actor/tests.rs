@@ -1969,6 +1969,9 @@ async fn parallel_tool_calls_accept_first_reject_second_skip_third() {
     // In production this is built from the stream and pushed via `push_assistant_response`.
     let assistant_with_tools =
         ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "I'll read the file, fix it, and run tests.".into(),
             tool_calls: vec![
                 ToolCall {
@@ -2252,6 +2255,9 @@ async fn dangling_tool_calls_after_crash_are_repaired_on_load() {
         ConversationItem::system("You are a helpful assistant."),
         ConversationItem::user("Read, edit, and test"),
         ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: std::sync::Arc::<str>::from(""),
             tool_calls: vec![
                 ToolCall {
@@ -4459,6 +4465,9 @@ async fn get_last_model_metadata_returns_both_fields() {
         ConversationItem::system("sys"),
         ConversationItem::user("hi"),
         ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "hello".into(),
             tool_calls: vec![],
             model_id: Some("grok-4.5".into()),
@@ -4504,6 +4513,9 @@ async fn sampling_config_survives_compaction_replacement() {
             ConversationItem::system("You are a helpful assistant."),
             ConversationItem::user("fix the bug"),
             ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: "I'll fix it.".into(),
                 tool_calls: vec![],
                 model_id: Some("grok-4.5".into()),
@@ -4584,6 +4596,9 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
             ConversationItem::system("sys"),
             ConversationItem::user("task"),
             ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: "done".into(),
                 tool_calls: vec![],
                 model_id: Some("grok-4.5".into()),
@@ -4619,6 +4634,9 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
     h.handle
         .push_assistant_response(ConversationItem::Assistant(
             xai_grok_sampling_types::AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: "working on it".into(),
                 tool_calls: vec![],
                 model_id: Some("grok-4.5".into()),

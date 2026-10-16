@@ -523,6 +523,7 @@ impl SessionActor {
     > {
         self.refresh_token_if_expired().await;
         let mut config = self.reconstruct_full_config().await;
+        config.responses_compact_threshold = None;
         if self.models_manager.model_shares_route(
             &settings.model,
             &config.base_url,
@@ -748,6 +749,7 @@ impl SessionActor {
 
         self.refresh_token_if_expired().await;
         let mut sampling_config = self.reconstruct_full_config().await;
+        sampling_config.responses_compact_threshold = None;
         sampling_config.model = model.clone();
         sampling_config.reasoning_effort = None;
         let supports_reasoning = self.models_manager.model_supports_reasoning_effort(&model);

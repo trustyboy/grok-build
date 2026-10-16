@@ -315,10 +315,20 @@ fn ensure_session_dir(root: &std::path::Path, session_id: &str) -> (PathBuf, std
     let created = std::fs::create_dir_all(&dir);
     (dir, created)
 }
-/// The session folder (`/tmp/sessions/<sanitized_id>`) as a 0700 `TMPDIR`
-/// private to one session.
+/// Windows 使用带盘符的系统临时目录；Unix 保持既有 `/tmp` 路径。
+pub(crate) fn session_tmp_root() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::temp_dir().join("grok")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/tmp")
+    }
+}
+/// 创建会话专属临时目录，Unix 权限限制为 0700。
 pub(crate) fn ensure_private_session_tmp_dir(session_id: &str) -> std::io::Result<PathBuf> {
-    let (dir, created) = ensure_session_dir(std::path::Path::new("/tmp"), session_id);
+    let (dir, created) = ensure_session_dir(&session_tmp_root(), session_id);
     created?;
     #[cfg(unix)]
     {
@@ -336,7 +346,7 @@ pub(crate) use crate::ENV_TEST_LOCK as TOOL_STATE_ENV_LOCK;
 static REGISTRY_TOOL_IDS: std::sync::LazyLock<Arc<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| Arc::new(ToolRegistryBuilder::new().known_tool_ids()));
 /// Gen tools enable only with an [`AuthProvider`] and API base URL; otherwise they stay `Disabled`.
-/// `state_path` is `<home>/sessions/<session_id>/` only when set; `session_folder` is `/tmp/sessions/…`, not the project cwd.
+/// `state_path` 按配置保存工具状态；`session_folder` 使用平台会话临时目录。
 /// The persistent-shell backend is built once per session and reused on every context build.
 pub struct WorkspaceSessionContextFactory {
     auth: Option<xai_computer_hub_sdk::SharedAuthProvider>,
@@ -427,9 +437,9 @@ impl WorkspaceSessionContextFactory {
         );
         dir.join("tool_state.json")
     }
-    /// `/tmp/sessions/<sanitized_id>/` for terminal logs and other tool artifacts.
+    /// 平台临时目录下的 `sessions/<sanitized_id>/`，用于终端日志和工具产物。
     fn resolve_session_folder(session_id: &str) -> PathBuf {
-        let (dir, created) = ensure_session_dir(std::path::Path::new("/tmp"), session_id);
+        let (dir, created) = ensure_session_dir(&session_tmp_root(), session_id);
         if let Err(e) = created {
             tracing::warn!(
                 session = %session_id,
@@ -1183,21 +1193,46 @@ mod tests {
         assert_eq!(factory.resolve_state_path("sess-1"), PathBuf::new());
     }
     #[test]
+    fn session_tmp_root_is_absolute_and_platform_scoped() {
+        let root = session_tmp_root();
+        assert!(root.is_absolute());
+        #[cfg(windows)]
+        assert_eq!(root, std::env::temp_dir().join("grok"));
+        #[cfg(not(windows))]
+        assert_eq!(root, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn private_session_tmp_dir_matches_tool_artifacts() {
+        let id = format!("tmp-path-test-{}", uuid::Uuid::new_v4());
+        let private = ensure_private_session_tmp_dir(&id).unwrap();
+        let artifacts = WorkspaceSessionContextFactory::resolve_session_folder(&id);
+        assert_eq!(private, artifacts);
+        assert!(private.is_absolute());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        std::fs::remove_dir(&private).unwrap();
+    }
+
+    #[test]
     fn factory_session_folder_is_tmp_sessions_not_project_cwd() {
         let cwd = PathBuf::from("/workspace");
         let folder = WorkspaceSessionContextFactory::resolve_session_folder("sess-1");
-        let expected = PathBuf::from("/tmp/sessions/sess-1");
+        let expected = session_tmp_root().join("sessions").join("sess-1");
         assert_eq!(folder, expected);
         assert!(folder.is_dir());
         assert!(!folder.starts_with(&cwd));
         assert_eq!(
             folder.join("terminal").join("call-42.log"),
-            PathBuf::from("/tmp/sessions/sess-1/terminal/call-42.log")
+            expected.join("terminal").join("call-42.log")
         );
     }
     #[test]
     fn factory_session_folder_sanitizes_and_isolates_ids() {
-        let sessions = PathBuf::from("/tmp/sessions");
+        let sessions = session_tmp_root().join("sessions");
         let hostile = WorkspaceSessionContextFactory::resolve_session_folder("../../etc");
         assert!(hostile.starts_with(&sessions));
         assert_eq!(hostile.parent(), Some(sessions.as_path()));
@@ -1226,9 +1261,10 @@ mod tests {
         assert!(ok.is_ok());
         assert_eq!(under_home, home.path().join("sessions").join("shared-id"));
         assert!(under_home.is_dir());
-        let (under_tmp, ok) = ensure_session_dir(std::path::Path::new("/tmp"), "shared-id");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (under_tmp, ok) = ensure_session_dir(tmp.path(), "shared-id");
         assert!(ok.is_ok());
-        assert_eq!(under_tmp, PathBuf::from("/tmp/sessions/shared-id"));
+        assert_eq!(under_tmp, tmp.path().join("sessions").join("shared-id"));
         assert!(under_tmp.is_dir());
     }
     /// A hostile `session_id` (`../../etc`) is sanitized to a single safe segment and cannot traverse outside `<home>/sessions/`.

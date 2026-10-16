@@ -23,6 +23,9 @@ fn user_text(text: &str) -> ConversationItem {
 
 fn assistant_text(text: &str) -> ConversationItem {
     ConversationItem::Assistant(AssistantItem {
+        responses_output: None,
+        responses_source: None,
+        responses_input_fingerprint: None,
         content: text.into(),
         tool_calls: vec![],
         model_id: None,
@@ -33,6 +36,9 @@ fn assistant_text(text: &str) -> ConversationItem {
 
 fn assistant_with_tool_call(text: &str, name: &str, args: &str) -> ConversationItem {
     ConversationItem::Assistant(AssistantItem {
+        responses_output: None,
+        responses_source: None,
+        responses_input_fingerprint: None,
         content: text.into(),
         tool_calls: vec![ToolCall {
             id: "call-1".into(),
@@ -70,6 +76,9 @@ fn assistant_with_reasoning_items(
         ));
     }
     out.push(ConversationItem::Assistant(AssistantItem {
+        responses_output: None,
+        responses_source: None,
+        responses_input_fingerprint: None,
         content: content.into(),
         tool_calls,
         model_id: None,
@@ -192,6 +201,9 @@ fn flatten_skips_reasoning_when_encrypted_only() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "ok".into(),
             tool_calls: vec![],
             model_id: None,
@@ -223,6 +235,9 @@ fn flatten_skips_reasoning_when_text_is_empty() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "ok".into(),
             tool_calls: vec![],
             model_id: None,
@@ -496,6 +511,9 @@ fn window_assistant_text_pin_skips_empty_assistant_turns() {
     // Assistant items with empty `.content` (tool-call-only routing turns) MUST NOT count toward min_assistant_turns
     // They have no prose for the classifier to interpret
     let empty_asst = ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+        responses_output: None,
+        responses_source: None,
+        responses_input_fingerprint: None,
         content: String::new().into(),
         tool_calls: vec![xai_grok_sampling_types::ToolCall {
             id: "c".into(),

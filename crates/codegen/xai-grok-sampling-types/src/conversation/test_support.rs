@@ -71,6 +71,9 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
         ConversationItem::user("Fix the bug"),
         // Completed turn with thinking
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "I'll look at the code.".into(),
             tool_calls: vec![],
             model_id: Some("messages-compatible-model".into()),
@@ -79,6 +82,9 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
         }),
         // Completed tool pair
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: String::new().into(),
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
@@ -91,6 +97,9 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
         }),
         ConversationItem::tool_result("call_1", "fn main() {}"),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "I see the issue.".into(),
             tool_calls: vec![],
             model_id: Some("messages-compatible-model".into()),
@@ -99,6 +108,9 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
         }),
         // Mid-turn: orphaned tool_use (no result yet)
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: String::new().into(),
             tool_calls: vec![ToolCall {
                 id: "call_2".into(),
@@ -114,6 +126,9 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
 
 pub(super) fn assistant_with_calls(calls: &[(&str, &str)]) -> ConversationItem {
     ConversationItem::Assistant(AssistantItem {
+        responses_output: None,
+        responses_source: None,
+        responses_input_fingerprint: None,
         content: String::new().into(),
         tool_calls: calls
             .iter()

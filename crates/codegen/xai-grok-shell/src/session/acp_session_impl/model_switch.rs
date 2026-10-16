@@ -158,6 +158,7 @@ impl SessionActor {
                 reasoning_effort: sampling_config.reasoning_effort,
                 reasoning_summary: sampling_config.reasoning_summary,
                 fast_mode: sampling_config.fast_mode,
+                responses_compact_threshold: sampling_config.responses_compact_threshold,
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
             });
         let existing = self.chat_state_handle.get_credentials().await;

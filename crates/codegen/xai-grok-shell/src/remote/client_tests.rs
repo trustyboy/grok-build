@@ -274,6 +274,37 @@ fn parse_fast_mode_defaults_to_false_and_accepts_both_spellings() {
 }
 
 #[test]
+fn parse_responses_compact_threshold_accepts_positive_integer_only() {
+    let base = serde_json::json!({"id": "compact", "context_window": 200_000});
+    assert_eq!(
+        parse_remote_model_value(&base, "https://example.test")
+            .unwrap()
+            .responses_compact_threshold,
+        None
+    );
+    for key in ["responsesCompactThreshold", "responses_compact_threshold"] {
+        for (value, expected) in [
+            (
+                serde_json::json!(100_000),
+                std::num::NonZeroU64::new(100_000),
+            ),
+            (serde_json::json!(0), None),
+            (serde_json::json!(-1), None),
+            (serde_json::json!("100000"), None),
+        ] {
+            let mut entry = base.clone();
+            entry[key] = value;
+            assert_eq!(
+                parse_remote_model_value(&entry, "https://example.test")
+                    .unwrap()
+                    .responses_compact_threshold,
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn parse_reads_rate_limit_retry_threshold() {
     let value = serde_json::json!({
         "model": "grok-4.5",

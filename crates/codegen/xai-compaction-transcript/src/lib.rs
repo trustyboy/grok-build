@@ -774,6 +774,9 @@ mod tests {
         let items = vec![
             user("Fix the bug"),
             ConversationItem::Assistant(AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: "Done".into(),
                 tool_calls: vec![
                     tc("read_file", r#"{"target_file":"src/a.py"}"#),

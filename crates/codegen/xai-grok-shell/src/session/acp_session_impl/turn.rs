@@ -3378,9 +3378,11 @@ impl SessionActor {
                     "tokens_per_sec": tokens_per_sec,
                 })),
             );
-            if let Some(usage) = response.usage.as_ref() {
-                self.chat_state_handle
-                    .record_token_usage(u64::from(usage.total_tokens));
+            let native_context = self.response_native_context(&response).await;
+            if let Some(tokens) = native_context.map(|(tokens, _)| tokens)
+                .or_else(|| response.usage.as_ref().map(|usage| u64::from(usage.total_tokens)))
+            {
+                self.chat_state_handle.record_token_usage(tokens);
                 self.send_available_commands_update(AdvertiseTrigger::UsageMeta)
                     .await;
             }
@@ -3414,12 +3416,14 @@ impl SessionActor {
                             .usage
                             .as_ref()
                             .map(|u| u.cache_creation_prompt_tokens),
-                        context_tokens: response.usage.as_ref().map(|u| u.total_tokens),
+                        context_tokens: native_context
+                            .map(|(tokens, _)| tokens.min(u64::from(u32::MAX)) as u32)
+                            .or_else(|| response.usage.as_ref().map(|u| u.total_tokens)),
                         cost_usd_ticks: response.cost_usd_ticks,
                     },
                 );
             }
-            self.record_response_token_usage(&response, Some(model_duration_ms));
+            self.record_response_token_usage(&response, Some(model_duration_ms)).await;
             let response_completed = self.response_completed_update(&response);
             if let Some(mut pt) = prompt_timing.take() {
                 pt.record_stream_latency(latency.time_to_last_byte_ms);
@@ -3532,13 +3536,14 @@ impl SessionActor {
                 }
                 LengthSalvageAction::NotSalvage => {}
             }
-            let usage_reported = response.usage.is_some();
+            let usage_reported = response.usage.is_some() || native_context.is_some();
             let response_item_count = response.items.len() as i64;
             let record_response_span = xai_grok_telemetry::region::Region::from_span(
                 tracing::info_span!("turn.record_response", item_count = response_item_count),
             );
             self.record_response_items(response.items, usage_reported)
                 .await;
+            self.commit_response_native_context(native_context).await;
             record_response_span.close();
             if let Some(text) = fallback_text {
                 tracing::warn!(

@@ -294,6 +294,8 @@ async fn subagents_inherit_reads_parent_actor_not_process_baseline() {
     live.reasoning_effort = Some(ReasoningEffort::Xhigh);
     live.context_window = NonZeroU64::new(128_000).unwrap();
     live.fast_mode = true;
+    live.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    live.responses_compact_threshold = NonZeroU64::new(100_000);
     chat.update_sampling_config(live);
     ctx.parent_chat_state = Some(chat);
     ctx.subagents_model = SubagentsModelSelection::Inherit;
@@ -306,6 +308,13 @@ async fn subagents_inherit_reads_parent_actor_not_process_baseline() {
     );
     assert_eq!(resolved.sampling.context_window, 128_000);
     assert!(resolved.sampling.fast_mode);
+    assert_eq!(
+        resolved.sampling.effective_responses_compact_threshold(),
+        NonZeroU64::new(100_000)
+    );
+    let mut reduced = resolved.sampling;
+    reduced.context_window = 100_000;
+    assert_eq!(reduced.effective_responses_compact_threshold(), None);
 }
 
 #[tokio::test]

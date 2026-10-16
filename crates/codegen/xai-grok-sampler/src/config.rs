@@ -90,6 +90,9 @@ pub struct SamplerConfig {
     /// 仅 Responses 请求启用优先服务；默认关闭。
     #[serde(default)]
     pub fast_mode: bool,
+    /// Responses 原生压缩触发 token 数；缺省关闭。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_compact_threshold: Option<NonZeroU64>,
 
     // Client identity
     pub origin_client: Option<OriginClientInfo>,
@@ -168,6 +171,7 @@ impl Default for SamplerConfig {
             reasoning_effort: None,
             reasoning_summary: None,
             fast_mode: false,
+            responses_compact_threshold: None,
             origin_client: None,
             client_identifier: None,
             deployment_id: None,
@@ -183,6 +187,17 @@ impl Default for SamplerConfig {
             doom_loop_recovery: None,
             header_injector: None,
         }
+    }
+}
+
+impl SamplerConfig {
+    /// 按当前协议及有效窗口解析原生压缩阈值。
+    pub fn effective_responses_compact_threshold(&self) -> Option<NonZeroU64> {
+        xai_grok_sampling_types::effective_responses_compact_threshold(
+            &self.api_backend,
+            self.responses_compact_threshold,
+            self.context_window,
+        )
     }
 }
 

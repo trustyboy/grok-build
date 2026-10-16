@@ -10,7 +10,10 @@ mod responses;
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
 pub use responses::{
-    extra_tool_entries, patch_reasoning_text_types, response_to_conversation_items,
+    RESPONSE_INPUT_FINGERPRINT_METADATA_KEY, RESPONSE_RAW_OUTPUT_METADATA_KEY,
+    RESPONSE_SOURCE_METADATA_KEY, extra_tool_entries, is_responses_x_search_tool,
+    patch_reasoning_text_types, patch_responses_input, patch_responses_input_for_source,
+    response_to_conversation_items, responses_input_fingerprint,
 };
 
 use std::sync::Arc;
@@ -263,6 +266,15 @@ pub struct UserItem {
 /// Old sessions on disk may still carry a `reasoning` field; serde silently ignores it on read (no `deny_unknown_fields`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantItem {
+    /// Responses 原始输出；通用文本及相邻推理项仍供其他协议使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_output: Option<Vec<serde_json::Value>>,
+    /// 完整成功响应的连接、认证及模型来源哈希。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_source: Option<String>,
+    /// 绑定来源的本地输入历史指纹；历史修改后压缩点失效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_input_fingerprint: Option<String>,
     /// Text content of the response
     pub content: Arc<str>,
     /// Tool calls made by the assistant (client must execute these locally)
@@ -1230,6 +1242,9 @@ impl ConversationItem {
     /// Create an assistant message
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: Arc::<str>::from(content.into()),
             tool_calls: Vec::new(),
             model_id: None,
@@ -1243,6 +1258,9 @@ impl ConversationItem {
     /// Callers should push that item to the conversation list separately.
     pub fn assistant_with_model(content: impl Into<String>, model_id: impl Into<String>) -> Self {
         Self::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: Arc::<str>::from(content.into()),
             tool_calls: Vec::new(),
             model_id: Some(model_id.into()),
@@ -1254,6 +1272,9 @@ impl ConversationItem {
     /// Create an assistant message that makes tool calls
     pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: Arc::<str>::from(""),
             tool_calls,
             model_id: None,
@@ -2948,6 +2969,9 @@ mod tests {
         let root = "/home/user/project";
 
         let mut items = vec![ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: format!("I'll read the file at {worktree}/src/main.rs").into(),
             tool_calls: vec![
                 ToolCall {
@@ -3041,6 +3065,9 @@ mod tests {
             ),
             // Assistant with tool calls for the fix
             ConversationItem::Assistant(AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: format!("I'll fix the bug in {worktree}/src/main.rs").into(),
                 tool_calls: vec![ToolCall {
                     id: "call_2".into(),
@@ -3129,6 +3156,9 @@ mod tests {
         let mut items = vec![
             ConversationItem::system(format!("Working in {root}.")),
             ConversationItem::Assistant(AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: format!("I previously edited {root}/src/main.rs").into(),
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),

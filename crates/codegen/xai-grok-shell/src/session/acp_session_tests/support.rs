@@ -1288,6 +1288,7 @@ pub(crate) fn test_compaction_config(
     threshold_percent: u8,
 ) -> crate::session::compaction_config::CompactionConfig {
     crate::session::compaction_config::CompactionConfig {
+        native_context: Default::default(),
         threshold_percent: std::cell::Cell::new(threshold_percent),
         force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         context_window_override: None,

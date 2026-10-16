@@ -388,6 +388,9 @@ impl From<crate::messages::MessagesResponse> for ConversationItem {
         }
 
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: Arc::<str>::from(content),
             tool_calls,
             model_id: Some(resp.model),

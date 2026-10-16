@@ -1210,6 +1210,9 @@ pub struct SamplingConfig {
     /// 仅 Responses 请求启用优先服务；旧会话默认关闭。
     #[serde(default)]
     pub fast_mode: bool,
+    /// Responses 原生压缩触发 token 数；缺省关闭。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_compact_threshold: Option<NonZeroU64>,
     /// When true, inject `stream_tool_calls: true` into the Responses API request body so the upstream emits per-chunk argument deltas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
@@ -1238,8 +1241,46 @@ impl Default for SamplingConfig {
             reasoning_effort: None,
             reasoning_summary: None,
             fast_mode: false,
+            responses_compact_threshold: None,
             stream_tool_calls: None,
         }
+    }
+}
+
+/// 仅 Responses 且阈值小于当前有效窗口时启用原生压缩。
+/// 配置保留原值，窗口覆盖后由调用方重新求有效值。
+pub fn effective_responses_compact_threshold(
+    api_backend: &ApiBackend,
+    threshold: Option<NonZeroU64>,
+    context_window: u64,
+) -> Option<NonZeroU64> {
+    let threshold = threshold?;
+    if *api_backend != ApiBackend::Responses {
+        tracing::warn!(
+            ?api_backend,
+            "responses_compact_threshold 仅支持 Responses，已禁用"
+        );
+        return None;
+    }
+    if threshold.get() >= context_window {
+        tracing::warn!(
+            threshold = threshold.get(),
+            context_window,
+            "responses_compact_threshold 必须小于当前上下文窗口，已禁用"
+        );
+        return None;
+    }
+    Some(threshold)
+}
+
+impl SamplingConfig {
+    /// 按当前协议及有效窗口解析原生压缩阈值。
+    pub fn effective_responses_compact_threshold(&self) -> Option<NonZeroU64> {
+        effective_responses_compact_threshold(
+            &self.api_backend,
+            self.responses_compact_threshold,
+            self.context_window.get(),
+        )
     }
 }
 
@@ -1273,6 +1314,10 @@ pub struct CreateResponseWrapper {
     /// xAI-specific tool definitions that can't be expressed via `async_openai`'s `rs::Tool` enum (e.g., `x_search`).
     /// They are injected as raw JSON into the serialized request body's `tools` array.
     pub extra_tool_entries: Vec<serde_json::Value>,
+    /// 保留 Responses 历史字段的合法输入，序列化后覆盖 SDK 输入。
+    pub responses_input: Option<serde_json::Value>,
+    /// 认证快照确定后生成原生压缩请求投影所需的通用历史。
+    pub responses_history: Option<Box<crate::ConversationRequest>>,
 }
 
 impl CreateResponseWrapper {
@@ -1290,6 +1335,8 @@ impl CreateResponseWrapper {
             trace: None,
             traceparent: None,
             extra_tool_entries: vec![],
+            responses_input: None,
+            responses_history: None,
         }
     }
 
@@ -1385,6 +1432,51 @@ impl From<crate::messages::MessagesRequest> for MessagesRequestWrapper {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn responses_compact_threshold_validates_backend_window_and_old_sessions() {
+        let mut config = SamplingConfig {
+            api_backend: ApiBackend::Responses,
+            context_window: NonZeroU64::new(200_000).unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(config.effective_responses_compact_threshold(), None);
+        config.responses_compact_threshold = NonZeroU64::new(100_000);
+        assert_eq!(
+            config.effective_responses_compact_threshold(),
+            NonZeroU64::new(100_000)
+        );
+        for backend in [ApiBackend::ChatCompletions, ApiBackend::Messages] {
+            config.api_backend = backend;
+            assert_eq!(config.effective_responses_compact_threshold(), None);
+        }
+        config.api_backend = ApiBackend::Responses;
+        for window in [100_000, 99_999] {
+            config.context_window = NonZeroU64::new(window).unwrap();
+            assert_eq!(config.effective_responses_compact_threshold(), None);
+        }
+        config.context_window = NonZeroU64::new(200_000).unwrap();
+        let mut value = serde_json::to_value(&config).unwrap();
+        let restored: SamplingConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            restored.effective_responses_compact_threshold(),
+            config.responses_compact_threshold
+        );
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("responses_compact_threshold");
+        assert_eq!(
+            serde_json::from_value::<SamplingConfig>(value)
+                .unwrap()
+                .responses_compact_threshold,
+            None
+        );
+        assert_eq!(
+            effective_responses_compact_threshold(&ApiBackend::Responses, NonZeroU64::new(1), 0),
+            None
+        );
+    }
 
     #[test]
     fn sampling_config_fast_mode_defaults_to_false_and_round_trips() {

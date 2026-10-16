@@ -52,6 +52,8 @@ pub(crate) fn strip_tool_messages_for_conversation_item(
             ConversationItem::ToolResult(_) => None,
             ConversationItem::BackendToolCall(_) => None,
             ConversationItem::Assistant(mut a) => {
+                // 摘要历史不得从协议快照恢复已清理的工具和服务端结果。
+                a.responses_output = None;
                 if !a.tool_calls.is_empty() {
                     let tool_names: Vec<String> =
                         a.tool_calls.iter().map(|tc| tc.name.clone()).collect();
@@ -77,7 +79,15 @@ pub(crate) fn strip_tool_messages_for_conversation_item(
 pub fn strip_reasoning_blocks(conversation: Vec<ConversationItem>) -> Vec<ConversationItem> {
     conversation
         .into_iter()
-        .filter(|item| !matches!(item, ConversationItem::Reasoning(_)))
+        .filter_map(|item| match item {
+            ConversationItem::Reasoning(_) => None,
+            ConversationItem::Assistant(mut a) => {
+                // 原始加密上下文也可能携带被移除的推理。
+                a.responses_output = None;
+                Some(ConversationItem::Assistant(a))
+            }
+            other => Some(other),
+        })
         .collect()
 }
 /// Replace `ContentPart::Image` entries with `"[image]"` so downstream
@@ -155,6 +165,12 @@ pub fn fit_conversation_to_budget(
     }
     let mut head: Vec<ConversationItem> = Vec::new();
     let mut body: Vec<ConversationItem> = conversation;
+    // 进入预算裁剪后丢弃协议快照，避免隐藏输出绕过文本预算。
+    for item in &mut body {
+        if let ConversationItem::Assistant(assistant) = item {
+            assistant.responses_output = None;
+        }
+    }
     if matches!(body.first(), Some(ConversationItem::System(_))) {
         head.push(body.remove(0));
     }
@@ -225,6 +241,7 @@ fn truncate_item_to_tokens(item: ConversationItem, max_tokens: u64) -> Conversat
         }
         ConversationItem::Assistant(mut a) => {
             if let Some(s) = truncate_text_to_bytes(&a.content, max_bytes) {
+                a.responses_output = None;
                 a.content = s;
             }
             ConversationItem::Assistant(a)

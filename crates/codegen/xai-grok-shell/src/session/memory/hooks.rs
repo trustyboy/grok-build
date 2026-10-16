@@ -199,6 +199,9 @@ mod tests {
 
     fn make_assistant(text: &str) -> ConversationItem {
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: text.into(),
             tool_calls: vec![],
             model_id: None,

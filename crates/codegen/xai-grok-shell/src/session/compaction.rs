@@ -178,6 +178,10 @@ impl SessionActor {
     }
     /// Per-turn prefire decision: usage has reached `threshold - lead` (so there is still runway before the hard auto-compact line at `threshold`).
     pub(crate) async fn should_prefire_two_pass(&self) -> bool {
+        if self.responses_native_compaction_enabled().await {
+            self.abort_and_clear_prefire().await;
+            return false;
+        }
         if self.compaction.is_suppressed() {
             return false;
         }
@@ -230,7 +234,7 @@ impl SessionActor {
         }
     }
     async fn run_prefire_pass1_inner(self: &Arc<Self>) -> PrefirePass1Run {
-        if !self.two_pass_active() {
+        if self.responses_native_compaction_enabled().await || !self.two_pass_active() {
             return PrefireOutcome::Disabled.into();
         }
         if std::env::var("GROK_DEBUG_TWO_PASS_FAIL_PASS1")
@@ -2142,13 +2146,18 @@ impl SessionActor {
         if context_window == 0 {
             return false;
         }
-        let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
+        let estimated_total = self.context_tokens_for_capacity().await;
         estimated_total > context_window
     }
     /// Pre-sampling compaction check.
     /// Uses `get_estimated_total_tokens()` (exact prior count plus a byte-estimate of items since last response) so tool results are accounted for.
     /// Returns `None` when `is_flushing`.
     pub(crate) async fn check_auto_compact_needed(&self) -> Option<AutoCompactTriggerInfo> {
+        let native_compaction = self.responses_native_compaction_enabled().await;
+        if native_compaction {
+            // 已有缓存会短路 prefire 检查，普通触发入口也必须清理后台任务。
+            self.abort_and_clear_prefire().await;
+        }
         if self
             .memory
             .is_flushing
@@ -2163,7 +2172,7 @@ impl SessionActor {
             .as_ref()
             .map(|c| c.model.clone())
             .unwrap_or_default();
-        let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
+        let estimated_total = self.context_tokens_for_capacity().await;
         self.signals_handle()
             .update_context_usage(estimated_total, cw);
         if self.compaction.is_suppressed() {
@@ -2192,6 +2201,9 @@ impl SessionActor {
                 reason_override: None,
             });
         }
+        if native_compaction {
+            return None;
+        }
         if let Some(trigger_info) = self.should_auto_compact(estimated_total, context_window) {
             tracing::info!(
                 "Pre-sampling auto-compact trigger: model={model}, \
@@ -2209,7 +2221,7 @@ impl SessionActor {
         if self.compaction.is_suppressed() {
             return None;
         }
-        let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
+        let estimated_total = self.context_tokens_for_capacity().await;
         let cfg = self.chat_state_handle.get_sampling_config().await?;
         let cw = cfg.context_window.get();
         if estimated_total <= cw {
@@ -2236,6 +2248,10 @@ impl SessionActor {
     /// Leaves credit/auth suppress (a switch can't fix those) and short-circuits.
     /// Auth compact failures abort the turn (same as pre-sampling/preflight).
     pub(crate) async fn maybe_compact_on_model_switch(self: &Arc<Self>) -> Result<(), acp::Error> {
+        let native_compaction = self.responses_native_compaction_enabled().await;
+        if native_compaction {
+            self.abort_and_clear_prefire().await;
+        }
         self.refresh_token_if_expired().await;
         let Some(prev) = self.compaction.previous_model.take() else {
             return Ok(());
@@ -2255,8 +2271,13 @@ impl SessionActor {
         if prev.context_window <= cfg.context_window.get() {
             return Ok(());
         }
-        let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
-        let Some(trigger_info) = self.should_auto_compact(total_tokens, cfg.context_window) else {
+        let trigger_info = if native_compaction {
+            self.check_preflight_overflow().await
+        } else {
+            let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
+            self.should_auto_compact(total_tokens, cfg.context_window)
+        };
+        let Some(trigger_info) = trigger_info else {
             return Ok(());
         };
         tracing::info!(

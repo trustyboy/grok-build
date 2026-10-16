@@ -8996,7 +8996,11 @@ async fn bind_session_root_scopes_shell_env_to_the_session() {
     )
     .await
     .expect("bind");
-    let tmp = format!("/tmp/sessions/{sid}");
+    let tmp = crate::session::tool_config::session_tmp_root()
+        .join("sessions")
+        .join(sid)
+        .to_string_lossy()
+        .into_owned();
     let port = crate::bind_env::advisory_port(sid);
     assert_eq!(
         bound_shell_stdout(&handle, sid, BIND_ENV_PROBE)

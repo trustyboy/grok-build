@@ -1501,6 +1501,9 @@ fn verbatim_fork_falls_back_to_summary_on_incomplete_tail() {
             ConversationItem::assistant("a1"),
             ConversationItem::user("q2"),
             ConversationItem::Assistant(AssistantItem {
+                responses_output: None,
+                responses_source: None,
+                responses_input_fingerprint: None,
                 content: String::new().into(),
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),

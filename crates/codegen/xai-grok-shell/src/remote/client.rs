@@ -809,6 +809,16 @@ pub(crate) fn parse_remote_model_value(
             .get("reasoningSummary")
             .or_else(|| obj.get("reasoning_summary"))
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        responses_compact_threshold: obj
+            .get("responsesCompactThreshold")
+            .or_else(|| obj.get("responses_compact_threshold"))
+            .and_then(|value| {
+                let threshold = value.as_u64().and_then(std::num::NonZeroU64::new);
+                if threshold.is_none() {
+                    tracing::warn!("远端 responses_compact_threshold 必须为正整数，已忽略");
+                }
+                threshold
+            }),
         fast_mode: obj
             .get("fastMode")
             .or_else(|| obj.get("fast_mode"))

@@ -1447,6 +1447,9 @@ async fn side_question_trims_reasoning_orphaned_by_mid_turn_truncation() {
                     "planning the file read",
                 )),
                 ConversationItem::Assistant(AssistantItem {
+                    responses_output: None,
+                    responses_source: None,
+                    responses_input_fingerprint: None,
                     content: String::new().into(),
                     tool_calls: vec![ToolCall {
                         id: "tc1".into(),

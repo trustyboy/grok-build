@@ -155,7 +155,23 @@ impl PrefireState {
     }
 }
 
+/// 仅进程内使用；来源或已提交历史变化后不复用压缩后的计数。
+pub(crate) struct NativeContextBaseline {
+    /// 本地连接、配置和凭据的不可逆摘要。
+    pub identity: String,
+    /// 客户端绑定的线上来源，供请求投影验证。
+    pub source: String,
+    /// 最后压缩项的密文摘要；只做身份验证，不计 token。
+    pub checkpoint_hash: String,
+    /// 已提交响应所在历史前缀长度。
+    pub prefix_len: usize,
+    /// 包含原始压缩标记的完整前缀摘要。
+    pub prefix_hash: String,
+}
+
 pub(crate) struct CompactionConfig {
+    /// 原生压缩上下文的有效性锚点；恢复会话默认重新估计通用历史。
+    pub native_context: RefCell<Option<NativeContextBaseline>>,
     /// Context window usage percentage (0-100) at which auto-compact triggers.
     /// `Cell` so the value can be re-resolved at model-switch time without holding `&mut self` on the actor.
     pub threshold_percent: Cell<u8>,

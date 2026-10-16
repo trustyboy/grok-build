@@ -92,24 +92,14 @@ impl GrokRequestHeaders<'_> {
 
 /// Deserialize a Responses SSE event, stripping unknown tools and rewriting terminal `total_tokens` from `context_details`.
 pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
-    let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
+    let mut value: serde_json::Value =
+        serde_json::from_str(data).map_err(SamplingError::Serialization)?;
+    if let Some(response) = value.get_mut("response") {
+        crate::responses_compat::prepare_response(response)?;
+    }
+    let mut event = match serde_json::from_value::<rs::ResponseStreamEvent>(value) {
         Ok(event) => event,
         Err(first_err) => {
-            // Try sanitizing: parse as Value, strip unknown tools, retry.
-            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
-                // Strip tools that async_openai's rs::Tool can't deserialize (e.g., xAI-specific "x_search")
-                // Instead of maintaining a hardcoded allowlist, try deserializing each tool entry; if it fails, drop it
-                if let Some(tools) = value
-                    .pointer_mut("/response/tools")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    tools.retain(|t| serde_json::from_value::<rs::Tool>(t.clone()).is_ok());
-                }
-                if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
-                    apply_terminal_event_overrides(&mut event, data);
-                    return Ok(event);
-                }
-            }
             tracing::error!(
                 error = %first_err,
                 raw_data = %data,
@@ -152,6 +142,65 @@ fn apply_terminal_event_overrides(event: &mut rs::ResponseStreamEvent, data: &st
         return;
     };
     usage.total_tokens = total;
+}
+
+/// 仅完整成功响应绑定本次请求来源；上游提供的内部标识一律移除。
+fn bind_responses_origin(
+    response: &mut rs::Response,
+    source: Option<&str>,
+    fingerprint: Option<&str>,
+    threshold: Option<std::num::NonZeroU64>,
+    context_tokens: Option<u64>,
+) {
+    use xai_grok_sampling_types::{
+        RESPONSE_INPUT_FINGERPRINT_METADATA_KEY, RESPONSE_SOURCE_METADATA_KEY,
+    };
+    if let Some(metadata) = response.metadata.as_mut() {
+        metadata.remove(RESPONSE_SOURCE_METADATA_KEY);
+        metadata.remove(RESPONSE_INPUT_FINGERPRINT_METADATA_KEY);
+    }
+    if matches!(response.status, rs::Status::Completed) {
+        if let Some((source, fingerprint)) = source.zip(fingerprint) {
+            let metadata = response.metadata.get_or_insert_with(Default::default);
+            metadata.insert(RESPONSE_SOURCE_METADATA_KEY.into(), source.into());
+            metadata.insert(
+                RESPONSE_INPUT_FINGERPRINT_METADATA_KEY.into(),
+                fingerprint.into(),
+            );
+            if let Some(raw) =
+                metadata.get_mut(xai_grok_sampling_types::RESPONSE_RAW_OUTPUT_METADATA_KEY)
+            {
+                if let Ok(mut output) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+                    // 清除上游伪造的本地上下文标记。
+                    for item in &mut output {
+                        if let Some(item) = item.as_object_mut() {
+                            item.remove("__grok_context_tokens");
+                            item.remove("__grok_context_estimated");
+                        }
+                    }
+                    if let Some(index) = output.iter().rposition(|item| {
+                        item.get("type").and_then(|v| v.as_str()) == Some("compaction")
+                    }) {
+                        let tail_bytes: usize = output
+                            .iter()
+                            .skip(index + 1)
+                            .map(|item| item.to_string().len())
+                            .sum();
+                        let estimate = threshold
+                            .map(|t| t.get().saturating_add((tail_bytes as u64).div_ceil(3)));
+                        if let Some(tokens) = context_tokens.or(estimate) {
+                            if let Some(item) = output.get_mut(index) {
+                                item["__grok_context_tokens"] = serde_json::json!(tokens);
+                                item["__grok_context_estimated"] =
+                                    serde_json::json!(context_tokens.is_none());
+                            }
+                        }
+                    }
+                    *raw = serde_json::to_string(&output).expect("JSON 输出可以序列化");
+                }
+            }
+        }
+    }
 }
 
 /// Metadata key that carries cost ticks through the typed Response events, which have no field for them.
@@ -308,6 +357,8 @@ fn apply_env_http_headers(
 #[derive(Clone)]
 pub struct SamplingClient {
     http: reqwest::Client,
+    /// 与 HTTP 客户端同批加载的 mTLS 身份指纹；不包含目录路径。
+    mtls_identity_digest: Option<[u8; 32]>,
     default_headers: HeaderMap,
     base_url: String,
     defaults: ClientDefaults,
@@ -351,6 +402,8 @@ struct ClientDefaults {
     reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
     /// 仅在 Responses 默认值处理时使用，避免泄漏到其它后端。
     fast_mode: bool,
+    /// 仅显式配置的 Responses 模型启用原生压缩。
+    responses_compact_threshold: Option<std::num::NonZeroU64>,
     extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     /// Whether the endpoint accepts image content blocks; `false` strips
@@ -648,12 +701,17 @@ impl SamplingClient {
         if config.force_http1 {
             tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
         }
-        let http = if let Some(cert_dir) = config.mtls_cert_dir.as_deref() {
-            crate::shared_http::mtls_client(cert_dir, config.force_http1)?
+        let (http, mtls_identity_digest) = if let Some(cert_dir) = config.mtls_cert_dir.as_deref() {
+            let (client, digest) =
+                crate::shared_http::mtls_client_with_identity_digest(cert_dir, config.force_http1)?;
+            (client, Some(digest))
         } else if config.force_http1 {
-            crate::shared_http::client_http1().map_err(SamplingError::Http)?
+            (
+                crate::shared_http::client_http1().map_err(SamplingError::Http)?,
+                None,
+            )
         } else {
-            crate::shared_http::client().map_err(SamplingError::Http)?
+            (crate::shared_http::client().map_err(SamplingError::Http)?, None)
         };
 
         tracing::info!(
@@ -672,6 +730,7 @@ impl SamplingClient {
             has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
         );
 
+        let responses_compact_threshold = config.effective_responses_compact_threshold();
         let defaults = ClientDefaults {
             model: config.model,
             max_completion_tokens: config.max_completion_tokens,
@@ -683,6 +742,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             reasoning_summary: config.reasoning_summary,
             fast_mode: config.fast_mode,
+            responses_compact_threshold,
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
             supports_vision: config.supports_vision,
@@ -692,6 +752,7 @@ impl SamplingClient {
 
         Ok(Self {
             http,
+            mtls_identity_digest,
             default_headers: headers,
             base_url: config.base_url,
             defaults,
@@ -853,6 +914,38 @@ impl SamplingClient {
             builder: self.http.post(url).headers(headers),
             sent_bearer,
         }
+    }
+
+    /// 来源绑定实际发送的连接、模型和认证头，原始凭据不离开内存。
+    fn responses_source(&self, builder: &reqwest::RequestBuilder, model: &str) -> Result<String> {
+        let snapshot = builder
+            .try_clone()
+            .expect("JSON 请求构造器可以克隆")
+            .build()?;
+        let mut hasher = blake3::Hasher::new();
+        for value in [snapshot.url().as_str().as_bytes(), model.as_bytes()] {
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+        if let Some(digest) = self.mtls_identity_digest {
+            hasher.update(b"\0mtls-identity\0");
+            hasher.update(&digest);
+        }
+        let mut headers: Vec<_> = snapshot.headers().iter().collect();
+        headers.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        for (name, value) in headers {
+            // 跟踪字段随请求变化，不参与认证来源判定。
+            if matches!(
+                name.as_str(),
+                "traceparent" | "tracestate" | "baggage" | "x-request-id"
+            ) {
+                continue;
+            }
+            hasher.update(name.as_str().as_bytes());
+            hasher.update(&(value.as_bytes().len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        Ok(hasher.finalize().to_hex().to_string())
     }
 
     /// Must run before the span gets its first child, which starts it and freezes its parent.
@@ -1425,6 +1518,9 @@ impl SamplingClient {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
         })?;
+        if let Some(input) = request.responses_input.take() {
+            request_body["input"] = input;
+        }
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         // async-openai's ReasoningTextContent struct omits the `type` discriminator that the Responses API requires on input
@@ -1435,6 +1531,33 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
+        let responses_source = self
+            .defaults
+            .responses_compact_threshold
+            .map(|_| self.responses_source(&builder, &model_id))
+            .transpose()?;
+        let responses_input_fingerprint = responses_source
+            .as_deref()
+            .zip(request.responses_history.as_deref())
+            .map(|(source, history)| {
+                xai_grok_sampling_types::responses_input_fingerprint(history, source)
+            });
+        if let Some(history) = request.responses_history.as_deref() {
+            if let Some(source) = responses_source.as_deref() {
+                xai_grok_sampling_types::patch_responses_input_for_source(
+                    &mut request_body,
+                    history,
+                    Some(source),
+                );
+            } else {
+                xai_grok_sampling_types::patch_responses_input(&mut request_body, history);
+            }
+        }
+        if let Some(threshold) = self.defaults.responses_compact_threshold {
+            request_body["context_management"] = serde_json::json!([
+                {"type": "compaction", "compact_threshold": threshold.get()}
+            ]);
+        }
         let built_request = self
             .build_json_request(grok_headers.apply(builder), &request_body)
             .await?;
@@ -1482,7 +1605,12 @@ impl SamplingClient {
             });
         }
 
-        let response_obj = serde_json::from_slice::<rs::Response>(&bytes).map_err(|e| {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(SamplingError::Serialization)?;
+        let context_tokens =
+            extract_context_total(&serde_json::json!({"response": &value})).map(u64::from);
+        crate::responses_compat::prepare_response(&mut value)?;
+        let mut response_obj = serde_json::from_value::<rs::Response>(value).map_err(|e| {
             let raw_body = String::from_utf8_lossy(&bytes);
             tracing::error!(
                 error = %e,
@@ -1491,6 +1619,13 @@ impl SamplingClient {
             );
             SamplingError::Serialization(e)
         })?;
+        bind_responses_origin(
+            &mut response_obj,
+            responses_source.as_deref(),
+            responses_input_fingerprint.as_deref(),
+            self.defaults.responses_compact_threshold,
+            context_tokens,
+        );
         Ok(response_obj)
     }
 
@@ -1572,6 +1707,9 @@ impl SamplingClient {
         {
             obj.insert("stream_tool_calls".to_owned(), serde_json::json!(true));
         }
+        if let Some(input) = request.responses_input.take() {
+            request_body["input"] = input;
+        }
         splice_extra_tool_entries(&mut request_body, extra_tool_entries);
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
@@ -1585,6 +1723,33 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
+        let responses_source = self
+            .defaults
+            .responses_compact_threshold
+            .map(|_| self.responses_source(&builder, &model_id))
+            .transpose()?;
+        let responses_input_fingerprint = responses_source
+            .as_deref()
+            .zip(request.responses_history.as_deref())
+            .map(|(source, history)| {
+                xai_grok_sampling_types::responses_input_fingerprint(history, source)
+            });
+        if let Some(history) = request.responses_history.as_deref() {
+            if let Some(source) = responses_source.as_deref() {
+                xai_grok_sampling_types::patch_responses_input_for_source(
+                    &mut request_body,
+                    history,
+                    Some(source),
+                );
+            } else {
+                xai_grok_sampling_types::patch_responses_input(&mut request_body, history);
+            }
+        }
+        if let Some(threshold) = self.defaults.responses_compact_threshold {
+            request_body["context_management"] = serde_json::json!([
+                {"type": "compaction", "compact_threshold": threshold.get()}
+            ]);
+        }
         let mut http_request = grok_headers
             .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -1671,6 +1836,7 @@ impl SamplingClient {
         let event_stream = byte_stream.eventsource();
 
         let doom_loop_for_stream = doom_loop.clone();
+        let responses_compact_threshold = self.defaults.responses_compact_threshold;
 
         // The scan item is an `Option`: `Some(None)` skips an absorbed doom-loop event without terminating the stream (`filter_map` below)
         // An outer `None` still ends the stream
@@ -1705,7 +1871,51 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            Some(Some(deserialize_response_event(data)))
+                            let prepared = serde_json::from_str(data)
+                                .map_err(SamplingError::Serialization)
+                                .and_then(crate::responses_compat::prepare_event);
+                            match prepared {
+                                Ok(Some(value)) => {
+                                    Some(Some(deserialize_response_event(&value.to_string()).map(
+                                        |mut event| {
+                                            match &mut event {
+                                                rs::ResponseStreamEvent::ResponseCompleted(e) => {
+                                                    bind_responses_origin(
+                                                        &mut e.response,
+                                                        responses_source.as_deref(),
+                                                        responses_input_fingerprint.as_deref(),
+                                                        responses_compact_threshold,
+                                                        extract_context_total(&value)
+                                                            .map(u64::from),
+                                                    )
+                                                }
+                                                rs::ResponseStreamEvent::ResponseIncomplete(e) => {
+                                                    bind_responses_origin(
+                                                        &mut e.response,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                    )
+                                                }
+                                                rs::ResponseStreamEvent::ResponseFailed(e) => {
+                                                    bind_responses_origin(
+                                                        &mut e.response,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                    )
+                                                }
+                                                _ => {}
+                                            }
+                                            event
+                                        },
+                                    )))
+                                }
+                                Ok(None) => Some(None),
+                                Err(error) => Some(Some(Err(error))),
+                            }
                         }
                     }
                     Err(e) => {
@@ -2203,6 +2413,10 @@ impl SamplingClient {
         wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
+        let mut raw_input = serde_json::json!({});
+        xai_grok_sampling_types::patch_responses_input(&mut raw_input, &request);
+        wrapper.responses_input = raw_input.get("input").cloned();
+        wrapper.responses_history = Some(Box::new(request.clone()));
         wrapper.traceparent = request.traceparent;
 
         if let Some(trace) = trace {
@@ -2240,6 +2454,10 @@ impl SamplingClient {
         wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
+        let mut raw_input = serde_json::json!({});
+        xai_grok_sampling_types::patch_responses_input(&mut raw_input, &request);
+        wrapper.responses_input = raw_input.get("input").cloned();
+        wrapper.responses_history = Some(Box::new(request.clone()));
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2759,6 +2977,57 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    #[test]
+    fn responses_native_source_changes_with_credentials_and_route() {
+        let client = SamplingClient::new(minimal_config()).unwrap();
+        let first = client.http.post("https://example.test/v1/responses").bearer_auth("key-a");
+        let second = client.http.post("https://example.test/v1/responses").bearer_auth("key-b");
+        let other = client.http.post("https://other.test/v1/responses").bearer_auth("key-a");
+        let source = client.responses_source(&first, "model-a").unwrap();
+        assert_eq!(source, client.responses_source(&first, "model-a").unwrap());
+        assert_ne!(source, client.responses_source(&second, "model-a").unwrap());
+        assert_ne!(source, client.responses_source(&other, "model-a").unwrap());
+        assert_ne!(source, client.responses_source(&first, "model-b").unwrap());
+        assert!(!source.contains("key-a"));
+    }
+
+    #[test]
+    fn responses_source_changes_with_mtls_identity() {
+        let mut client = SamplingClient::new(minimal_config()).unwrap();
+        let source = |client: &SamplingClient| {
+            let request = client.post(client.endpoint("responses"));
+            client.responses_source(&request.builder, "test-model").unwrap()
+        };
+        let without_mtls = source(&client);
+        client.mtls_identity_digest = Some([1; 32]);
+        let first_identity = source(&client);
+        assert_ne!(first_identity, without_mtls);
+        assert_eq!(first_identity, source(&client.clone()));
+        client.mtls_identity_digest = Some([2; 32]);
+        assert_ne!(first_identity, source(&client));
+    }
+
+    #[test]
+    fn responses_native_origin_is_local_and_context_is_separate() {
+        use xai_grok_sampling_types::{RESPONSE_RAW_OUTPUT_METADATA_KEY, RESPONSE_SOURCE_METADATA_KEY};
+        let mut response: rs::Response = serde_json::from_str(EMPTY_RESPONSE_JSON).unwrap();
+        response.status = rs::Status::Completed;
+        response.metadata = Some(std::collections::HashMap::from([
+            (RESPONSE_SOURCE_METADATA_KEY.into(), "forged".into()),
+            (RESPONSE_RAW_OUTPUT_METADATA_KEY.into(), serde_json::json!([
+                {"type":"compaction","encrypted_content":"opaque","__grok_context_tokens":1}
+            ]).to_string()),
+        ]));
+        bind_responses_origin(&mut response, Some("trusted"), Some("prefix"), std::num::NonZeroU64::new(2000), Some(1111));
+        let metadata = response.metadata.as_ref().unwrap();
+        assert_eq!(metadata.get(RESPONSE_SOURCE_METADATA_KEY).unwrap(), "trusted");
+        let raw: serde_json::Value = serde_json::from_str(metadata.get(RESPONSE_RAW_OUTPUT_METADATA_KEY).unwrap()).unwrap();
+        assert_eq!(raw.pointer("/0/__grok_context_tokens"), Some(&serde_json::json!(1111)));
+        assert_eq!(raw.pointer("/0/__grok_context_estimated"), Some(&serde_json::json!(false)));
+        bind_responses_origin(&mut response, None, None, None, None);
+        assert!(!response.metadata.as_ref().unwrap().contains_key(RESPONSE_SOURCE_METADATA_KEY));
+    }
+
     #[tokio::test]
     async fn response_call_sites_emit_final_includes_and_stream_fields() {
         let unary = capture_response_body(false).await;
@@ -2802,8 +3071,28 @@ mod tests {
         fast_mode: bool,
         input: &str,
     ) -> (axum::http::HeaderMap, Bytes) {
+        capture_request_with_config(
+            SamplerConfig {
+                api_backend: backend,
+                request_compression,
+                fast_mode,
+                ..minimal_config()
+            },
+            streaming,
+            input,
+        )
+        .await
+    }
+
+    /// 复用假上游捕获请求，允许定向测试覆盖模型配置。
+    async fn capture_request_with_config(
+        config: SamplerConfig,
+        streaming: bool,
+        input: &str,
+    ) -> (axum::http::HeaderMap, Bytes) {
         use xai_grok_sampling_types::{ContentPart, ConversationItem, UserItem};
 
+        let backend = config.api_backend.clone();
         let (content_type, reply) = match (streaming, &backend) {
             (true, _) => ("text/event-stream", "data: [DONE]\n\n"),
             (false, ApiBackend::Responses) => ("application/json", EMPTY_RESPONSE_JSON),
@@ -2835,10 +3124,7 @@ mod tests {
         });
         let client = SamplingClient::new(SamplerConfig {
             base_url: format!("http://{addr}/v1"),
-            api_backend: backend.clone(),
-            request_compression,
-            fast_mode,
-            ..minimal_config()
+            ..config
         })
         .unwrap();
         let request = ConversationRequest {
@@ -2902,6 +3188,50 @@ mod tests {
                         assert!(body.get("service_tier").is_none(), "{route}: {body}");
                     }
                     assert!(body.get("fast_mode").is_none(), "{route}: {body}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_compact_threshold_only_sends_valid_responses_streaming_and_unary() {
+        for backend in [
+            ApiBackend::Responses,
+            ApiBackend::ChatCompletions,
+            ApiBackend::Messages,
+        ] {
+            for threshold in [None, Some(99_u64), Some(100), Some(101)] {
+                let mut unary_context_management = None;
+                for streaming in [false, true] {
+                    let (_, body) = capture_request_with_config(
+                        SamplerConfig {
+                            api_backend: backend.clone(),
+                            context_window: 100,
+                            responses_compact_threshold: threshold
+                                .and_then(std::num::NonZeroU64::new),
+                            ..minimal_config()
+                        },
+                        streaming,
+                        "responses-native-compaction-test",
+                    )
+                    .await;
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let route = format!("{backend:?} streaming={streaming} threshold={threshold:?}");
+                    let actual = body.get("context_management").cloned();
+                    let expected = (backend == ApiBackend::Responses && threshold == Some(99))
+                        .then(|| serde_json::json!([
+                            {"type": "compaction", "compact_threshold": 99}
+                        ]));
+                    assert_eq!(actual, expected, "{route}: {body}");
+                    assert!(
+                        body.get("responses_compact_threshold").is_none(),
+                        "{route}: {body}"
+                    );
+                    if streaming {
+                        assert_eq!(actual, unary_context_management, "{route}");
+                    } else {
+                        unary_context_management = actual;
+                    }
                 }
             }
         }
@@ -3704,7 +4034,13 @@ mod tests {
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
-        assert!(e.response.metadata.is_none());
+        assert!(
+            e.response
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(COST_USD_TICKS_METADATA_KEY))
+                .is_none()
+        );
     }
 
     #[test]

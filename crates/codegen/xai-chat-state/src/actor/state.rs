@@ -78,7 +78,13 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
                     .iter()
                     .map(|tc| tc.arguments.len())
                     .sum::<usize>();
-            (bytes as u64) / xai_token_estimation::BYTES_PER_TOKEN
+            // 原始服务端输出也占上下文；保守计入，避免压缩预算漏算。
+            let raw_bytes = a
+                .responses_output
+                .as_ref()
+                .and_then(|output| serde_json::to_vec(output).ok())
+                .map_or(0, |output| output.len());
+            (bytes.max(raw_bytes) as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
         ConversationItem::ToolResult(tr) => xai_token_estimation::estimate_tokens(&tr.content),
         ConversationItem::BackendToolCall(b) => {

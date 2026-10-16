@@ -45,6 +45,9 @@ impl From<ChatRequestMessage> for ConversationItem {
                     .collect();
 
                 ConversationItem::Assistant(AssistantItem {
+                    responses_output: None,
+                    responses_source: None,
+                    responses_input_fingerprint: None,
                     content: Arc::<str>::from(content),
                     tool_calls,
                     model_id,
@@ -233,6 +236,9 @@ impl From<ChatResponseMessage> for ConversationItem {
             .collect();
 
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: Arc::<str>::from(content),
             tool_calls,
             model_id: None,

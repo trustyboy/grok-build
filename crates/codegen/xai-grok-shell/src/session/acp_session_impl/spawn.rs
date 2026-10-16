@@ -616,6 +616,7 @@ pub(crate) async fn spawn_session_actor(
         reasoning_effort: sampling_config.reasoning_effort,
         reasoning_summary: sampling_config.reasoning_summary,
         fast_mode: sampling_config.fast_mode,
+        responses_compact_threshold: sampling_config.responses_compact_threshold,
         stream_tool_calls: Some(sampling_config.stream_tool_calls),
     };
     let actor_pruning_config = xai_chat_state::PruningConfig {
@@ -1855,6 +1856,7 @@ pub(crate) async fn spawn_session_actor(
         startup_hints,
         forked_tool_override,
         compaction: super::compaction_config::CompactionConfig {
+            native_context: Default::default(),
             threshold_percent: std::cell::Cell::new(auto_compact_threshold_percent),
             force_compact: force_compact.clone(),
             context_window_override,

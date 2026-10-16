@@ -42,6 +42,188 @@ fn response_without_usage() -> ConversationResponse {
     }
 }
 
+/// 原生压缩响应的本地元数据；密文大小与有效上下文计数故意不一致。
+async fn response_with_native_context(actor: &SessionActor, estimated: bool) -> ConversationResponse {
+    let mut response = response_with_usage(240_000);
+    let assistant = response.assistant_mut().unwrap();
+    assistant.responses_source = Some("trusted-source".into());
+    assistant.responses_input_fingerprint = Some(xai_grok_sampling_types::responses_input_fingerprint(
+        &xai_grok_sampling_types::ConversationRequest {
+            items: actor.chat_state_handle.get_conversation().await,
+            ..Default::default()
+        },
+        "trusted-source",
+    ));
+    assistant.responses_output = Some(vec![
+        serde_json::json!({"type":"compaction", "encrypted_content":"x".repeat(1_200_000),
+            "__grok_context_tokens":12_000, "__grok_context_estimated":estimated}),
+        serde_json::json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"ok"}]}),
+    ]);
+    response
+}
+
+/// 测试原生策略，不修改真实配置或请求上游。
+async fn enable_native_context(actor: &SessionActor) {
+    let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+    config.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    config.responses_compact_threshold = std::num::NonZeroU64::new(160_000);
+    actor.chat_state_handle.update_sampling_config(config);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_context_usage_keeps_billing_and_tool_delta() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+        enable_native_context(&actor).await;
+        let response = response_with_native_context(&actor, true).await;
+        let context = actor.response_native_context(&response).await;
+        assert_eq!(context, Some((12_000, true)));
+        actor.record_response_token_usage(&response, None).await;
+        actor.record_response_items(response.items, true).await;
+        actor.commit_response_native_context(context).await;
+        assert_eq!(actor.context_tokens_for_capacity().await, 12_000);
+        assert!(actor.check_preflight_overflow().await.is_none());
+        let usage = actor.chat_state_handle.try_get_session_usage().await.unwrap();
+        assert_eq!(usage.totals.input_tokens, 239_950);
+        assert_eq!(usage.totals.output_tokens, 50);
+        let mut tool_call = ConversationItem::assistant("");
+        if let ConversationItem::Assistant(assistant) = &mut tool_call {
+            assistant.tool_calls.push(xai_grok_sampling_types::ToolCall {
+                id: "call".into(), name: "test_tool".into(), arguments: "{}".into(),
+            });
+        }
+        actor.chat_state_handle.push_assistant_response(tool_call);
+        actor.chat_state_handle.push_tool_result(ConversationItem::tool_result("call", "abcd".repeat(100)));
+        assert_eq!(actor.context_tokens_for_capacity().await, 12_100);
+        actor.record_response_token_usage(&response_without_usage(), None).await;
+        assert_eq!(actor.context_tokens_for_capacity().await, 12_100);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_context_metadata_requires_source_mode_and_latest_valid_shape() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+        let mut response = response_with_native_context(&actor, false).await;
+        assert_eq!(actor.response_native_context(&response).await, None);
+        enable_native_context(&actor).await;
+        assert_eq!(actor.response_native_context(&response).await, Some((12_000, false)));
+        response.assistant_mut().unwrap().responses_source = None;
+        assert_eq!(actor.response_native_context(&response).await, None);
+        actor.record_response_token_usage(&response, None).await;
+        assert_eq!(actor.chat_state_handle.get_total_tokens().await, 240_000);
+        response.assistant_mut().unwrap().responses_source = Some("trusted-source".into());
+        response.assistant_mut().unwrap().responses_output.as_mut().unwrap().push(
+            serde_json::json!({"type":"compaction", "encrypted_content":"new"}));
+        assert_eq!(actor.response_native_context(&response).await, None);
+        response.assistant_mut().unwrap().responses_output = None;
+        assert_eq!(actor.response_native_context(&response).await, None);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_context_without_usage_does_not_count_ciphertext_twice() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+        enable_native_context(&actor).await;
+        let mut response = response_with_native_context(&actor, true).await;
+        response.usage = None;
+        let context = actor.response_native_context(&response).await;
+        actor.record_response_token_usage(&response, None).await;
+        actor.record_response_items(response.items, context.is_some()).await;
+        actor.commit_response_native_context(context).await;
+        assert_eq!(actor.chat_state_handle.get_estimated_total_tokens().await, 12_000);
+        assert_eq!(actor.chat_state_handle.try_get_session_usage().await.unwrap().totals.model_calls, 0);
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_context_history_change_and_restore_use_full_history_guard() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+        enable_native_context(&actor).await;
+        actor.chat_state_handle.push_user_message_and_ack(ConversationItem::user("abcd".repeat(270_000))).await;
+        let response = response_with_native_context(&actor, true).await;
+        let context = actor.response_native_context(&response).await;
+        actor.record_response_token_usage(&response, None).await;
+        actor.record_response_items(response.items, true).await;
+        actor.commit_response_native_context(context).await;
+        assert_eq!(actor.context_tokens_for_capacity().await, 12_000);
+        let original = actor.chat_state_handle.get_conversation().await;
+        let mut changed = original.clone();
+        if let ConversationItem::Assistant(assistant) = changed.last_mut().unwrap() {
+            assistant.responses_source = None;
+        }
+        actor.chat_state_handle.replace_conversation(changed);
+        assert!(actor.context_tokens_for_capacity().await >= 270_000);
+        assert!(actor.check_preflight_overflow().await.is_some());
+        // 恢复旧 raw 不会恢复进程内来源锚点，也不能重新套用旧的低计数。
+        actor.chat_state_handle.replace_conversation(original);
+        assert!(actor.context_tokens_for_capacity().await >= 270_000);
+        assert!(actor.compaction.native_context.borrow().is_none());
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_context_credentials_change_invalidates_baseline() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+        enable_native_context(&actor).await;
+        actor.chat_state_handle.push_user_message_and_ack(ConversationItem::user("abcd".repeat(270_000))).await;
+        let response = response_with_native_context(&actor, true).await;
+        let context = actor.response_native_context(&response).await;
+        actor.record_response_token_usage(&response, None).await;
+        actor.record_response_items(response.items, true).await;
+        actor.commit_response_native_context(context).await;
+        let mut credentials = actor.chat_state_handle.get_credentials().await;
+        credentials.api_key = Some("rotated".into());
+        actor.chat_state_handle.update_credentials(credentials);
+        assert!(actor.context_tokens_for_capacity().await >= 270_000);
+        assert!(actor.compaction.native_context.borrow().is_none());
+    }).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_context_invalid_projection_and_disabled_mode_do_not_keep_low_count() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+        enable_native_context(&actor).await;
+        actor.chat_state_handle.push_user_message_and_ack(ConversationItem::user("abcd".repeat(270_000))).await;
+        let mut response = response_with_native_context(&actor, true).await;
+        response.assistant_mut().unwrap().responses_input_fingerprint = Some("stale".into());
+        let context = actor.response_native_context(&response).await;
+        actor.record_response_token_usage(&response, None).await;
+        actor.record_response_items(response.items, true).await;
+        actor.commit_response_native_context(context).await;
+        assert!(actor.context_tokens_for_capacity().await >= 270_000);
+        assert!(actor.compaction.native_context.borrow().is_none());
+
+        let response = response_with_native_context(&actor, false).await;
+        let context = actor.response_native_context(&response).await;
+        actor.record_response_token_usage(&response, None).await;
+        actor.record_response_items(response.items, true).await;
+        actor.commit_response_native_context(context).await;
+        assert_eq!(actor.context_tokens_for_capacity().await, 12_000);
+        let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+        config.responses_compact_threshold = None;
+        actor.chat_state_handle.update_sampling_config(config);
+        assert!(actor.context_tokens_for_capacity().await >= 270_000);
+        assert!(actor.check_preflight_overflow().await.is_some());
+    }).await;
+}
+
 /// A reasoning-capable Responses turn reports the live context after its output has already been included.
 /// Persisting that output must not add it again to the context sent to the pager or the pre-sampling compaction gate.
 #[tokio::test(flavor = "current_thread")]
@@ -95,7 +277,7 @@ async fn response_reasoning_does_not_inflate_model_reported_context() {
                 stop_sequence: None,
             };
 
-            actor.record_response_token_usage(&response, None);
+            actor.record_response_token_usage(&response, None).await;
             let usage_reported = response.usage.is_some();
             actor
                 .record_response_items(response.items, usage_reported)
@@ -170,7 +352,7 @@ async fn response_without_usage_keeps_model_output_as_estimated_growth() {
                 stop_sequence: None,
             };
 
-            actor.record_response_token_usage(&response, None);
+            actor.record_response_token_usage(&response, None).await;
             let usage_reported = response.usage.is_some();
             actor
                 .record_response_items(response.items, usage_reported)
@@ -212,7 +394,7 @@ async fn updates_chat_state_total_tokens_from_response_usage() {
             let _sync = actor.chat_state_handle.get_total_tokens().await;
             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 0);
 
-            actor.record_response_token_usage(&response_with_usage(150_000), None);
+            actor.record_response_token_usage(&response_with_usage(150_000), None).await;
 
             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 150_000);
             let prompt = actor
@@ -249,7 +431,7 @@ async fn preserves_total_tokens_when_response_has_no_usage() {
             let actor = create_test_actor(99_999, 256_000, 85, gateway_tx, persistence_tx).await;
             let _sync = actor.chat_state_handle.get_total_tokens().await;
 
-            actor.record_response_token_usage(&response_without_usage(), None);
+            actor.record_response_token_usage(&response_without_usage(), None).await;
 
             assert_eq!(actor.chat_state_handle.get_total_tokens().await, 99_999);
         })
@@ -286,7 +468,7 @@ async fn build_session_info_used_reflects_recorded_response() {
                 .push_user_message_and_ack(ConversationItem::user("hello hello hello hello"))
                 .await;
 
-            actor.record_response_token_usage(&response_with_usage(120_000), None);
+            actor.record_response_token_usage(&response_with_usage(120_000), None).await;
 
             let info = actor.build_session_info().await;
             assert_eq!(info.context.used, 120_000);
@@ -380,7 +562,7 @@ async fn stashes_per_turn_usage_in_chat_state() {
             );
 
             // The fixture splits total 200_000 into prompt 199_950 and completion 50
-            actor.record_response_token_usage(&response_with_usage(200_000), None);
+            actor.record_response_token_usage(&response_with_usage(200_000), None).await;
 
             let stashed = actor
                 .chat_state_handle

@@ -49,6 +49,9 @@ fn fork_filter_consecutive_users_with_tool_calls() {
         ConversationItem::user("prefix"),
         ConversationItem::user("query"),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: String::new().into(),
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
@@ -76,6 +79,9 @@ fn fork_filter_preserves_complete_tool_turn() {
     let mut items = vec![
         ConversationItem::user("q"),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: String::new().into(),
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
@@ -100,6 +106,9 @@ fn fork_filter_strips_incomplete_tool_turn() {
         ConversationItem::assistant("a1"),
         ConversationItem::user("q2"),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: String::new().into(),
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
@@ -154,6 +163,9 @@ fn fork_filter_keeps_multi_tool_turn_with_reasoning_between_results() {
         ConversationItem::user("q"),
         ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item("plan")),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: String::new().into(),
             tool_calls: vec![
                 ToolCall {

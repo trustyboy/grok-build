@@ -774,6 +774,7 @@ async fn read_parent_sampling_config(
                 reasoning_effort: cfg.reasoning_effort,
                 reasoning_summary: cfg.reasoning_summary,
                 fast_mode: cfg.fast_mode,
+                responses_compact_threshold: cfg.responses_compact_threshold,
                 force_http1: false,
                 max_retries: cfg.max_retries.or(ctx.sampling_config.max_retries),
                 rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,

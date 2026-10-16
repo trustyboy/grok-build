@@ -23,6 +23,7 @@ pub mod handle;
 pub mod metrics;
 mod prewarm;
 mod request_compression;
+mod responses_compat;
 pub mod retry;
 pub mod sampling_log;
 mod shared_http;

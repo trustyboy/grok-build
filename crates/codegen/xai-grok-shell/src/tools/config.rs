@@ -189,6 +189,7 @@ pub(crate) fn web_search_sampling_config(base: SamplerConfig) -> SamplerConfig {
     SamplerConfig {
         model,
         max_completion_tokens: Some(8192),
+        responses_compact_threshold: None,
         temperature: Some(0.1),
         top_p: Some(0.95),
         force_http1: false,
@@ -221,6 +222,7 @@ impl ShellToolsetConfig {
             reasoning_effort: None,
             reasoning_summary: None,
             fast_mode: false,
+            responses_compact_threshold: None,
             force_http1: false,
             max_retries: None,
             rate_limit_retry_threshold: None,

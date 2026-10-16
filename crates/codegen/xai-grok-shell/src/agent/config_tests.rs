@@ -2325,6 +2325,68 @@ fn fast_mode_defaults_and_explicit_false_override_reach_sampler() {
 }
 
 #[test]
+fn responses_compact_threshold_reaches_sampler_but_not_auxiliary_models() {
+    assert_eq!(
+        ModelEntryConfig::default().responses_compact_threshold,
+        None
+    );
+    assert_eq!(ModelInfo::default().responses_compact_threshold, None);
+    assert_eq!(
+        DefaultModelJson::default().responses_compact_threshold,
+        None
+    );
+    let old: ModelEntryConfig = serde_json::from_value(serde_json::json!({
+        "model": "compact", "base_url": "https://example.test/v1", "context_window": 200_000
+    }))
+    .unwrap();
+    assert_eq!(old.responses_compact_threshold, None);
+    let base = ModelEntry::from_config_entry(&ModelEntryConfig {
+        api_backend: ApiBackend::Responses,
+        api_key: Some("test-key".into()),
+        responses_compact_threshold: NonZeroU64::new(100_000),
+        ..old
+    });
+    let model = ConfigModelOverride {
+        responses_compact_threshold: NonZeroU64::new(120_000),
+        ..Default::default()
+    }
+    .apply("compact", Some(base), &EndpointsConfig::default());
+    let mut sampler = sampling_config_for_model(
+        &model,
+        resolve_credentials(&model, None),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        sampler.effective_responses_compact_threshold(),
+        NonZeroU64::new(120_000)
+    );
+    sampler.context_window = 120_000;
+    assert_eq!(sampler.effective_responses_compact_threshold(), None);
+    sampler.context_window = 200_000;
+    let (_, fallback) = finalize_image_describe_sampler_config(None, &sampler, None, None);
+    assert_eq!(fallback.responses_compact_threshold, None);
+    assert_eq!(
+        crate::tools::config::web_search_sampling_config(sampler).responses_compact_threshold,
+        None
+    );
+    let models = IndexMap::from([("compact".to_owned(), model)]);
+    let auxiliary = resolve_aux_model_sampling_config(
+        "compact",
+        &models,
+        &EndpointsConfig::default(),
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(auxiliary.responses_compact_threshold, None);
+}
+
+#[test]
 fn model_info_from_config_propagates_use_concise() {
     let entry = ModelEntryConfig {
         model: "test".to_string(),

@@ -1995,6 +1995,9 @@ async fn build_compacted_history_multi_turn_with_parallel_tool_calls() {
         ),
         // [3] Assistant with 2 parallel tool calls
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "I'll read both files for you.".into(),
             tool_calls: vec![
                 ToolCall {
@@ -2028,6 +2031,9 @@ async fn build_compacted_history_multi_turn_with_parallel_tool_calls() {
         ),
         // [8] Assistant with 2 parallel tool calls
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "I'll fix the typo and run tests.".into(),
             tool_calls: vec![
                 ToolCall {
@@ -2763,6 +2769,9 @@ fn conversation_item_preserves_reasoning_siblings() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "response".into(),
             tool_calls: vec![],
             model_id: None,
@@ -2787,6 +2796,9 @@ fn strip_reasoning_blocks_drops_reasoning_siblings() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "response".into(),
             tool_calls: vec![],
             model_id: None,
@@ -2830,6 +2842,9 @@ fn prepare_for_summarization_drops_reasoning_sibling_on_mutated_assistant() {
         ConversationItem::user("do stuff"),
         mk_reasoning(),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "I'll search.".into(),
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
@@ -2877,6 +2892,9 @@ fn prepare_for_summarization_drops_standalone_reasoning_sibling() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "plain text response".into(),
             tool_calls: vec![],
             model_id: None,
@@ -2909,6 +2927,9 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
         ConversationItem::user("first turn"),
         mk_reasoning(),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "calling grep".into(),
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
@@ -2923,6 +2944,9 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
         ConversationItem::user("second turn"),
         mk_reasoning(),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "thinking only".into(),
             tool_calls: vec![],
             model_id: None,
@@ -2932,6 +2956,9 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
         ConversationItem::tool_result("tc2", "stray"),
         ConversationItem::user("third turn"),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "plain reply".into(),
             tool_calls: vec![],
             model_id: None,
@@ -2995,6 +3022,9 @@ fn prepare_for_summarization_is_idempotent() {
             status: None,
         }),
         ConversationItem::Assistant(AssistantItem {
+            responses_output: None,
+            responses_source: None,
+            responses_input_fingerprint: None,
             content: "hi".into(),
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
@@ -3410,4 +3440,28 @@ fn fit_counts_encrypted_reasoning_against_budget() {
         out.iter().any(|i| i.text_content() == "recent answer"),
         "recent turn must survive"
     );
+}
+
+#[test]
+fn responses_snapshot_is_discarded_by_history_cleanup_and_budget() {
+    let mut item = ConversationItem::assistant("text".repeat(100));
+    let ConversationItem::Assistant(a) = &mut item else {
+        panic!()
+    };
+    a.responses_output = Some(vec![serde_json::json!({
+        "type":"compaction", "encrypted_content":"secret".repeat(1000)
+    })]);
+    let cleaned = [
+        strip_tool_messages_for_conversation_item(vec![item.clone()]),
+        strip_reasoning_blocks(vec![item.clone()]),
+        fit_conversation_to_budget(vec![item], 200),
+    ];
+    for items in cleaned {
+        assert!(!items.is_empty());
+        for item in items {
+            if let ConversationItem::Assistant(a) = item {
+                assert!(a.responses_output.is_none());
+            }
+        }
+    }
 }

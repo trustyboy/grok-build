@@ -782,6 +782,7 @@ impl SessionActor {
             reasoning_effort: None,
             reasoning_summary: None,
             fast_mode: false,
+            responses_compact_threshold: None,
             stream_tool_calls: None,
         });
         let supports_vision = snapshot.as_ref().map_or_else(
@@ -918,6 +919,7 @@ impl SessionActor {
             reasoning_effort: cfg.reasoning_effort,
             reasoning_summary: cfg.reasoning_summary,
             fast_mode,
+            responses_compact_threshold: cfg.responses_compact_threshold,
             force_http1: false,
             max_retries: cfg.max_retries.or(Some(self.max_retries)),
             rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,
@@ -1019,7 +1021,8 @@ impl SessionActor {
                         }
                         None => {
                             session.refresh_token_if_expired().await;
-                            let config = session.reconstruct_full_config().await;
+                            let mut config = session.reconstruct_full_config().await;
+                            config.responses_compact_threshold = None;
                             let context_window = config.context_window;
                             let model = config.model.clone();
                             let client = xai_grok_sampler::SamplingClient::new(config).map_err(|e| {
@@ -1175,6 +1178,8 @@ impl SessionActor {
         self.refresh_token_if_expired().await;
 
         let mut full_config = self.reconstruct_full_config().await;
+        // 独立分类和摘要请求不参与会话的原生压缩。
+        full_config.responses_compact_threshold = None;
         full_config.force_http1 = force_http1;
         let sampling_client =
             xai_grok_sampler::SamplingClient::new(full_config).map_err(|e| self.to_acp_error(e))?;
@@ -2388,19 +2393,193 @@ impl SessionActor {
         key
     }
 
+    /// 原生压缩跟随本轮模型；同来源的窗口修正仍使用实时配置。
+    pub(crate) async fn responses_native_compaction_enabled(&self) -> bool {
+        let current = self.chat_state_handle.get_sampling_config().await;
+        let snapshot = TURN_SAMPLING_STATE
+            .try_with(|state| state.config.clone())
+            .ok()
+            .flatten();
+        let config = match snapshot.as_ref() {
+            Some(snapshot)
+                if current.as_ref().is_none_or(|current| {
+                    current.model != snapshot.model
+                        || current.base_url != snapshot.base_url
+                        || current.api_backend != snapshot.api_backend
+                }) => Some(snapshot),
+            _ => current.as_ref(),
+        };
+        config.is_some_and(|config| {
+            config.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+                && config
+                    .responses_compact_threshold
+                    .is_some_and(|threshold| threshold < config.context_window)
+        })
+    }
+
+    /// 只消费完整成功响应中由客户端绑定来源的最后一个压缩项。
+    pub(crate) async fn response_native_context(
+        &self,
+        response: &ConversationResponse,
+    ) -> Option<(u64, bool)> {
+        if !self.responses_native_compaction_enabled().await {
+            return None;
+        }
+        for item in response.items.iter().rev() {
+            let ConversationItem::Assistant(assistant) = item else { continue };
+            let Some(raw) = assistant.responses_output.as_ref() else { continue };
+            let Some(compaction) = raw.iter().rev().find(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+            }) else { continue };
+            assistant.responses_source.as_deref().filter(|source| !source.is_empty())?;
+            compaction.get("encrypted_content")?.as_str().filter(|value| !value.is_empty())?;
+            return Some((
+                compaction.get("__grok_context_tokens")?.as_u64()?,
+                compaction.get("__grok_context_estimated")?.as_bool()?,
+            ));
+        }
+        None
+    }
+
+    /// 摘要仅留在内存，用于发现模型、连接、凭据及环境认证变化。
+    async fn native_context_identity(&self) -> String {
+        let current = self.chat_state_handle.get_sampling_config().await;
+        let snapshot = TURN_SAMPLING_STATE.try_with(Clone::clone).ok();
+        let crossed = snapshot.as_ref().is_some_and(|state| {
+            state.config.as_ref().map(|cfg| (&cfg.model, &cfg.base_url, &cfg.api_backend))
+                != current.as_ref().map(|cfg| (&cfg.model, &cfg.base_url, &cfg.api_backend))
+        });
+        let (config, credentials) = if crossed {
+            let state = snapshot.expect("crossed requires a snapshot");
+            (state.config, state.credentials)
+        } else {
+            (current, self.chat_state_handle.get_credentials().await)
+        };
+        let env: Vec<_> = config.as_ref().into_iter().flat_map(|cfg| cfg.env_http_headers.iter())
+            .map(|(header, name)| (header, std::env::var(name).ok())).collect();
+        let bytes = serde_json::to_vec(&(&config, &credentials, env))
+            .expect("sampling config and credentials are serializable");
+        blake3::hash(&bytes).to_hex().to_string()
+    }
+
+    /// 响应入历史后再固定基线，避免后续工具输出或 raw 密文被重复计数。
+    pub(crate) async fn commit_response_native_context(&self, context: Option<(u64, bool)>) {
+        let Some((tokens, estimated)) = context else { return };
+        let identity = self.native_context_identity().await;
+        let conversation = self.chat_state_handle.get_conversation().await;
+        let checkpoint = conversation.iter().rev().find_map(|item| {
+            let ConversationItem::Assistant(assistant) = item else { return None };
+            let raw = assistant.responses_output.as_ref()?;
+            let item = raw.iter().rev().find(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+            })?;
+            Some((assistant.responses_source.as_deref()?, item.get("encrypted_content")?.as_str()?))
+        });
+        let Some((source, encrypted)) = checkpoint else { return };
+        let checkpoint_hash = blake3::hash(encrypted.as_bytes()).to_hex().to_string();
+        let bytes = serde_json::to_vec(&conversation).expect("conversation is serializable");
+        self.compaction.native_context.replace(Some(
+            crate::session::compaction_config::NativeContextBaseline {
+                identity,
+                source: source.to_owned(),
+                checkpoint_hash,
+                prefix_len: conversation.len(),
+                prefix_hash: blake3::hash(&bytes).to_hex().to_string(),
+            },
+        ));
+        self.chat_state_handle.record_token_usage(tokens);
+        self.send_xai_notification(XaiSessionUpdate::HookAnnotation {
+            message: if estimated {
+                "服务端压缩完成；上下文用量为估算值"
+            } else {
+                "服务端压缩完成；上下文用量采用服务端报告值"
+            }.to_string(),
+            kind: Default::default(),
+        }).await;
+    }
+
+    /// 硬容量检查只复用同来源、未改写历史的基线；失效时使用通用历史保护。
+    pub(crate) async fn context_tokens_for_capacity(&self) -> u64 {
+        let tracked = self.chat_state_handle.get_estimated_total_tokens().await;
+        let native = self.responses_native_compaction_enabled().await;
+        let identity = self.native_context_identity().await;
+        let mut conversation = self.chat_state_handle.get_conversation().await;
+        let valid = self.compaction.native_context.borrow().as_ref().is_some_and(|baseline| {
+            native && baseline.identity == identity
+                && conversation.get(..baseline.prefix_len).is_some_and(|prefix| {
+                    let bytes = serde_json::to_vec(prefix).expect("conversation is serializable");
+                    blake3::hash(&bytes).to_hex().as_str() == baseline.prefix_hash
+                })
+        });
+        if valid {
+            let baseline = self.compaction.native_context.borrow();
+            let baseline = baseline.as_ref().expect("validated baseline");
+            let mut projected = serde_json::json!({});
+            xai_grok_sampling_types::patch_responses_input_for_source(
+                &mut projected,
+                &xai_grok_sampling_types::ConversationRequest {
+                    items: conversation.clone(),
+                    ..Default::default()
+                },
+                Some(&baseline.source),
+            );
+            let retained = projected.get("input").and_then(serde_json::Value::as_array).is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+                        && item.get("encrypted_content").and_then(serde_json::Value::as_str).is_some_and(|value| {
+                            blake3::hash(value.as_bytes()).to_hex().as_str() == baseline.checkpoint_hash
+                        })
+                })
+            });
+            if retained {
+                return tracked;
+            }
+        }
+        let had_baseline = self.compaction.native_context.borrow_mut().take().is_some();
+        let mut has_compaction = false;
+        for item in &mut conversation {
+            if let ConversationItem::Assistant(assistant) = item
+                && assistant.responses_output.as_ref().is_some_and(|raw| raw.iter().any(|entry| {
+                    entry.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+                }))
+            {
+                has_compaction = true;
+                assistant.responses_output = None;
+            }
+        }
+        if !native && !had_baseline && !has_compaction {
+            return tracked;
+        }
+        let full_history = xai_chat_state::estimate_conversation_tokens(&conversation);
+        let tokens = if had_baseline || has_compaction {
+            full_history
+        } else {
+            tracked.max(full_history)
+        };
+        if had_baseline || has_compaction {
+            // 清除旧基线的增量锚点，模型切换和恢复不能保留过小的压缩计数。
+            self.chat_state_handle.record_token_usage(tokens);
+        }
+        tokens
+    }
+
     /// Propagate the model-reported token usage from a turn response into chat state, the per-prompt usage ledger, and per-turn signals.
     /// Without it `state.total_tokens` would stay frozen at the `estimate_conversation_tokens` seed from `ChatState::new`.
     /// Resetting `estimated_tokens_since_model = 0` here also keeps the preflight-overflow guard accurate against the next turn's tool-result deltas.
-    pub(crate) fn record_response_token_usage(
+    pub(crate) async fn record_response_token_usage(
         &self,
         response: &ConversationResponse,
         api_duration_ms: Option<u64>,
     ) {
+        let context = self.response_native_context(response).await;
+        if let Some(tokens) = context.map(|(tokens, _)| tokens)
+            .or_else(|| response.usage.as_ref().map(|usage| u64::from(usage.total_tokens)))
+        {
+            self.chat_state_handle.record_token_usage(tokens);
+        }
         if let Some(ref u) = response.usage {
             self.tool_context
                 .record_task_model_output(u64::from(u.completion_tokens));
-            self.chat_state_handle
-                .record_token_usage(u64::from(u.total_tokens));
             self.chat_state_handle.record_last_turn_usage(u.clone());
             self.chat_state_handle.record_model_call_usage(
                 response.assistant().and_then(|a| a.model_id.clone()),

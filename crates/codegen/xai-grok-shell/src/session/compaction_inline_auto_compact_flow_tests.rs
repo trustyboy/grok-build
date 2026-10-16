@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering::Relaxed;
 use tokio::sync::mpsc;
 use xai_grok_paths::AbsPathBuf;
+use xai_grok_sampling_types::ApiBackend;
 use xai_grok_workspace::file_system::MockFs;
 use xai_grok_workspace::permission::PermissionHandle;
 #[derive(Debug)]
@@ -32,7 +33,7 @@ async fn create_test_actor(
     gateway_tx: mpsc::UnboundedSender<xai_acp_lib::AcpClientMessage>,
     persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
 ) -> SessionActor {
-    let cwd = AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
+    let cwd = AbsPathBuf::new(std::env::temp_dir()).unwrap();
     let fs = Arc::new(MockFs::new(cwd.to_path_buf()));
     let terminal = Arc::new(DummyTerminal {});
     let (hunk_tx, _hunk_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -292,6 +293,138 @@ async fn create_test_actor(
         trace_config_template: std::cell::RefCell::new(None),
     }
 }
+/// 原生策略仅接受 Responses 的有效阈值，其他模型保持客户端触发。
+#[tokio::test(flavor = "current_thread")]
+async fn responses_native_compaction_threshold_policy() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor = create_test_actor(190_000, 200_000, 85, gateway_tx, persistence_tx).await;
+            for (backend, threshold, native) in [
+                (ApiBackend::Responses, None, false),
+                (ApiBackend::Responses, Some(160_000), true),
+                (ApiBackend::Responses, Some(200_000), false),
+                (ApiBackend::Responses, Some(210_000), false),
+                (ApiBackend::ChatCompletions, Some(160_000), false),
+                (ApiBackend::Messages, Some(160_000), false),
+            ] {
+                let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                config.api_backend = backend;
+                config.responses_compact_threshold = threshold.and_then(std::num::NonZeroU64::new);
+                actor.chat_state_handle.update_sampling_config(config);
+                assert_eq!(actor.responses_native_compaction_enabled().await, native);
+                assert_eq!(actor.check_auto_compact_needed().await.is_none(), native);
+                assert_eq!(actor.should_prefire_two_pass().await, !native);
+                assert!(actor.check_preflight_overflow().await.is_none());
+            }
+        })
+        .await;
+}
+
+/// 执行中的轮次不借用切换后的策略，同来源窗口变小则重新验证阈值。
+#[tokio::test(flavor = "current_thread")]
+async fn responses_native_compaction_turn_snapshot() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor = create_test_actor(190_000, 200_000, 85, gateway_tx, persistence_tx).await;
+            let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            config.api_backend = ApiBackend::Responses;
+            config.responses_compact_threshold = std::num::NonZeroU64::new(160_000);
+            actor.chat_state_handle.update_sampling_config(config.clone());
+            let snapshot = actor.capture_turn_sampling_state().await;
+            super::super::sampler_turn::TURN_SAMPLING_STATE
+                .scope(snapshot, async {
+                    config.model = "next-model".to_string();
+                    config.api_backend = ApiBackend::Messages;
+                    config.responses_compact_threshold = None;
+                    actor.chat_state_handle.update_sampling_config(config);
+                    assert!(actor.responses_native_compaction_enabled().await);
+                    assert!(actor.check_auto_compact_needed().await.is_none());
+                })
+                .await;
+            assert!(!actor.responses_native_compaction_enabled().await);
+            let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            config.api_backend = ApiBackend::Responses;
+            config.responses_compact_threshold = std::num::NonZeroU64::new(160_000);
+            actor.chat_state_handle.update_sampling_config(config.clone());
+            let snapshot = actor.capture_turn_sampling_state().await;
+            super::super::sampler_turn::TURN_SAMPLING_STATE
+                .scope(snapshot, async {
+                    config.context_window = std::num::NonZeroU64::new(150_000).unwrap();
+                    actor.chat_state_handle.update_sampling_config(config);
+                    assert!(!actor.responses_native_compaction_enabled().await);
+                })
+                .await;
+        })
+        .await;
+}
+
+/// 原生策略清理已启动的预压缩与缓存，但不关闭硬溢出保护。
+#[tokio::test(flavor = "current_thread")]
+async fn responses_native_compaction_cancels_prefire_keeps_hard_overflow() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor = create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await;
+            let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            config.api_backend = ApiBackend::Responses;
+            config.responses_compact_threshold = std::num::NonZeroU64::new(160_000);
+            actor.chat_state_handle.update_sampling_config(config);
+            for check_prefire in [true, false] {
+                assert!(actor.compaction.prefire.try_begin());
+                let worker = tokio::task::spawn_local(std::future::pending::<()>());
+                let abort_handle = worker.abort_handle();
+                actor.compaction.prefire.set_handle(worker);
+                actor.compaction.prefire.store(crate::session::compaction_config::AsyncCompactionCache {
+                    note1: "old summary".to_string(),
+                    prefix_len: 1,
+                    fingerprint: 1,
+                    model_slug: "test".to_string(),
+                    pass1_latency_ms: 0,
+                });
+                if check_prefire {
+                    assert!(!actor.should_prefire_two_pass().await);
+                } else {
+                    assert!(actor.check_auto_compact_needed().await.is_none());
+                }
+                assert!(abort_handle.is_finished());
+                assert!(!actor.compaction.prefire.is_in_flight());
+                assert!(!actor.compaction.prefire.has_cache());
+            }
+            assert!(actor.check_preflight_overflow().await.is_some());
+            assert!(actor.should_compact_on_error(&api_error_with_context_window(200_000)).await);
+        })
+        .await;
+}
+
+/// 切到较小窗口时，原生模式不会沿用客户端百分比阈值。
+#[tokio::test(flavor = "current_thread")]
+async fn responses_native_compaction_model_switch_skips_percentage() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let actor = Arc::new(create_test_actor(190_000, 200_000, 85, gateway_tx, persistence_tx).await);
+            let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            config.api_backend = ApiBackend::Responses;
+            config.responses_compact_threshold = std::num::NonZeroU64::new(160_000);
+            actor.chat_state_handle.update_sampling_config(config);
+            actor.compaction.previous_model.set(Some(crate::session::compaction_config::PreviousModelInfo {
+                model_slug: "previous".to_string(),
+                context_window: 300_000,
+            }));
+            actor.maybe_compact_on_model_switch().await.unwrap();
+            assert!(actor.compaction.previous_model.take().is_none());
+            assert_eq!(actor.compaction.count.load(Relaxed), 0);
+            assert_eq!(actor.chat_state_handle.get_total_tokens().await, 190_000);
+        })
+        .await;
+}
+
 /// Suppression gates both AUTO paths; the reset scope depends on the reason.
 /// `other` clears next turn, `credit_block` holds until a successful model call, `size` is sticky until a full reset (success/rewind/model switch).
 #[tokio::test(flavor = "current_thread")]
