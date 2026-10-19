@@ -2128,6 +2128,14 @@ impl SessionActor {
         if self.compaction.is_suppressed() {
             return false;
         }
+        if self.responses_native_compaction_enabled().await {
+            return !self.compaction.native_overflow_recovered.get()
+                && (xai_grok_sampling_types::is_context_length_error(&err.message)
+                    || matches!(err.error_code.as_ref(),
+                        Some(xai_grok_sampling_types::ApiErrorCode::ContextOverflow(code))
+                            if code.eq_ignore_ascii_case("context_length_exceeded")
+                                || code.eq_ignore_ascii_case("exceed_context_size_error")));
+        }
         self.estimate_exceeds_error_context_window(err).await
     }
     /// The request's token estimate exceeds the failed response's reported context window.
@@ -2216,9 +2224,9 @@ impl SessionActor {
         }
         None
     }
-    /// Returns `Some` when tool call outputs have pushed the estimated token count past the context window, so pre-emptive compaction is needed.
+    /// 原生模式在请求层完成投影后检查；旧模式保留工具输出后的提前保护。
     pub(crate) async fn check_preflight_overflow(&self) -> Option<AutoCompactTriggerInfo> {
-        if self.compaction.is_suppressed() {
+        if self.responses_native_compaction_enabled().await || self.compaction.is_suppressed() {
             return None;
         }
         let estimated_total = self.context_tokens_for_capacity().await;

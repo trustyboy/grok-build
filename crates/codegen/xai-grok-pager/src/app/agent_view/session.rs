@@ -1246,6 +1246,9 @@ impl AgentView {
         };
         match self.context_state.as_mut() {
             Some(snap) => {
+                if snap.used != used {
+                    snap.usage_estimated = None;
+                }
                 snap.used = used;
                 if total > 0 {
                     snap.total = total;

@@ -333,7 +333,9 @@ async fn responses_native_compaction_turn_snapshot() {
             let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
             config.api_backend = ApiBackend::Responses;
             config.responses_compact_threshold = std::num::NonZeroU64::new(160_000);
-            actor.chat_state_handle.update_sampling_config(config.clone());
+            actor
+                .chat_state_handle
+                .update_sampling_config(config.clone());
             let snapshot = actor.capture_turn_sampling_state().await;
             super::super::sampler_turn::TURN_SAMPLING_STATE
                 .scope(snapshot, async {
@@ -349,7 +351,9 @@ async fn responses_native_compaction_turn_snapshot() {
             let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
             config.api_backend = ApiBackend::Responses;
             config.responses_compact_threshold = std::num::NonZeroU64::new(160_000);
-            actor.chat_state_handle.update_sampling_config(config.clone());
+            actor
+                .chat_state_handle
+                .update_sampling_config(config.clone());
             let snapshot = actor.capture_turn_sampling_state().await;
             super::super::sampler_turn::TURN_SAMPLING_STATE
                 .scope(snapshot, async {
@@ -362,9 +366,9 @@ async fn responses_native_compaction_turn_snapshot() {
         .await;
 }
 
-/// 原生策略清理已启动的预压缩与缓存，但不关闭硬溢出保护。
+/// 原生策略清理预压缩缓存，由最终请求检查容量，并限制错误恢复次数。
 #[tokio::test(flavor = "current_thread")]
-async fn responses_native_compaction_cancels_prefire_keeps_hard_overflow() {
+async fn responses_native_compaction_defers_guard_and_bounds_recovery() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
@@ -379,13 +383,15 @@ async fn responses_native_compaction_cancels_prefire_keeps_hard_overflow() {
                 let worker = tokio::task::spawn_local(std::future::pending::<()>());
                 let abort_handle = worker.abort_handle();
                 actor.compaction.prefire.set_handle(worker);
-                actor.compaction.prefire.store(crate::session::compaction_config::AsyncCompactionCache {
-                    note1: "old summary".to_string(),
-                    prefix_len: 1,
-                    fingerprint: 1,
-                    model_slug: "test".to_string(),
-                    pass1_latency_ms: 0,
-                });
+                actor.compaction.prefire.store(
+                    crate::session::compaction_config::AsyncCompactionCache {
+                        note1: "old summary".to_string(),
+                        prefix_len: 1,
+                        fingerprint: 1,
+                        model_slug: "test".to_string(),
+                        pass1_latency_ms: 0,
+                    },
+                );
                 if check_prefire {
                     assert!(!actor.should_prefire_two_pass().await);
                 } else {
@@ -395,8 +401,17 @@ async fn responses_native_compaction_cancels_prefire_keeps_hard_overflow() {
                 assert!(!actor.compaction.prefire.is_in_flight());
                 assert!(!actor.compaction.prefire.has_cache());
             }
-            assert!(actor.check_preflight_overflow().await.is_some());
-            assert!(actor.should_compact_on_error(&api_error_with_context_window(200_000)).await);
+            assert!(actor.check_preflight_overflow().await.is_none());
+            let mut error = api_error_with_context_window(200_000);
+            error.message = "unrelated upstream failure".into();
+            assert!(!actor.should_compact_on_error(&error).await);
+            error.error_code = Some(xai_grok_sampling_types::ApiErrorCode::ContextOverflow(
+                "context_length_exceeded".into(),
+            ));
+            error.model_metadata = None;
+            assert!(actor.should_compact_on_error(&error).await);
+            actor.compaction.native_overflow_recovered.set(true);
+            assert!(!actor.should_compact_on_error(&error).await);
         })
         .await;
 }
@@ -408,15 +423,18 @@ async fn responses_native_compaction_model_switch_skips_percentage() {
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
-            let actor = Arc::new(create_test_actor(190_000, 200_000, 85, gateway_tx, persistence_tx).await);
+            let actor =
+                Arc::new(create_test_actor(190_000, 200_000, 85, gateway_tx, persistence_tx).await);
             let mut config = actor.chat_state_handle.get_sampling_config().await.unwrap();
             config.api_backend = ApiBackend::Responses;
             config.responses_compact_threshold = std::num::NonZeroU64::new(160_000);
             actor.chat_state_handle.update_sampling_config(config);
-            actor.compaction.previous_model.set(Some(crate::session::compaction_config::PreviousModelInfo {
-                model_slug: "previous".to_string(),
-                context_window: 300_000,
-            }));
+            actor.compaction.previous_model.set(Some(
+                crate::session::compaction_config::PreviousModelInfo {
+                    model_slug: "previous".to_string(),
+                    context_window: 300_000,
+                },
+            ));
             actor.maybe_compact_on_model_switch().await.unwrap();
             assert!(actor.compaction.previous_model.take().is_none());
             assert_eq!(actor.compaction.count.load(Relaxed), 0);

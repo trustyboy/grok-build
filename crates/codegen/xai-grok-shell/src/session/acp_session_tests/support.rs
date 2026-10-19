@@ -1289,6 +1289,7 @@ pub(crate) fn test_compaction_config(
 ) -> crate::session::compaction_config::CompactionConfig {
     crate::session::compaction_config::CompactionConfig {
         native_context: Default::default(),
+        native_overflow_recovered: Default::default(),
         threshold_percent: std::cell::Cell::new(threshold_percent),
         force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         context_window_override: None,

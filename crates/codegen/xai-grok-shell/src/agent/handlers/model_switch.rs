@@ -25,6 +25,15 @@ pub(crate) enum SwitchEffort {
     /// Use this effort; `None` falls back to the new model's default (session setup and restore).
     Set(Option<ReasoningEffort>),
 }
+/// 模型切换是否更新已有系统提示；恢复会话时保留持久化内容及显式覆盖。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchPrompt {
+    /// 用户切换模型时应用对应提示策略。
+    Update,
+    /// 内部恢复只重建模型配置，保留已有提示前缀。
+    Preserve,
+}
+
 /// Apply a model switch to a session (no gate; `set_session_model` gates first).
 pub(crate) async fn apply(
     agent: &MvpAgent,
@@ -32,6 +41,26 @@ pub(crate) async fn apply(
     effort: SwitchEffort,
     context_window: SwitchContextWindow,
     config_notice: ConfigNotice,
+) -> Result<acp::SetSessionModelResponse, acp::Error> {
+    apply_with_prompt_policy(
+        agent,
+        args,
+        effort,
+        context_window,
+        config_notice,
+        SwitchPrompt::Update,
+    )
+    .await
+}
+
+/// 显式区分模型切换与会话恢复，避免恢复时改写已压缩的历史前缀。
+pub(crate) async fn apply_with_prompt_policy(
+    agent: &MvpAgent,
+    args: acp::SetSessionModelRequest,
+    effort: SwitchEffort,
+    context_window: SwitchContextWindow,
+    config_notice: ConfigNotice,
+    prompt_policy: SwitchPrompt,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     xai_grok_telemetry::unified_log::info(
@@ -221,12 +250,13 @@ pub(crate) async fn apply(
     let gate_closed = !handle
         .gateway_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
-    let apply_prompt_override = !gate_closed;
-    if gate_closed {
+    let apply_prompt_override = !gate_closed && prompt_policy == SwitchPrompt::Update;
+    if !apply_prompt_override {
         tracing::info!(
             session_id = %session_id.0,
             model_id = %model_id.0,
-            "set_session_model: gateway gate closed, prompt override suppressed"
+            gate_closed,
+            "set_session_model: prompt override suppressed"
         );
         pending_rebuild_definition = None;
     }

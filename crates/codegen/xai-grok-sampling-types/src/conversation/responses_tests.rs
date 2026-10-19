@@ -1913,7 +1913,11 @@ fn responses_mcp_and_compaction_are_sdk_input_items() {
     let body = patched_history(response_to_conversation_items(raw_history_response(raw)));
     let input = body["input"].as_array().unwrap();
     assert_eq!(input.len(), 3);
-    assert!(input.iter().all(|item| item.get("type").and_then(|value| value.as_str()) != Some("compaction")));
+    assert!(
+        input
+            .iter()
+            .all(|item| item.get("type").and_then(|value| value.as_str()) != Some("compaction"))
+    );
     for item in input {
         assert!(item.get("output_only").is_none());
         serde_json::from_value::<rs::Item>(item.clone())
@@ -2236,4 +2240,939 @@ fn responses_checkpoint_tool_image_cleanup_invalidates_entire_chain() {
     assert!(!input.to_string().contains("base64"));
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[1]["type"], "function_call_output");
+}
+
+/// 构造已由客户端绑定来源和完整准备历史的响应。
+fn signed_context_response(
+    history: &ConversationRequest,
+    raw: serde_json::Value,
+    total_tokens: Option<u32>,
+) -> rs::Response {
+    let mut response = raw_history_response(raw);
+    let metadata = response.metadata.as_mut().unwrap();
+    metadata.insert(RESPONSE_SOURCE_METADATA_KEY.into(), "source".into());
+    metadata.insert(
+        RESPONSE_INPUT_FINGERPRINT_METADATA_KEY.into(),
+        responses_input_fingerprint(history, "source"),
+    );
+    response.usage = total_tokens.map(|tokens| {
+        serde_json::from_value(serde_json::json!({
+            "input_tokens": tokens, "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 0, "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": tokens
+        }))
+        .expect("response usage fixture")
+    });
+    response
+}
+
+/// 走完整签发和持久历史追加路径，不直接伪造内部记录。
+fn append_context_response(
+    history: &mut ConversationRequest,
+    raw: serde_json::Value,
+    context_tokens: Option<u64>,
+    total_tokens: Option<u32>,
+    tools: &serde_json::Value,
+) -> (ResponsesContextUsage, rs::Response) {
+    let mut response = signed_context_response(history, raw, total_tokens);
+    let usage = checkpoint_responses_context(
+        &mut response,
+        history,
+        "source",
+        tools,
+        context_tokens,
+        std::num::NonZeroU64::new(1_000).unwrap(),
+    )
+    .unwrap();
+    history
+        .items
+        .extend(response_to_conversation_items(response.clone()));
+    (usage, response)
+}
+
+/// 读取末尾响应记录，验证持久化结构而不是进程内状态。
+fn last_context_record(history: &ConversationRequest) -> &serde_json::Value {
+    let Some(ConversationItem::Assistant(assistant)) = history.items.last() else {
+        panic!()
+    };
+    assistant
+        .responses_output
+        .as_ref()
+        .unwrap()
+        .first()
+        .unwrap()
+        .get(RESPONSE_CONTEXT_CHECKPOINT_FIELD)
+        .unwrap()
+}
+
+#[test]
+fn responses_context_projection_matches_source_wrapper() {
+    let mut history = ConversationRequest::from_items(vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("old"),
+    ]);
+    append_checkpoint(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"opaque"},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]),
+        "source",
+    );
+    for source in [None, Some(""), Some("source"), Some("other")] {
+        let projection = project_responses_input(&history, source);
+        assert_eq!(
+            serde_json::json!(projection.input),
+            source_history(&history, source)
+        );
+        assert_eq!(
+            projection.checkpoint_key.is_some(),
+            source == Some("source")
+        );
+    }
+    let mut legacy = serde_json::json!({"model":"untouched"});
+    patch_responses_input(&mut legacy, &history);
+    assert_eq!(legacy["model"], "untouched");
+    assert!(!legacy["input"].to_string().contains("opaque"));
+}
+
+#[test]
+fn responses_context_checkpoint_survives_serde_and_estimates_appended_tail() {
+    let tools = serde_json::json!([]);
+    let mut history =
+        ConversationRequest::from_items(vec![ConversationItem::user("old".repeat(2_000))]);
+    let (usage, _) = append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"opaque"},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]),
+        Some(75),
+        Some(50_000),
+        &tools,
+    );
+    assert_eq!(
+        usage,
+        ResponsesContextUsage {
+            tokens: 75,
+            estimated: false
+        }
+    );
+    assert!(
+        last_context_record(&history)
+            .get("replacement_input")
+            .is_some()
+    );
+    history.items = serde_json::from_str(&serde_json::to_string(&history.items).unwrap()).unwrap();
+    let projection = project_responses_input(&history, Some("source"));
+    assert_eq!(responses_projection_context(&projection, &tools), usage);
+    assert!(
+        !serde_json::to_string(&projection.input)
+            .unwrap()
+            .contains("__grok_context")
+    );
+    history
+        .items
+        .push(ConversationItem::user("a new user message"));
+    let extended = project_responses_input(&history, Some("source"));
+    assert_eq!(extended.checkpoint_key, projection.checkpoint_key);
+    let extended_usage = responses_projection_context(&extended, &tools);
+    assert!(extended_usage.tokens > 75);
+    assert!(extended_usage.estimated);
+    assert!(history.items.len() > projection.input.len());
+}
+
+#[test]
+fn responses_context_normal_usage_calibrates_without_replacement_input() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"opaque"}
+        ]),
+        None,
+        Some(50_000),
+        &tools,
+    );
+    history.items.push(ConversationItem::user("next"));
+    let (usage, _) = append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"normal answer"}]}
+        ]),
+        None,
+        Some(123),
+        &tools,
+    );
+    assert_eq!(
+        usage,
+        ResponsesContextUsage {
+            tokens: 123,
+            estimated: false
+        }
+    );
+    let record = last_context_record(&history);
+    assert!(record.get("replacement_input").is_none());
+    assert!(record["checkpoint_key"].is_string());
+    history.items = serde_json::from_value(serde_json::to_value(&history.items).unwrap()).unwrap();
+    assert_eq!(
+        responses_projection_context(&project_responses_input(&history, Some("source")), &tools),
+        usage
+    );
+    let Some(ConversationItem::Assistant(assistant)) = history.items.last() else {
+        panic!()
+    };
+    assert_eq!(assistant_context_usage(assistant), Some(usage));
+}
+
+#[test]
+fn responses_context_details_override_normal_usage_and_missing_usage_is_estimated() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("task")]);
+    let (usage, _) = append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]),
+        Some(47),
+        Some(500),
+        &tools,
+    );
+    assert_eq!(
+        usage,
+        ResponsesContextUsage {
+            tokens: 47,
+            estimated: false
+        }
+    );
+    let (estimated, _) = append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"more"}]}
+        ]),
+        None,
+        None,
+        &tools,
+    );
+    assert!(estimated.estimated);
+    assert!(estimated.tokens > 47);
+}
+
+#[test]
+fn responses_context_source_history_and_sibling_changes_invalidate_records() {
+    let tools = serde_json::json!([]);
+    let mut history =
+        ConversationRequest::from_items(vec![ConversationItem::user("old".repeat(1_000))]);
+    append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"reasoning", "id":"r1", "summary":[], "encrypted_content":"reason"},
+            {"type":"compaction", "encrypted_content":"opaque"}
+        ]),
+        Some(1),
+        None,
+        &tools,
+    );
+    for source in [None, Some("other")] {
+        let projection = project_responses_input(&history, source);
+        assert!(projection.checkpoint_key.is_none());
+        let usage = responses_projection_context(&projection, &tools);
+        assert!(usage.estimated && usage.tokens > 1);
+    }
+    for change in ["prefix", "sibling", "same-length-prefix", "assistant"] {
+        let mut edited = history.clone();
+        match change {
+            "prefix" => {
+                edited.items.remove(0);
+            }
+            "same-length-prefix" => {
+                edited.items[0] = ConversationItem::user("new".repeat(1_000));
+            }
+            "sibling" => {
+                edited
+                    .items
+                    .retain(|item| !matches!(item, ConversationItem::Reasoning(_)));
+            }
+            "assistant" => {
+                let Some(ConversationItem::Assistant(assistant)) = edited.items.last_mut() else {
+                    panic!()
+                };
+                assistant.content = Arc::from("rewritten");
+            }
+            _ => unreachable!(),
+        }
+        let projection = project_responses_input(&edited, Some("source"));
+        assert!(projection.checkpoint_key.is_none(), "{change}");
+        assert!(
+            responses_projection_context(&projection, &tools).estimated,
+            "{change}"
+        );
+    }
+}
+
+#[test]
+fn responses_context_unsafe_new_boundary_cannot_commit_low_count() {
+    let tools = serde_json::json!([]);
+    let mut history =
+        ConversationRequest::from_items(vec![ConversationItem::user("old".repeat(1_000))]);
+    let (usage, _) = append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"function_call", "call_id":"c1", "name":"read_file", "arguments":"{}"},
+            {"type":"compaction", "encrypted_content":"unsafe"}
+        ]),
+        Some(1),
+        Some(1),
+        &tools,
+    );
+    assert!(usage.estimated && usage.tokens > 1);
+    assert!(
+        last_context_record(&history)
+            .get("replacement_input")
+            .is_none()
+    );
+    history
+        .items
+        .push(ConversationItem::tool_result("c1", "result"));
+    let projection = project_responses_input(&history, Some("source"));
+    assert!(projection.checkpoint_key.is_none());
+    assert!(
+        !serde_json::to_string(&projection.input)
+            .unwrap()
+            .contains("unsafe")
+    );
+}
+
+#[test]
+fn responses_context_pending_tool_tail_does_not_calibrate_full_history_with_compact_usage() {
+    let tools = serde_json::json!([]);
+    for context_tokens in [None, Some(17)] {
+        let mut history =
+            ConversationRequest::from_items(vec![ConversationItem::user("old".repeat(1_000))]);
+        append_context_response(
+            &mut history,
+            serde_json::json!([
+                {"type":"compaction", "encrypted_content":"safe"}
+            ]),
+            Some(100),
+            None,
+            &tools,
+        );
+        let (usage, _) = append_context_response(
+            &mut history,
+            serde_json::json!([
+                {"type":"function_call", "call_id":"c1", "name":"read_file", "arguments":"{}"}
+            ]),
+            context_tokens,
+            Some(1),
+            &tools,
+        );
+        let reported = ResponsesContextUsage {
+            tokens: context_tokens.unwrap_or(1),
+            estimated: false,
+        };
+        assert!(usage.estimated && usage.tokens > 1_000);
+        assert_eq!(
+            last_context_record(&history)["usage"]["tokens"],
+            usage.tokens
+        );
+        assert_eq!(
+            last_context_record(&history)["reported_usage"],
+            serde_json::json!(reported)
+        );
+        history.items =
+            serde_json::from_str(&serde_json::to_string(&history.items).unwrap()).unwrap();
+        let Some(ConversationItem::Assistant(assistant)) = history.items.last() else {
+            panic!()
+        };
+        assert_eq!(assistant_context_usage(assistant), Some(reported));
+        let pending = project_responses_input(&history, Some("source"));
+        assert!(pending.checkpoint_key.is_none());
+        assert_eq!(responses_projection_context(&pending, &tools), usage);
+
+        // 缺少新字段的旧记录仍返回原安全预算。
+        let mut legacy = history.clone();
+        let Some(ConversationItem::Assistant(assistant)) = legacy.items.last_mut() else {
+            panic!()
+        };
+        assistant
+            .responses_output
+            .as_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap()
+            .get_mut(RESPONSE_CONTEXT_CHECKPOINT_FIELD)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("reported_usage");
+        assert_eq!(assistant_context_usage(assistant), Some(usage));
+        assert_eq!(
+            responses_projection_context(&project_responses_input(&legacy, Some("source")), &tools),
+            usage
+        );
+
+        history
+            .items
+            .push(ConversationItem::tool_result("c1", "result"));
+        history.items =
+            serde_json::from_str(&serde_json::to_string(&history.items).unwrap()).unwrap();
+        let projection = project_responses_input(&history, Some("source"));
+        assert!(projection.checkpoint_key.is_some());
+        assert_eq!(
+            responses_projection_context(&projection, &tools),
+            ResponsesContextUsage {
+                tokens: 106,
+                estimated: true
+            },
+        );
+    }
+}
+
+#[test]
+fn responses_context_legacy_compaction_metadata_remains_source_bound() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    append_checkpoint(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"opaque", "__grok_context_tokens":41, "__grok_context_estimated":false}
+        ]),
+        "source",
+    );
+    let projection = project_responses_input(&history, Some("source"));
+    assert_eq!(
+        responses_projection_context(&projection, &tools),
+        ResponsesContextUsage {
+            tokens: 41,
+            estimated: false
+        }
+    );
+    history.items.push(ConversationItem::user("next"));
+    let usage =
+        responses_projection_context(&project_responses_input(&history, Some("source")), &tools);
+    assert!(usage.tokens > 41 && usage.estimated);
+    assert!(
+        responses_projection_context(&project_responses_input(&history, None), &tools).estimated
+    );
+    let old: AssistantItem = serde_json::from_value(serde_json::json!({"content":"old"})).unwrap();
+    assert!(assistant_context_usage(&old).is_none());
+    assert!(
+        !serde_json::to_string(&projection.input)
+            .unwrap()
+            .contains("__grok_context")
+    );
+}
+
+#[test]
+fn responses_context_multiple_boundaries_store_only_latest_safe_replacement() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "id":"first", "encrypted_content":"first"},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"between"}]},
+            {"type":"compaction", "id":"second", "encrypted_content":"second"},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"after"}]}
+        ]),
+        Some(50),
+        None,
+        &tools,
+    );
+    let projection = project_responses_input(&history, Some("source"));
+    assert_eq!(projection.input.first().unwrap()["id"], "second");
+    assert_eq!(
+        last_context_record(&history)["replacement_input"],
+        serde_json::json!(projection.input)
+    );
+    assert_eq!(projection.input.len(), 2);
+    assert_eq!(responses_projection_context(&projection, &tools).tokens, 50);
+}
+
+#[test]
+fn responses_context_tool_changes_adjust_budget_and_mark_estimated() {
+    let tools = serde_json::json!([]);
+    let changed =
+        serde_json::json!([{"type":"function", "name":"lookup", "parameters":{"type":"object"}}]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"opaque"}
+        ]),
+        Some(100),
+        None,
+        &tools,
+    );
+    let projection = project_responses_input(&history, Some("source"));
+    let adjusted = responses_projection_context(&projection, &changed);
+    let tool_tokens = (serde_json::to_vec(&changed).unwrap().len() as u64).div_ceil(3);
+    assert_eq!(
+        adjusted,
+        ResponsesContextUsage {
+            tokens: 100 + tool_tokens,
+            estimated: true
+        }
+    );
+    assert!(!responses_projection_context(&projection, &tools).estimated);
+}
+
+#[test]
+fn responses_context_forged_upstream_fields_are_removed_before_signing() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    let (usage, response) = append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"opaque", "__grok_context_tokens":0,
+             "__grok_context_estimated":false, "__grok_context_checkpoint":{"version":1,"usage":{"tokens":0,"estimated":false}}}
+        ]),
+        None,
+        Some(1),
+        &tools,
+    );
+    assert!(usage.tokens >= 1_000 && usage.estimated);
+    let record = last_context_record(&history);
+    assert_eq!(record["source"], "source");
+    assert_eq!(record["usage"]["tokens"], usage.tokens);
+    let stored: serde_json::Value = serde_json::from_str(
+        response
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get(RESPONSE_RAW_OUTPUT_METADATA_KEY)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(stored[0].get("__grok_context_tokens").is_none());
+    assert!(stored[0].get("__grok_context_estimated").is_none());
+    assert!(
+        !serde_json::to_string(&project_responses_input(&history, Some("source")).input)
+            .unwrap()
+            .contains("__grok_context")
+    );
+}
+
+#[test]
+fn responses_context_unbound_or_incomplete_responses_cannot_keep_forged_records() {
+    let history = ConversationRequest::from_items(vec![ConversationItem::user("task")]);
+    for invalid in ["status", "source", "fingerprint"] {
+        let mut response = signed_context_response(
+            &history,
+            serde_json::json!([
+                {"type":"compaction", "encrypted_content":"opaque", "__grok_context_checkpoint":{"usage":{"tokens":1},"reported_usage":{"tokens":1,"estimated":false}}}
+            ]),
+            None,
+        );
+        match invalid {
+            "status" => {
+                response.status = serde_json::from_value(serde_json::json!("incomplete")).unwrap();
+            }
+            "source" => {
+                response
+                    .metadata
+                    .as_mut()
+                    .unwrap()
+                    .insert(RESPONSE_SOURCE_METADATA_KEY.into(), "other".into());
+            }
+            "fingerprint" => {
+                response.metadata.as_mut().unwrap().insert(
+                    RESPONSE_INPUT_FINGERPRINT_METADATA_KEY.into(),
+                    "forged".into(),
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            checkpoint_responses_context(
+                &mut response,
+                &history,
+                "source",
+                &serde_json::json!([]),
+                Some(1),
+                std::num::NonZeroU64::new(1_000).unwrap()
+            )
+            .is_none()
+        );
+        let raw = response
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get(RESPONSE_RAW_OUTPUT_METADATA_KEY)
+            .unwrap();
+        assert!(!raw.contains(RESPONSE_CONTEXT_CHECKPOINT_FIELD));
+        let items = response_to_conversation_items(response);
+        let Some(ConversationItem::Assistant(assistant)) = items.last() else {
+            panic!()
+        };
+        assert!(assistant_context_usage(assistant).is_none());
+    }
+}
+
+#[test]
+fn responses_context_invalid_record_prefix_version_and_key_are_not_reused() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"opaque"}
+        ]),
+        Some(1),
+        None,
+        &tools,
+    );
+    for (field, value) in [
+        ("version", serde_json::json!(2)),
+        ("input_len", serde_json::json!(999_999)),
+        ("input_hash", serde_json::json!("forged")),
+        ("checkpoint_key", serde_json::json!("other")),
+        ("replacement_input", serde_json::json!([])),
+    ] {
+        let mut edited = history.clone();
+        let Some(ConversationItem::Assistant(assistant)) = edited.items.last_mut() else {
+            panic!()
+        };
+        let record = assistant
+            .responses_output
+            .as_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap()
+            .get_mut(RESPONSE_CONTEXT_CHECKPOINT_FIELD)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        record.insert(field.into(), value);
+        let usage =
+            responses_projection_context(&project_responses_input(&edited, Some("source")), &tools);
+        assert!(usage.estimated, "{field}");
+    }
+}
+
+#[test]
+fn responses_context_image_estimate_is_bounded_and_ciphertext_is_never_exact() {
+    let history = ConversationRequest::from_items(vec![ConversationItem::user_with_parts(vec![
+        ContentPart::Image {
+            url: Arc::from(format!("data:image/png;base64,{}", "a".repeat(100_000))),
+        },
+    ])]);
+    let projection = project_responses_input(&history, None);
+    let usage = responses_projection_context(&projection, &serde_json::json!([]));
+    assert!(usage.estimated && usage.tokens >= 1_024 && usage.tokens < 2_000);
+    let mut history = ConversationRequest::from_items(vec![]);
+    append_checkpoint(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"a".repeat(1_000)}
+        ]),
+        "source",
+    );
+    assert!(
+        responses_projection_context(
+            &project_responses_input(&history, Some("source")),
+            &serde_json::json!([])
+        )
+        .estimated
+    );
+}
+
+#[test]
+fn responses_context_empty_output_and_response_reader_keep_calibration() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("task")]);
+    let (usage, response) =
+        append_context_response(&mut history, serde_json::json!([]), None, Some(64), &tools);
+    let mut converted = ConversationResponse {
+        items: response_to_conversation_items(response.clone()),
+        stop_reason: Some(StopReason::Stop),
+        usage: None,
+        cost_usd_ticks: None,
+        message_chunks_emitted: 0,
+        doom_loop_signals: Vec::new(),
+        stop_message: None,
+        message_id: None,
+        raw_stop_reason: None,
+        stop_sequence: None,
+    };
+    assert_eq!(response_context_usage(&converted), Some(usage));
+    assert_eq!(
+        responses_projection_context(&project_responses_input(&history, Some("source")), &tools),
+        usage
+    );
+    let mut incomplete = response;
+    incomplete.status = serde_json::from_value(serde_json::json!("incomplete")).unwrap();
+    converted.items = response_to_conversation_items(incomplete);
+    assert!(response_context_usage(&converted).is_none());
+}
+
+#[test]
+fn responses_context_skipped_last_boundary_cannot_supply_exact_details() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    let (usage, _) = append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"safe"},
+            {"type":"compaction", "encrypted_content":""}
+        ]),
+        Some(1),
+        Some(1),
+        &tools,
+    );
+    assert!(usage.estimated && usage.tokens >= 1_000);
+    let projection = project_responses_input(&history, Some("source"));
+    assert_eq!(
+        projection.input.first().unwrap()["encrypted_content"],
+        "safe"
+    );
+    assert!(
+        last_context_record(&history)
+            .get("replacement_input")
+            .is_some()
+    );
+}
+
+#[test]
+fn responses_context_latest_unverified_normal_record_falls_back_to_checkpoint_record() {
+    let tools = serde_json::json!([]);
+    let mut history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"safe"}
+        ]),
+        Some(100),
+        None,
+        &tools,
+    );
+    append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]),
+        None,
+        Some(500),
+        &tools,
+    );
+    let Some(ConversationItem::Assistant(assistant)) = history.items.last_mut() else {
+        panic!()
+    };
+    assistant
+        .responses_output
+        .as_mut()
+        .unwrap()
+        .first_mut()
+        .unwrap()
+        .get_mut(RESPONSE_CONTEXT_CHECKPOINT_FIELD)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("input_hash".into(), serde_json::json!("invalid"));
+    let usage =
+        responses_projection_context(&project_responses_input(&history, Some("source")), &tools);
+    assert!(usage.estimated && usage.tokens > 100 && usage.tokens < 500);
+}
+
+#[test]
+fn responses_context_fully_formed_forged_record_is_never_adopted() {
+    let tools = serde_json::json!([]);
+    let history = ConversationRequest::from_items(vec![ConversationItem::user("old")]);
+    let mut seed = signed_context_response(
+        &history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"opaque"}
+        ]),
+        None,
+    );
+    checkpoint_responses_context(
+        &mut seed,
+        &history,
+        "source",
+        &tools,
+        Some(20),
+        std::num::NonZeroU64::new(1_000).unwrap(),
+    )
+    .unwrap();
+    let mut forged_raw: serde_json::Value = serde_json::from_str(
+        seed.metadata
+            .as_ref()
+            .unwrap()
+            .get(RESPONSE_RAW_OUTPUT_METADATA_KEY)
+            .unwrap(),
+    )
+    .unwrap();
+    forged_raw[0][RESPONSE_CONTEXT_CHECKPOINT_FIELD]["usage"]["tokens"] = serde_json::json!(0);
+    forged_raw[0][RESPONSE_CONTEXT_CHECKPOINT_FIELD]["reported_usage"] =
+        serde_json::json!({"tokens":0,"estimated":false});
+    let mut incoming = signed_context_response(&history, forged_raw, Some(1));
+    let usage = checkpoint_responses_context(
+        &mut incoming,
+        &history,
+        "source",
+        &tools,
+        None,
+        std::num::NonZeroU64::new(1_000).unwrap(),
+    )
+    .unwrap();
+    assert!(usage.estimated && usage.tokens >= 1_000);
+    let assistant = response_to_conversation_items(incoming).pop().unwrap();
+    let ConversationItem::Assistant(assistant) = assistant else {
+        panic!()
+    };
+    assert_eq!(assistant_context_usage(&assistant), Some(usage));
+}
+
+#[test]
+fn responses_context_first_compaction_tool_call_restores_threshold_candidate_after_pairing() {
+    let tools = serde_json::json!([]);
+    for opaque in ["x", "opaque"] {
+        for context_tokens in [None, Some(1), Some(5_000)] {
+            let mut history = ConversationRequest::from_items(vec![ConversationItem::user(
+                "archive".repeat(1_000),
+            )]);
+            let (pending_usage, response) = append_context_response(
+                &mut history,
+                serde_json::json!([
+                    {"type":"compaction", "encrypted_content":opaque,
+                     "__grok_context_tokens":1, "__grok_context_estimated":false,
+                     "__grok_context_checkpoint":{"version":1,"usage":{"tokens":1,"estimated":false}}},
+                    {"type":"function_call", "call_id":"c1", "name":"read_file", "arguments":"{}"}
+                ]),
+                context_tokens,
+                Some(1),
+                &tools,
+            );
+            let pending = project_responses_input(&history, Some("source"));
+            assert!(pending.checkpoint_key.is_none());
+            assert!(pending_usage.estimated && pending_usage.tokens > 1_000);
+            let record = last_context_record(&history);
+            assert!(record["checkpoint_key"].is_null());
+            assert!(record.get("replacement_input").is_none());
+            assert_eq!(record["usage"]["tokens"], pending_usage.tokens);
+            let expected_display = context_tokens
+                .map(|tokens| ResponsesContextUsage {
+                    tokens,
+                    estimated: false,
+                })
+                .unwrap_or(pending_usage);
+            if context_tokens.is_none() {
+                assert!(record.get("reported_usage").is_none());
+            } else {
+                assert_eq!(
+                    record["reported_usage"],
+                    serde_json::json!(expected_display)
+                );
+            }
+            let Some(ConversationItem::Assistant(assistant)) = history.items.last() else {
+                panic!()
+            };
+            assert_eq!(assistant_context_usage(assistant), Some(expected_display));
+            assert_eq!(
+                responses_projection_context(&pending, &tools),
+                pending_usage
+            );
+            let raw: serde_json::Value = serde_json::from_str(
+                response
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .get(RESPONSE_RAW_OUTPUT_METADATA_KEY)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(raw[0]["__grok_context_tokens"], 1_000);
+            assert_eq!(raw[0]["__grok_context_estimated"], true);
+            assert_eq!(
+                raw[0][RESPONSE_CONTEXT_CHECKPOINT_FIELD]["source"],
+                "source"
+            );
+
+            // 先恢复待执行工具的历史，再追加真实结果并再次恢复。
+            history.items =
+                serde_json::from_str(&serde_json::to_string(&history.items).unwrap()).unwrap();
+            assert!(
+                project_responses_input(&history, Some("source"))
+                    .checkpoint_key
+                    .is_none()
+            );
+            history
+                .items
+                .push(ConversationItem::tool_result("c1", "result"));
+            history.items =
+                serde_json::from_str(&serde_json::to_string(&history.items).unwrap()).unwrap();
+            let paired = project_responses_input(&history, Some("source"));
+            assert!(paired.checkpoint_key.is_some());
+            assert_eq!(paired.input.len(), 3);
+            assert_eq!(paired.input.first().unwrap()["encrypted_content"], opaque);
+            // threshold 1000 + read_file 3 + {} 1 + result 2；不累计 archive 或 context_details 尾部。
+            assert_eq!(
+                responses_projection_context(&paired, &tools),
+                ResponsesContextUsage {
+                    tokens: 1_006,
+                    estimated: true
+                },
+            );
+            assert!(
+                !serde_json::to_string(&paired.input)
+                    .unwrap()
+                    .contains("__grok_context")
+            );
+            assert!(
+                project_responses_input(&history, None)
+                    .checkpoint_key
+                    .is_none()
+            );
+            assert!(
+                project_responses_input(&history, Some("other"))
+                    .checkpoint_key
+                    .is_none()
+            );
+            history.items[0] = ConversationItem::user("modified archive");
+            assert!(
+                project_responses_input(&history, Some("source"))
+                    .checkpoint_key
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn responses_context_pending_candidate_waits_for_all_real_tool_results() {
+    let tools = serde_json::json!([]);
+    let mut history =
+        ConversationRequest::from_items(vec![ConversationItem::user("archive".repeat(1_000))]);
+    append_context_response(
+        &mut history,
+        serde_json::json!([
+            {"type":"compaction", "encrypted_content":"x", "__grok_context_tokens":999_999},
+            {"type":"function_call", "call_id":"c1", "name":"read_file", "arguments":"{}"},
+            {"type":"function_call", "call_id":"c2", "name":"read_file", "arguments":"{}"}
+        ]),
+        Some(1),
+        Some(1),
+        &tools,
+    );
+    history
+        .items
+        .push(ConversationItem::tool_result("c1", "result"));
+    let partial = project_responses_input(&history, Some("source"));
+    assert!(partial.checkpoint_key.is_none());
+    assert!(responses_projection_context(&partial, &tools).tokens > 1_000);
+    history
+        .items
+        .push(ConversationItem::tool_result("c2", "result"));
+    history.items = serde_json::from_str(&serde_json::to_string(&history.items).unwrap()).unwrap();
+    let complete = project_responses_input(&history, Some("source"));
+    assert!(complete.checkpoint_key.is_some());
+    assert_eq!(
+        responses_projection_context(&complete, &tools),
+        ResponsesContextUsage {
+            tokens: 1_012,
+            estimated: true
+        },
+    );
 }

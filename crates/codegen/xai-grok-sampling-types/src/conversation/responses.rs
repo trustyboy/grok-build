@@ -1,5 +1,13 @@
 use super::*;
 
+#[path = "responses_context.rs"]
+mod context;
+pub use context::{
+    RESPONSE_CONTEXT_CHECKPOINT_FIELD, ResponsesContextUsage, ResponsesInputProjection,
+    assistant_context_usage, checkpoint_responses_context, response_context_usage,
+    responses_projection_context,
+};
+
 /// 流适配器通过 metadata 传递完整 output 数组的 JSON 字符串。
 pub const RESPONSE_RAW_OUTPUT_METADATA_KEY: &str = "__grok_responses_raw_output";
 /// 客户端覆盖的来源哈希；不得直接信任上游 metadata。
@@ -295,7 +303,8 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
 
 /// 序列化后恢复 Responses 历史；不影响其他请求字段及跨协议转换。
 pub fn patch_responses_input(body: &mut serde_json::Value, req: &ConversationRequest) {
-    patch_responses_history(body, req, None, true);
+    let projection = project_responses_history(req, None, true);
+    apply_responses_projection(body, projection);
 }
 
 /// 仅启用且来源、完整本地前缀均匹配时重放最新安全压缩点。
@@ -305,7 +314,7 @@ pub fn patch_responses_input_for_source(
     req: &ConversationRequest,
     source: Option<&str>,
 ) {
-    patch_responses_history(body, req, source.filter(|s| !s.is_empty()), false);
+    apply_responses_projection(body, project_responses_input(req, source));
 }
 
 /// 检查裁剪边界两侧是否产生孤立调用或结果。
@@ -358,14 +367,14 @@ fn responses_owned_sibling(entry: &serde_json::Value) -> bool {
 }
 
 /// 原始历史兼容投影与来源校验共用排序逻辑。
-fn patch_responses_history(
-    body: &mut serde_json::Value,
+fn project_responses_history(
     req: &ConversationRequest,
     source: Option<&str>,
     legacy: bool,
-) {
+) -> ResponsesInputProjection {
     let mut input = Vec::new();
     let mut checkpoints = Vec::new();
+    let mut records = Vec::new();
     let mut siblings = Vec::new();
     let mut sibling_start = None;
     for (index, item) in req.items.iter().enumerate() {
@@ -398,6 +407,9 @@ fn patch_responses_history(
                         )
                     && responses_siblings_match(raw, &siblings)
             });
+            if valid_checkpoint && let Some(record) = context::assistant_record(assistant) {
+                records.push(record);
+            }
             if !legacy
                 && !valid_checkpoint
                 && raw
@@ -416,7 +428,7 @@ fn patch_responses_history(
             // 原有 sibling 是裁剪后的权威数据；原始输出只恢复其顺序。
             let mut replay = Vec::new();
             let mut replay_checkpoints = Vec::new();
-            for entry in raw {
+            for (raw_index, entry) in raw.iter().enumerate() {
                 let kind = entry.get("type").and_then(|v| v.as_str());
                 let owned_sibling = matches!(
                     kind,
@@ -438,7 +450,14 @@ fn patch_responses_history(
                     }
                 } else if kind == Some("compaction") {
                     if valid_checkpoint && let Some(item) = responses_output_to_input(entry) {
-                        replay_checkpoints.push(replay.len());
+                        let key = context::checkpoint_key(
+                            source.unwrap_or_default(),
+                            assistant,
+                            raw_index,
+                            &item,
+                        );
+                        let old_usage = context::legacy_context_usage(entry);
+                        replay_checkpoints.push((replay.len(), key, index, raw_index, old_usage));
                         replay.push(item);
                     }
                 } else if let Some(item) = responses_output_to_input(entry) {
@@ -446,11 +465,11 @@ fn patch_responses_history(
                 }
             }
             input.append(&mut siblings);
-            checkpoints.extend(
-                replay_checkpoints
-                    .into_iter()
-                    .map(|offset| input.len() + offset),
-            );
+            checkpoints.extend(replay_checkpoints.into_iter().map(
+                |(offset, key, owner, raw_index, usage)| {
+                    (input.len() + offset, key, owner, raw_index, usage)
+                },
+            ));
             input.append(&mut replay);
         } else {
             input.append(&mut siblings);
@@ -467,7 +486,12 @@ fn patch_responses_history(
     let is_compaction =
         |item: &serde_json::Value| item.get("type").and_then(|v| v.as_str()) == Some("compaction");
     let mut selected = None;
-    for boundary in checkpoints.into_iter().rev() {
+    let mut checkpoint_key = None;
+    let mut selected_assistant = None;
+    let mut selected_raw_index = None;
+    let mut legacy_usage = None;
+    let mut checkpoint_tail_start = None;
+    for (boundary, key, owner, raw_index, usage) in checkpoints.into_iter().rev() {
         let prefix: Vec<_> = input[..boundary]
             .iter()
             .filter(|item| !is_compaction(item))
@@ -485,7 +509,12 @@ fn patch_responses_history(
                 .filter(|item| item.get("role").and_then(|v| v.as_str()) == Some("system"))
                 .cloned()
                 .collect();
+            checkpoint_tail_start = Some(projected.len() + 1);
             projected.extend(suffix);
+            checkpoint_key = Some(key);
+            selected_assistant = Some(owner);
+            selected_raw_index = Some(raw_index);
+            legacy_usage = usage;
             selected = Some(projected);
             break;
         }
@@ -495,10 +524,39 @@ fn patch_responses_history(
     } else {
         input.retain(|item| !is_compaction(item));
     }
-    if let Some(object) = body.as_object_mut() {
-        object.insert("input".into(), serde_json::Value::Array(input));
+    let mut body = serde_json::json!({"input": input});
+    patch_reasoning_text_types(&mut body);
+    context::clear_context_fields(&mut body);
+    let input = body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    ResponsesInputProjection {
+        input,
+        checkpoint_key,
+        source: source.map(str::to_owned),
+        records,
+        selected_assistant,
+        selected_raw_index,
+        legacy_usage,
+        checkpoint_tail_start,
     }
-    patch_reasoning_text_types(body);
+}
+
+/// 对完整准备历史求有效投影；不修改通用历史或请求的其他字段。
+pub fn project_responses_input(
+    req: &ConversationRequest,
+    source: Option<&str>,
+) -> ResponsesInputProjection {
+    project_responses_history(req, source.filter(|s| !s.is_empty()), false)
+}
+
+/// 旧补丁入口与纯投影共用同一份合法 input。
+fn apply_responses_projection(body: &mut serde_json::Value, projection: ResponsesInputProjection) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert("input".into(), serde_json::Value::Array(projection.input));
+    }
 }
 
 /// 只放行已知输入类型；原始未知数据只持久化，不猜测协议语义。
@@ -563,6 +621,7 @@ fn responses_output_to_input(raw: &serde_json::Value) -> Option<serde_json::Valu
         | "mcp_approval_request" => {
             // SDK 输入模型负责过滤输出专用及未知字段。
             let mut value = raw.clone();
+            context::clear_context_fields(&mut value);
             if kind == "reasoning" {
                 value.as_object_mut()?.remove("status");
             }
@@ -575,7 +634,9 @@ fn responses_output_to_input(raw: &serde_json::Value) -> Option<serde_json::Valu
                 .and_then(Value::as_str)
                 .is_some_and(is_responses_x_search_tool) =>
         {
-            serde_json::from_value::<rs::Item>(raw.clone())
+            let mut value = raw.clone();
+            context::clear_context_fields(&mut value);
+            serde_json::from_value::<rs::Item>(value)
                 .ok()
                 .and_then(|item| serde_json::to_value(item).ok())
         }

@@ -683,6 +683,11 @@ impl SessionActor {
                 free_tokens,
                 usage_pct,
                 auto_compact_threshold_percent: self.compaction.threshold_percent.get(),
+                responses_compact_threshold: config
+                    .as_ref()
+                    .and_then(|config| config.effective_responses_compact_threshold())
+                    .map(|threshold| threshold.get()),
+                usage_estimated: self.native_context_is_estimated().await,
                 usage_categories,
             },
         }

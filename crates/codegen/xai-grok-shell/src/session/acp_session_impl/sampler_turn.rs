@@ -1424,12 +1424,22 @@ impl SessionActor {
         // Genuine overflows already completed truncated in the quiet arm above
         // The remaining mid-salvage kinds (rate limit) take their terminal arms below
         if !mid_salvage_continuation && self.should_compact_on_error(&error).await {
-            // SAFETY: `should_compact_on_error` returned true only when `model_metadata.context_window` was Some(>0)
+            let native = self.responses_native_compaction_enabled().await;
+            let configured_window = self
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .map(|config| config.context_window.get());
             let cw = error
                 .model_metadata
                 .as_ref()
                 .and_then(|m| m.context_window)
-                .expect("should_compact_on_error guarantees context_window");
+                .filter(|window| *window > 0)
+                .or_else(|| native.then_some(configured_window).flatten())
+                .expect("compaction recovery requires a known context window");
+            if native {
+                self.compaction.native_overflow_recovered.set(true);
+            }
             {
                 let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
                 let percentage = xai_token_estimation::usage_percentage_u8(total_tokens, cw);
@@ -1449,7 +1459,8 @@ impl SessionActor {
                     percentage,
                     reason_override: None,
                 };
-                if let Err(e) = self.run_compact_only(trigger_info, false).await {
+                // 原生点失效后，先把归档历史限制到摘要预算内再重试一次。
+                if let Err(e) = self.run_compact_only(trigger_info, native).await {
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
                     }
@@ -2406,7 +2417,10 @@ impl SessionActor {
                     current.model != snapshot.model
                         || current.base_url != snapshot.base_url
                         || current.api_backend != snapshot.api_backend
-                }) => Some(snapshot),
+                }) =>
+            {
+                Some(snapshot)
+            }
             _ => current.as_ref(),
         };
         config.is_some_and(|config| {
@@ -2417,7 +2431,7 @@ impl SessionActor {
         })
     }
 
-    /// 只消费完整成功响应中由客户端绑定来源的最后一个压缩项。
+    /// 原生计数只接受请求层在完整成功响应上签发的上下文记录。
     pub(crate) async fn response_native_context(
         &self,
         response: &ConversationResponse,
@@ -2425,20 +2439,8 @@ impl SessionActor {
         if !self.responses_native_compaction_enabled().await {
             return None;
         }
-        for item in response.items.iter().rev() {
-            let ConversationItem::Assistant(assistant) = item else { continue };
-            let Some(raw) = assistant.responses_output.as_ref() else { continue };
-            let Some(compaction) = raw.iter().rev().find(|item| {
-                item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
-            }) else { continue };
-            assistant.responses_source.as_deref().filter(|source| !source.is_empty())?;
-            compaction.get("encrypted_content")?.as_str().filter(|value| !value.is_empty())?;
-            return Some((
-                compaction.get("__grok_context_tokens")?.as_u64()?,
-                compaction.get("__grok_context_estimated")?.as_bool()?,
-            ));
-        }
-        None
+        xai_grok_sampling_types::response_context_usage(response)
+            .map(|usage| (usage.tokens, usage.estimated))
     }
 
     /// 摘要仅留在内存，用于发现模型、连接、凭据及环境认证变化。
@@ -2446,8 +2448,13 @@ impl SessionActor {
         let current = self.chat_state_handle.get_sampling_config().await;
         let snapshot = TURN_SAMPLING_STATE.try_with(Clone::clone).ok();
         let crossed = snapshot.as_ref().is_some_and(|state| {
-            state.config.as_ref().map(|cfg| (&cfg.model, &cfg.base_url, &cfg.api_backend))
-                != current.as_ref().map(|cfg| (&cfg.model, &cfg.base_url, &cfg.api_backend))
+            state
+                .config
+                .as_ref()
+                .map(|cfg| (&cfg.model, &cfg.base_url, &cfg.api_backend))
+                != current
+                    .as_ref()
+                    .map(|cfg| (&cfg.model, &cfg.base_url, &cfg.api_backend))
         });
         let (config, credentials) = if crossed {
             let state = snapshot.expect("crossed requires a snapshot");
@@ -2455,111 +2462,121 @@ impl SessionActor {
         } else {
             (current, self.chat_state_handle.get_credentials().await)
         };
-        let env: Vec<_> = config.as_ref().into_iter().flat_map(|cfg| cfg.env_http_headers.iter())
-            .map(|(header, name)| (header, std::env::var(name).ok())).collect();
+        let env: Vec<_> = config
+            .as_ref()
+            .into_iter()
+            .flat_map(|cfg| cfg.env_http_headers.iter())
+            .map(|(header, name)| (header, std::env::var(name).ok()))
+            .collect();
         let bytes = serde_json::to_vec(&(&config, &credentials, env))
             .expect("sampling config and credentials are serializable");
         blake3::hash(&bytes).to_hex().to_string()
     }
 
-    /// 响应入历史后再固定基线，避免后续工具输出或 raw 密文被重复计数。
+    /// 响应入历史后固定显示来源；可恢复检查点已随响应持久化。
     pub(crate) async fn commit_response_native_context(&self, context: Option<(u64, bool)>) {
-        let Some((tokens, estimated)) = context else { return };
+        let Some((tokens, estimated)) = context else {
+            return;
+        };
         let identity = self.native_context_identity().await;
         let conversation = self.chat_state_handle.get_conversation().await;
-        let checkpoint = conversation.iter().rev().find_map(|item| {
-            let ConversationItem::Assistant(assistant) = item else { return None };
-            let raw = assistant.responses_output.as_ref()?;
-            let item = raw.iter().rev().find(|item| {
-                item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
-            })?;
-            Some((assistant.responses_source.as_deref()?, item.get("encrypted_content")?.as_str()?))
+        let compacted = conversation.last().is_some_and(|item| {
+            matches!(item, ConversationItem::Assistant(assistant)
+            if assistant.responses_output.as_ref().is_some_and(|raw| raw.iter().any(|entry| {
+                entry.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+            })))
         });
-        let Some((source, encrypted)) = checkpoint else { return };
-        let checkpoint_hash = blake3::hash(encrypted.as_bytes()).to_hex().to_string();
+        let calibrated = self
+            .compaction
+            .native_context
+            .borrow()
+            .as_ref()
+            .is_some_and(|baseline| baseline.estimated && !estimated);
         let bytes = serde_json::to_vec(&conversation).expect("conversation is serializable");
         self.compaction.native_context.replace(Some(
             crate::session::compaction_config::NativeContextBaseline {
                 identity,
-                source: source.to_owned(),
-                checkpoint_hash,
+                tokens,
+                estimated,
                 prefix_len: conversation.len(),
                 prefix_hash: blake3::hash(&bytes).to_hex().to_string(),
             },
         ));
         self.chat_state_handle.record_token_usage(tokens);
-        self.send_xai_notification(XaiSessionUpdate::HookAnnotation {
-            message: if estimated {
+        let message = if compacted {
+            Some(if estimated {
                 "服务端压缩完成；上下文用量为估算值"
             } else {
                 "服务端压缩完成；上下文用量采用服务端报告值"
-            }.to_string(),
-            kind: Default::default(),
-        }).await;
+            })
+        } else if calibrated {
+            Some("上下文用量已使用服务端报告值校准")
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            self.send_xai_notification(XaiSessionUpdate::HookAnnotation {
+                message: message.to_owned(),
+                kind: Default::default(),
+            })
+            .await;
+        }
     }
 
-    /// 硬容量检查只复用同来源、未改写历史的基线；失效时使用通用历史保护。
+    /// 显示计数来源；新增未发送内容仍属于估算，历史或认证改变后清除来源。
+    pub(crate) async fn native_context_is_estimated(&self) -> Option<bool> {
+        if !self.responses_native_compaction_enabled().await {
+            return None;
+        }
+        let identity = self.native_context_identity().await;
+        let conversation = self.chat_state_handle.get_conversation().await;
+        let tracked = self.chat_state_handle.get_estimated_total_tokens().await;
+        let baseline = self.compaction.native_context.borrow();
+        let baseline = baseline.as_ref()?;
+        if baseline.identity != identity {
+            return None;
+        }
+        let prefix = conversation.get(..baseline.prefix_len)?;
+        let bytes = serde_json::to_vec(prefix).expect("conversation is serializable");
+        if blake3::hash(&bytes).to_hex().as_str() != baseline.prefix_hash {
+            return None;
+        }
+        Some(baseline.estimated || tracked != baseline.tokens)
+    }
+
+    /// 原生请求由发送层按最终 input 检查；旧模式继续使用完整通用历史保护。
     pub(crate) async fn context_tokens_for_capacity(&self) -> u64 {
         let tracked = self.chat_state_handle.get_estimated_total_tokens().await;
-        let native = self.responses_native_compaction_enabled().await;
-        let identity = self.native_context_identity().await;
-        let mut conversation = self.chat_state_handle.get_conversation().await;
-        let valid = self.compaction.native_context.borrow().as_ref().is_some_and(|baseline| {
-            native && baseline.identity == identity
-                && conversation.get(..baseline.prefix_len).is_some_and(|prefix| {
-                    let bytes = serde_json::to_vec(prefix).expect("conversation is serializable");
-                    blake3::hash(&bytes).to_hex().as_str() == baseline.prefix_hash
-                })
-        });
-        if valid {
-            let baseline = self.compaction.native_context.borrow();
-            let baseline = baseline.as_ref().expect("validated baseline");
-            let mut projected = serde_json::json!({});
-            xai_grok_sampling_types::patch_responses_input_for_source(
-                &mut projected,
-                &xai_grok_sampling_types::ConversationRequest {
-                    items: conversation.clone(),
-                    ..Default::default()
-                },
-                Some(&baseline.source),
-            );
-            let retained = projected.get("input").and_then(serde_json::Value::as_array).is_some_and(|items| {
-                items.iter().any(|item| {
-                    item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
-                        && item.get("encrypted_content").and_then(serde_json::Value::as_str).is_some_and(|value| {
-                            blake3::hash(value.as_bytes()).to_hex().as_str() == baseline.checkpoint_hash
-                        })
-                })
-            });
-            if retained {
-                return tracked;
-            }
-        }
-        let had_baseline = self.compaction.native_context.borrow_mut().take().is_some();
-        let mut has_compaction = false;
-        for item in &mut conversation {
-            if let ConversationItem::Assistant(assistant) = item
-                && assistant.responses_output.as_ref().is_some_and(|raw| raw.iter().any(|entry| {
-                    entry.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
-                }))
-            {
-                has_compaction = true;
-                assistant.responses_output = None;
-            }
-        }
-        if !native && !had_baseline && !has_compaction {
+        if self.responses_native_compaction_enabled().await {
             return tracked;
         }
-        let full_history = xai_chat_state::estimate_conversation_tokens(&conversation);
-        let tokens = if had_baseline || has_compaction {
-            full_history
-        } else {
-            tracked.max(full_history)
-        };
-        if had_baseline || has_compaction {
-            // 清除旧基线的增量锚点，模型切换和恢复不能保留过小的压缩计数。
-            self.chat_state_handle.record_token_usage(tokens);
+        let had_baseline = self.compaction.native_context.borrow_mut().take().is_some();
+        let mut conversation = self.chat_state_handle.get_conversation().await;
+        let mut has_compaction = false;
+        for item in &mut conversation {
+            if let ConversationItem::Assistant(assistant) = item {
+                if assistant.responses_output.as_ref().is_some_and(|raw| {
+                    raw.iter().any(|entry| {
+                        entry.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+                    })
+                }) {
+                    has_compaction = true;
+                    assistant.responses_output = None;
+                } else if let Some(raw) = assistant.responses_output.as_mut() {
+                    for entry in raw {
+                        if let Some(entry) = entry.as_object_mut() {
+                            entry
+                                .remove(xai_grok_sampling_types::RESPONSE_CONTEXT_CHECKPOINT_FIELD);
+                        }
+                    }
+                }
+            }
         }
+        if !had_baseline && !has_compaction {
+            return tracked;
+        }
+        let tokens = xai_chat_state::estimate_conversation_tokens(&conversation);
+        self.chat_state_handle.record_token_usage(tokens);
         tokens
     }
 
@@ -2572,9 +2589,12 @@ impl SessionActor {
         api_duration_ms: Option<u64>,
     ) {
         let context = self.response_native_context(response).await;
-        if let Some(tokens) = context.map(|(tokens, _)| tokens)
-            .or_else(|| response.usage.as_ref().map(|usage| u64::from(usage.total_tokens)))
-        {
+        if let Some(tokens) = context.map(|(tokens, _)| tokens).or_else(|| {
+            response
+                .usage
+                .as_ref()
+                .map(|usage| u64::from(usage.total_tokens))
+        }) {
             self.chat_state_handle.record_token_usage(tokens);
         }
         if let Some(ref u) = response.usage {

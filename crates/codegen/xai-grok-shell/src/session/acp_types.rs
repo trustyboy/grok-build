@@ -480,6 +480,12 @@ pub struct ContextInfo {
     /// Used by the TUI `/context` view so the displayed “Auto-compact at X%” matches the actual trigger (e.g. 65 for grok-build in remote settings).
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold_percent: u8,
+    /// 原生压缩有效阈值；缺省时展示旧客户端压缩策略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responses_compact_threshold: Option<u64>,
+    /// 当前原生上下文计数是否包含估算；旧模式或未验证时缺省。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_estimated: Option<bool>,
     /// Itemized usage rows (skills, workflows, MCP servers, AGENTS.md).
     /// Empty on partial snapshots.
     #[serde(skip_serializing_if = "Vec::is_empty")]

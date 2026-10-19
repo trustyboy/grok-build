@@ -10,10 +10,13 @@ mod responses;
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
 pub use responses::{
-    RESPONSE_INPUT_FINGERPRINT_METADATA_KEY, RESPONSE_RAW_OUTPUT_METADATA_KEY,
-    RESPONSE_SOURCE_METADATA_KEY, extra_tool_entries, is_responses_x_search_tool,
-    patch_reasoning_text_types, patch_responses_input, patch_responses_input_for_source,
-    response_to_conversation_items, responses_input_fingerprint,
+    RESPONSE_CONTEXT_CHECKPOINT_FIELD, RESPONSE_INPUT_FINGERPRINT_METADATA_KEY,
+    RESPONSE_RAW_OUTPUT_METADATA_KEY, RESPONSE_SOURCE_METADATA_KEY, ResponsesContextUsage,
+    ResponsesInputProjection, assistant_context_usage, checkpoint_responses_context,
+    extra_tool_entries, is_responses_x_search_tool, patch_reasoning_text_types,
+    patch_responses_input, patch_responses_input_for_source, project_responses_input,
+    response_context_usage, response_to_conversation_items, responses_input_fingerprint,
+    responses_projection_context,
 };
 
 use std::sync::Arc;

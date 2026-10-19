@@ -7,6 +7,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::appearance::AppearanceConfig;
 use crate::render::wrapping::word_wrap_lines;
@@ -90,16 +91,10 @@ struct RowLayout {
 }
 
 impl RowLayout {
-    /// Measure column widths over every row that will render.
-    /// Widths are in codepoints, not bytes.
+    /// 按实际终端列宽对齐标签，兼容原生模式的中文说明。
     fn measure<'a>(rows: impl Iterator<Item = &'a LegendRow> + Clone, total: u64) -> Self {
         Self {
-            label_width: rows
-                .clone()
-                .map(|r| r.label.chars().count())
-                .max()
-                .unwrap_or(0)
-                + 1,
+            label_width: rows.clone().map(|r| r.label.width()).max().unwrap_or(0) + 1,
             tokens_width: rows
                 .clone()
                 .map(|r| fmt_tok(r.tokens).chars().count())
@@ -183,9 +178,9 @@ impl RowLayout {
                 glyph,
                 Span::styled(
                     format!(
-                        "{:<label_width$}",
+                        "{}{}",
                         row.label,
-                        label_width = self.label_width
+                        " ".repeat(self.label_width.saturating_sub(row.label.width()))
                     ),
                     label_style,
                 ),
@@ -229,11 +224,21 @@ impl ContextInfoBlock {
         let tool_call_count = snapshot.tool_call_count;
         let compaction_count = snapshot.compaction_count;
 
+        let native = snapshot.responses_compact_threshold.is_some();
+        // 服务端只报告总量，压缩后的密文无法继续按本地历史拆分分类。
         let tokens = window_tokens(
             used,
             total,
-            snapshot.system_prompt_tokens,
-            snapshot.message_tokens,
+            if native {
+                0
+            } else {
+                snapshot.system_prompt_tokens
+            },
+            if native {
+                used
+            } else {
+                snapshot.message_tokens
+            },
         );
         let system_tokens = tokens.system;
         let message_tokens = tokens.messages;
@@ -311,22 +316,32 @@ impl ContextInfoBlock {
 
         // Tool definitions are already in Reasoning/overhead
         // Usage categories are already in Messages
-        let mut legend_rows = vec![
-            LegendRow {
-                glyph: system_glyph,
-                color: system_color,
-                label: "System prompt".to_string(),
-                tokens: system_tokens,
-                detail: None,
-            },
-            LegendRow {
+        let mut legend_rows = if native {
+            vec![LegendRow {
                 glyph: messages_glyph,
                 color: messages_color,
-                label: "Messages".to_string(),
+                label: "有效上下文".to_string(),
                 tokens: message_tokens,
                 detail: None,
-            },
-        ];
+            }]
+        } else {
+            vec![
+                LegendRow {
+                    glyph: system_glyph,
+                    color: system_color,
+                    label: "System prompt".to_string(),
+                    tokens: system_tokens,
+                    detail: None,
+                },
+                LegendRow {
+                    glyph: messages_glyph,
+                    color: messages_color,
+                    label: "Messages".to_string(),
+                    tokens: message_tokens,
+                    detail: None,
+                },
+            ]
+        };
         if overhead_tokens > 0 {
             legend_rows.push(LegendRow {
                 glyph: overhead_glyph,
@@ -393,7 +408,14 @@ impl ContextInfoBlock {
         }
         lines.push(Line::from(""));
 
-        lines.push(Line::from(Span::styled("Already counted above", muted)));
+        lines.push(Line::from(Span::styled(
+            if native {
+                "本地明细估算（各项可能已被压缩）"
+            } else {
+                "Already counted above"
+            },
+            muted,
+        )));
         for row in &info_rows {
             lines.extend(layout.render(row, bar, total, label_style, muted));
         }
@@ -402,7 +424,22 @@ impl ContextInfoBlock {
         // `threshold_tokens` uses `div_ceil` rather than truncating integer division. Without `div_ceil`, tiny totals
         // could produce `remaining == 0` while `usage_pct < threshold_percent`. That would show `~0 tokens remaining` for
         // a context window that isn't actually at the threshold.
-        if total > 0 {
+        if let Some(threshold) = snapshot.responses_compact_threshold {
+            let source = match snapshot.usage_estimated {
+                Some(false) => "服务端报告",
+                Some(true) => "估算（含尚未发送的新增内容）",
+                None => "待下一次请求校验",
+            };
+            lines.push(Line::from(Span::styled(
+                format!("服务端自动压缩阈值：{} tokens", fmt_tok_big(threshold)),
+                muted,
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("上下文计数：{source}"),
+                muted,
+            )));
+            lines.push(Line::from(""));
+        } else if total > 0 {
             let threshold_percent = snapshot.auto_compact_threshold_percent;
             let threshold_tokens = total.saturating_mul(threshold_percent as u64).div_ceil(100);
             let remaining = threshold_tokens.saturating_sub(used);
@@ -437,7 +474,9 @@ impl ContextInfoBlock {
         // The tip about approaching auto-compact only shows in the gap between the "getting close" mark (80%) and the
         // actual auto-compact threshold. A second warning-styled tip suggesting a manual `/compact` would just stack
         // visually and contradict itself.
-        if (80..snapshot.auto_compact_threshold_percent).contains(&usage_pct) {
+        if snapshot.responses_compact_threshold.is_none()
+            && (80..snapshot.auto_compact_threshold_percent).contains(&usage_pct)
+        {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Tip: run /compact to free up context space.".to_string(),
@@ -589,6 +628,7 @@ impl BlockContent for ContextInfoBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glyphs::{diamond_dotted, diamond_filled, diamond_hollow};
     use xai_grok_shell::session::TokenUsageCategory;
 
     fn snapshot() -> ContextInfo {
@@ -606,6 +646,8 @@ mod tests {
             free_tokens: 963_300,
             usage_pct: 4,
             auto_compact_threshold_percent: 85,
+            responses_compact_threshold: None,
+            usage_estimated: None,
             usage_categories: vec![],
         }
     }
@@ -646,6 +688,45 @@ mod tests {
         // Percent shows 2 decimal places (36.7k / 1m = 3.67%)
         assert!(l2.contains("(3.67%)"), "got: {l2:?}");
         assert_eq!(line_text(&lines, 3), "grok-4");
+    }
+
+    /// 原生模式展示真实策略与计数来源，宽窄布局均保留旧模式的独立分支。
+    #[test]
+    fn native_context_source_and_threshold_are_explicit() {
+        for bar in [BarLayout::WIDE, BarLayout::NARROW] {
+            for (estimated, label) in [
+                (Some(true), "估算"),
+                (Some(false), "服务端报告"),
+                (None, "待下一次请求校验"),
+            ] {
+                let mut snap = snapshot();
+                snap.responses_compact_threshold = Some(200_000);
+                snap.usage_estimated = estimated;
+                snap.system_prompt_tokens = 100_000;
+                snap.message_tokens = 900_000;
+                let lines =
+                    ContextInfoBlock::new(snap, "responses").build_lines(&test_theme(), bar);
+                assert_eq!(count_bar_glyphs(&lines, bar), (4, 0, 96, 100));
+                let text = all_text(&lines);
+                assert!(text.contains("服务端自动压缩阈值：200k tokens"), "{text}");
+                assert!(text.contains(label), "{text}");
+                assert!(text.contains("有效上下文"), "{text}");
+                assert!(text.contains("本地明细估算"), "{text}");
+                assert!(
+                    !text.contains("System prompt") && !text.contains("Messages"),
+                    "{text}"
+                );
+                assert!(!text.contains("Already counted above"), "{text}");
+                assert!(!text.contains("Auto-compact at"), "{text}");
+                if bar == BarLayout::WIDE {
+                    let column = |label: &str| {
+                        let row = text.lines().find(|line| line.contains(label)).unwrap();
+                        row[..row.find(" tokens").unwrap()].width()
+                    };
+                    assert_eq!(column("有效上下文"), column("Free"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -793,11 +874,6 @@ mod tests {
     // blank). Each row is rendered as `glyph` spans separated by raw-space spans. To count cells per category, we walk
     // the bar lines for the given layout and count spans whose content matches each category's glyph.
 
-    const SYSTEM_GLYPH_TEST: &str = "\u{25C6}";
-    const TOOLS_GLYPH_TEST: &str = "\u{25C8}";
-    const MESSAGES_GLYPH_TEST: &str = "\u{25C6}"; // same as system; distinguished by color in real render
-    const FREE_GLYPH_TEST: &str = "\u{25C7}";
-
     /// `layout` tells the function how many bar rows to slice (5 for WIDE, 10 for NARROW).
     /// Without it the slice would be wrong for the narrow layout and the assertions would fail spuriously.
     fn count_bar_glyphs(
@@ -807,17 +883,18 @@ mod tests {
         let mut diamonds = 0usize;
         let mut tools = 0usize;
         let mut free = 0usize;
+        let tools_color = Some(quantize(test_theme().accent_skill));
         let bar_start = 5; // header / blank / tokens / model / blank
         let bar_end = bar_start + layout.rows;
         for line in lines.get(bar_start..bar_end).into_iter().flatten() {
             for span in &line.spans {
                 let c = span.content.as_ref();
-                if c == SYSTEM_GLYPH_TEST || c == MESSAGES_GLYPH_TEST {
-                    // SYSTEM_GLYPH_TEST == MESSAGES_GLYPH_TEST; counted together.
-                    diamonds += 1;
-                } else if c == TOOLS_GLYPH_TEST {
+                // 旧 Windows 控制台中工具与已用区域共用字形，按颜色区分。
+                if c == diamond_dotted() && span.style.fg == tools_color {
                     tools += 1;
-                } else if c == FREE_GLYPH_TEST {
+                } else if c == diamond_filled() {
+                    diamonds += 1;
+                } else if c == diamond_hollow() {
                     free += 1;
                 }
             }
@@ -978,6 +1055,8 @@ mod tests {
             free_tokens: 400_000,
             usage_pct: 20,
             auto_compact_threshold_percent: 65,
+            responses_compact_threshold: None,
+            usage_estimated: None,
             usage_categories: vec![],
         };
         let block = ContextInfoBlock::new(snap, "grok-build");
@@ -1032,7 +1111,9 @@ mod tests {
 
         // Token, percent, and count columns line up across all rows; single-digit counts are right-aligned ("·  4 servers")
         let is_row = |l: &&str| {
-            (l.starts_with('\u{25C6}') || l.starts_with('\u{25C8}') || l.starts_with('\u{25C7}'))
+            (l.starts_with(diamond_filled())
+                || l.starts_with(diamond_dotted())
+                || l.starts_with(diamond_hollow()))
                 && l.contains(" tokens ")
         };
         let cols = |needle: &str| -> Vec<usize> {
@@ -1043,6 +1124,7 @@ mod tests {
         };
         for needle in [" tokens ", ")"] {
             let positions = cols(needle);
+            assert_eq!(positions.len(), 8, "{needle:?} rows missing:\n{all}");
             assert!(
                 positions.windows(2).all(|w| {
                     let [a, b] = w else { return false };
@@ -1145,10 +1227,7 @@ mod tests {
                 .iter()
                 .filter(|s| {
                     let c = s.content.as_ref();
-                    c == SYSTEM_GLYPH_TEST
-                        || c == TOOLS_GLYPH_TEST
-                        || c == MESSAGES_GLYPH_TEST
-                        || c == FREE_GLYPH_TEST
+                    c == diamond_filled() || c == diamond_dotted() || c == diamond_hollow()
                 })
                 .count();
             assert!(
@@ -1173,10 +1252,7 @@ mod tests {
                 .iter()
                 .filter(|s| {
                     let c = s.content.as_ref();
-                    c == SYSTEM_GLYPH_TEST
-                        || c == TOOLS_GLYPH_TEST
-                        || c == MESSAGES_GLYPH_TEST
-                        || c == FREE_GLYPH_TEST
+                    c == diamond_filled() || c == diamond_dotted() || c == diamond_hollow()
                 })
                 .count();
             assert!(

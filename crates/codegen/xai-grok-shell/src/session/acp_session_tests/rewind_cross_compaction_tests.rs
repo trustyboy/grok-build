@@ -586,8 +586,9 @@ async fn files_only_reverts_the_file_and_keeps_the_conversation() {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
             let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
-            let notes = std::path::Path::new("/tmp/notes-files-only.toml");
-            let cwd = std::path::Path::new("/tmp");
+            let cwd = actor.tool_context.cwd.as_path();
+            let notes_path = cwd.join("notes-files-only.toml");
+            let notes = notes_path.as_path();
             actor
                 .tool_context
                 .fs
@@ -667,8 +668,9 @@ async fn preview_reports_an_external_edit_and_changes_nothing() {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
             let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
-            let notes = std::path::Path::new("/tmp/notes-preview.toml");
-            let cwd = std::path::Path::new("/tmp");
+            let cwd = actor.tool_context.cwd.as_path();
+            let notes_path = cwd.join("notes-preview.toml");
+            let notes = notes_path.as_path();
             actor
                 .tool_context
                 .fs

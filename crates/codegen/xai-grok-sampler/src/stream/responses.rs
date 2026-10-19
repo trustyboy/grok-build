@@ -936,11 +936,18 @@ pub(crate) fn stream_responses_tracked<'a>(
             .as_ref()
             .map(|d| d.reason.clone());
 
-        // Convert to ConversationItem(s); patch in accumulated reasoning text as a fallback when the final response lacks `content` or `summary`
-        // The streaming deltas may have arrived out of band
-        // Splice policy lives in `inject_streaming_reasoning_fallback`.
         let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
-        xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
+        let has_native_context_record = matches!(status, Status::Completed)
+            && items.iter().any(|item| match item {
+                ConversationItem::Assistant(assistant) => {
+                    xai_grok_sampling_types::assistant_context_usage(assistant).is_some()
+                }
+                _ => false,
+            });
+        // 已签发记录绑定完成帧的权威历史；流式推理已展示，不能再补写 sibling。
+        if !has_native_context_record {
+            xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
+        }
 
         let has_tool_calls = items.iter().any(|i| match i {
             ConversationItem::Assistant(a) => !a.tool_calls.is_empty(),

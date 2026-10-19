@@ -67,8 +67,7 @@ pub struct SamplerConfig {
     /// Header name to environment variable, resolved into request headers at client build and never persisted.
     #[serde(default)]
     pub env_http_headers: IndexMap<String, String>,
-    /// Total context window size in tokens.
-    /// The sampler does not enforce it; the session uses it for compaction decisions.
+    /// 总上下文窗口；会话用于压缩决策，原生 Responses 请求另按实际投影保护容量。
     pub context_window: u64,
     /// Provider request-body cap, already defaulted from `api_backend` by model resolution; `None` budgets to 50 MiB.
     #[serde(default)]

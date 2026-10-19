@@ -43,6 +43,9 @@ use crate::span_timing::{ERROR, STATUS_CODE, SUCCESS, StreamSpanTiming};
 use crate::stream_classify::{chat_chunk_class, message_event_class, responses_event_class};
 use xai_grok_auth::bearer_suffix;
 
+mod native_responses;
+
+pub use native_responses::NATIVE_CONTEXT_OVERFLOW_PREFIX;
 pub use xai_grok_sampling_types::ApiBackend;
 
 /// Process-level fallback for the `x-grok-client-identifier` header.
@@ -92,9 +95,18 @@ impl GrokRequestHeaders<'_> {
 
 /// Deserialize a Responses SSE event, stripping unknown tools and rewriting terminal `total_tokens` from `context_details`.
 pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
+    deserialize_response_event_for_mode(data, false)
+}
+
+/// 原生模式保留线上计费用量，旧模式继续使用历史上下文覆盖。
+fn deserialize_response_event_for_mode(
+    data: &str,
+    native: bool,
+) -> Result<rs::ResponseStreamEvent> {
     let mut value: serde_json::Value =
         serde_json::from_str(data).map_err(SamplingError::Serialization)?;
     if let Some(response) = value.get_mut("response") {
+        native_responses::sanitize_wire_response(response);
         crate::responses_compat::prepare_response(response)?;
     }
     let mut event = match serde_json::from_value::<rs::ResponseStreamEvent>(value) {
@@ -108,19 +120,43 @@ pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStrea
             return Err(SamplingError::Serialization(first_err));
         }
     };
-    apply_terminal_event_overrides(&mut event, data);
+    if native {
+        apply_terminal_cost_override(&mut event, data);
+    } else {
+        apply_terminal_event_overrides(&mut event, data);
+    }
     Ok(event)
 }
 
 /// On `response.completed` / `response.incomplete`, rewrite `usage.total_tokens` to the live context length from `context_details`.
 /// Billing fields stay on the cumulative wire values, so telemetry is unaffected.
 fn apply_terminal_event_overrides(event: &mut rs::ResponseStreamEvent, data: &str) {
+    apply_terminal_cost_override(event, data);
     let response = match event {
         rs::ResponseStreamEvent::ResponseCompleted(e) => &mut e.response,
         rs::ResponseStreamEvent::ResponseIncomplete(e) => &mut e.response,
         _ => return,
     };
     // Re-parse for fields async_openai's types omit (context total, cost ticks).
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return;
+    };
+    let Some(usage) = response.usage.as_mut() else {
+        return;
+    };
+    let Some(total) = extract_context_total(&value) else {
+        return;
+    };
+    usage.total_tokens = total;
+}
+
+/// 保留两种模式的线上费用，避免上下文覆盖改变账单语义。
+fn apply_terminal_cost_override(event: &mut rs::ResponseStreamEvent, data: &str) {
+    let response = match event {
+        rs::ResponseStreamEvent::ResponseCompleted(e) => &mut e.response,
+        rs::ResponseStreamEvent::ResponseIncomplete(e) => &mut e.response,
+        _ => return,
+    };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
         return;
     };
@@ -134,72 +170,6 @@ fn apply_terminal_event_overrides(event: &mut rs::ResponseStreamEvent, data: &st
             .metadata
             .get_or_insert_with(Default::default)
             .insert(COST_USD_TICKS_METADATA_KEY.to_owned(), ticks.to_string());
-    }
-    let Some(usage) = response.usage.as_mut() else {
-        return;
-    };
-    let Some(total) = extract_context_total(&value) else {
-        return;
-    };
-    usage.total_tokens = total;
-}
-
-/// 仅完整成功响应绑定本次请求来源；上游提供的内部标识一律移除。
-fn bind_responses_origin(
-    response: &mut rs::Response,
-    source: Option<&str>,
-    fingerprint: Option<&str>,
-    threshold: Option<std::num::NonZeroU64>,
-    context_tokens: Option<u64>,
-) {
-    use xai_grok_sampling_types::{
-        RESPONSE_INPUT_FINGERPRINT_METADATA_KEY, RESPONSE_SOURCE_METADATA_KEY,
-    };
-    if let Some(metadata) = response.metadata.as_mut() {
-        metadata.remove(RESPONSE_SOURCE_METADATA_KEY);
-        metadata.remove(RESPONSE_INPUT_FINGERPRINT_METADATA_KEY);
-    }
-    if matches!(response.status, rs::Status::Completed) {
-        if let Some((source, fingerprint)) = source.zip(fingerprint) {
-            let metadata = response.metadata.get_or_insert_with(Default::default);
-            metadata.insert(RESPONSE_SOURCE_METADATA_KEY.into(), source.into());
-            metadata.insert(
-                RESPONSE_INPUT_FINGERPRINT_METADATA_KEY.into(),
-                fingerprint.into(),
-            );
-            if let Some(raw) =
-                metadata.get_mut(xai_grok_sampling_types::RESPONSE_RAW_OUTPUT_METADATA_KEY)
-            {
-                if let Ok(mut output) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
-                    // 清除上游伪造的本地上下文标记。
-                    for item in &mut output {
-                        if let Some(item) = item.as_object_mut() {
-                            item.remove("__grok_context_tokens");
-                            item.remove("__grok_context_estimated");
-                        }
-                    }
-                    if let Some(index) = output.iter().rposition(|item| {
-                        item.get("type").and_then(|v| v.as_str()) == Some("compaction")
-                    }) {
-                        let tail_bytes: usize = output
-                            .iter()
-                            .skip(index + 1)
-                            .map(|item| item.to_string().len())
-                            .sum();
-                        let estimate = threshold
-                            .map(|t| t.get().saturating_add((tail_bytes as u64).div_ceil(3)));
-                        if let Some(tokens) = context_tokens.or(estimate) {
-                            if let Some(item) = output.get_mut(index) {
-                                item["__grok_context_tokens"] = serde_json::json!(tokens);
-                                item["__grok_context_estimated"] =
-                                    serde_json::json!(context_tokens.is_none());
-                            }
-                        }
-                    }
-                    *raw = serde_json::to_string(&output).expect("JSON 输出可以序列化");
-                }
-            }
-        }
     }
 }
 
@@ -393,6 +363,8 @@ impl std::fmt::Debug for SamplingClient {
 struct ClientDefaults {
     model: String,
     max_completion_tokens: Option<u32>,
+    /// 仅原生 Responses 请求按投影后的输入和输出预留执行容量保护。
+    context_window: u64,
     temperature: Option<f32>,
     top_p: Option<f32>,
     api_backend: ApiBackend,
@@ -711,7 +683,10 @@ impl SamplingClient {
                 None,
             )
         } else {
-            (crate::shared_http::client().map_err(SamplingError::Http)?, None)
+            (
+                crate::shared_http::client().map_err(SamplingError::Http)?,
+                None,
+            )
         };
 
         tracing::info!(
@@ -734,6 +709,7 @@ impl SamplingClient {
         let defaults = ClientDefaults {
             model: config.model,
             max_completion_tokens: config.max_completion_tokens,
+            context_window: config.context_window,
             temperature: config.temperature,
             top_p: config.top_p,
             api_backend: config.api_backend,
@@ -1531,33 +1507,11 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let responses_source = self
-            .defaults
-            .responses_compact_threshold
-            .map(|_| self.responses_source(&builder, &model_id))
-            .transpose()?;
-        let responses_input_fingerprint = responses_source
-            .as_deref()
-            .zip(request.responses_history.as_deref())
-            .map(|(source, history)| {
-                xai_grok_sampling_types::responses_input_fingerprint(history, source)
-            });
-        if let Some(history) = request.responses_history.as_deref() {
-            if let Some(source) = responses_source.as_deref() {
-                xai_grok_sampling_types::patch_responses_input_for_source(
-                    &mut request_body,
-                    history,
-                    Some(source),
-                );
-            } else {
-                xai_grok_sampling_types::patch_responses_input(&mut request_body, history);
-            }
-        }
-        if let Some(threshold) = self.defaults.responses_compact_threshold {
-            request_body["context_management"] = serde_json::json!([
-                {"type": "compaction", "compact_threshold": threshold.get()}
-            ]);
-        }
+        let prepared_responses = self.prepare_responses_request(
+            &builder,
+            request.responses_history.take(),
+            &mut request_body,
+        )?;
         let built_request = self
             .build_json_request(grok_headers.apply(builder), &request_body)
             .await?;
@@ -1607,8 +1561,8 @@ impl SamplingClient {
 
         let mut value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(SamplingError::Serialization)?;
-        let context_tokens =
-            extract_context_total(&serde_json::json!({"response": &value})).map(u64::from);
+        let context_tokens = native_responses::context_tokens(&value);
+        native_responses::sanitize_wire_response(&mut value);
         crate::responses_compat::prepare_response(&mut value)?;
         let mut response_obj = serde_json::from_value::<rs::Response>(value).map_err(|e| {
             let raw_body = String::from_utf8_lossy(&bytes);
@@ -1619,11 +1573,9 @@ impl SamplingClient {
             );
             SamplingError::Serialization(e)
         })?;
-        bind_responses_origin(
+        native_responses::finish_response(
             &mut response_obj,
-            responses_source.as_deref(),
-            responses_input_fingerprint.as_deref(),
-            self.defaults.responses_compact_threshold,
+            prepared_responses.as_ref(),
             context_tokens,
         );
         Ok(response_obj)
@@ -1723,33 +1675,11 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let responses_source = self
-            .defaults
-            .responses_compact_threshold
-            .map(|_| self.responses_source(&builder, &model_id))
-            .transpose()?;
-        let responses_input_fingerprint = responses_source
-            .as_deref()
-            .zip(request.responses_history.as_deref())
-            .map(|(source, history)| {
-                xai_grok_sampling_types::responses_input_fingerprint(history, source)
-            });
-        if let Some(history) = request.responses_history.as_deref() {
-            if let Some(source) = responses_source.as_deref() {
-                xai_grok_sampling_types::patch_responses_input_for_source(
-                    &mut request_body,
-                    history,
-                    Some(source),
-                );
-            } else {
-                xai_grok_sampling_types::patch_responses_input(&mut request_body, history);
-            }
-        }
-        if let Some(threshold) = self.defaults.responses_compact_threshold {
-            request_body["context_management"] = serde_json::json!([
-                {"type": "compaction", "compact_threshold": threshold.get()}
-            ]);
-        }
+        let prepared_responses = self.prepare_responses_request(
+            &builder,
+            request.responses_history.take(),
+            &mut request_body,
+        )?;
         let mut http_request = grok_headers
             .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -1836,13 +1766,13 @@ impl SamplingClient {
         let event_stream = byte_stream.eventsource();
 
         let doom_loop_for_stream = doom_loop.clone();
-        let responses_compact_threshold = self.defaults.responses_compact_threshold;
+        let native_responses_enabled = self.defaults.responses_compact_threshold.is_some();
 
         // The scan item is an `Option`: `Some(None)` skips an absorbed doom-loop event without terminating the stream (`filter_map` below)
         // An outer `None` still ends the stream
         let events = event_stream
-            .scan(false, move |had_transport_error, event_res| {
-                if *had_transport_error {
+            .scan(false, move |attempt_finished, event_res| {
+                if *attempt_finished {
                     return std::future::ready(None);
                 }
                 let item = match event_res {
@@ -1876,42 +1806,43 @@ impl SamplingClient {
                                 .and_then(crate::responses_compat::prepare_event);
                             match prepared {
                                 Ok(Some(value)) => {
-                                    Some(Some(deserialize_response_event(&value.to_string()).map(
-                                        |mut event| {
-                                            match &mut event {
-                                                rs::ResponseStreamEvent::ResponseCompleted(e) => {
-                                                    bind_responses_origin(
-                                                        &mut e.response,
-                                                        responses_source.as_deref(),
-                                                        responses_input_fingerprint.as_deref(),
-                                                        responses_compact_threshold,
-                                                        extract_context_total(&value)
-                                                            .map(u64::from),
-                                                    )
-                                                }
-                                                rs::ResponseStreamEvent::ResponseIncomplete(e) => {
-                                                    bind_responses_origin(
-                                                        &mut e.response,
-                                                        None,
-                                                        None,
-                                                        None,
-                                                        None,
-                                                    )
-                                                }
-                                                rs::ResponseStreamEvent::ResponseFailed(e) => {
-                                                    bind_responses_origin(
-                                                        &mut e.response,
-                                                        None,
-                                                        None,
-                                                        None,
-                                                        None,
-                                                    )
-                                                }
-                                                _ => {}
+                                    let decoded = if native_responses_enabled {
+                                        deserialize_response_event_for_mode(
+                                            &value.to_string(),
+                                            true,
+                                        )
+                                    } else {
+                                        deserialize_response_event(&value.to_string())
+                                    };
+                                    Some(Some(decoded.map(|mut event| {
+                                        match &mut event {
+                                            rs::ResponseStreamEvent::ResponseCompleted(e) => {
+                                                native_responses::finish_response(
+                                                    &mut e.response,
+                                                    prepared_responses.as_ref(),
+                                                    value
+                                                        .get("response")
+                                                        .and_then(native_responses::context_tokens),
+                                                )
                                             }
-                                            event
-                                        },
-                                    )))
+                                            rs::ResponseStreamEvent::ResponseIncomplete(e) => {
+                                                native_responses::finish_response(
+                                                    &mut e.response,
+                                                    None,
+                                                    None,
+                                                )
+                                            }
+                                            rs::ResponseStreamEvent::ResponseFailed(e) => {
+                                                native_responses::finish_response(
+                                                    &mut e.response,
+                                                    None,
+                                                    None,
+                                                )
+                                            }
+                                            _ => {}
+                                        }
+                                        event
+                                    })))
                                 }
                                 Ok(None) => Some(None),
                                 Err(error) => Some(Some(Err(error))),
@@ -1919,10 +1850,24 @@ impl SamplingClient {
                         }
                     }
                     Err(e) => {
-                        *had_transport_error = true;
+                        *attempt_finished = true;
                         Some(Some(Err(SamplingError::EventStreamError(e.to_string()))))
                     }
                 };
+                if native_responses_enabled
+                    && match &item {
+                        Some(Some(Err(_))) => true,
+                        Some(Some(Ok(event))) => matches!(
+                            event,
+                            rs::ResponseStreamEvent::ResponseIncomplete(_)
+                                | rs::ResponseStreamEvent::ResponseFailed(_)
+                                | rs::ResponseStreamEvent::ResponseError(_)
+                        ),
+                        _ => false,
+                    }
+                {
+                    *attempt_finished = true;
+                }
                 std::future::ready(item)
             })
             .filter_map(std::future::ready)
@@ -2413,9 +2358,11 @@ impl SamplingClient {
         wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
-        let mut raw_input = serde_json::json!({});
-        xai_grok_sampling_types::patch_responses_input(&mut raw_input, &request);
-        wrapper.responses_input = raw_input.get("input").cloned();
+        if self.defaults.responses_compact_threshold.is_none() {
+            let mut raw_input = serde_json::json!({});
+            xai_grok_sampling_types::patch_responses_input(&mut raw_input, &request);
+            wrapper.responses_input = raw_input.get("input").cloned();
+        }
         wrapper.responses_history = Some(Box::new(request.clone()));
         wrapper.traceparent = request.traceparent;
 
@@ -2454,9 +2401,11 @@ impl SamplingClient {
         wrapper.x_grok_transient_retry = x_grok_transient_retry;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
-        let mut raw_input = serde_json::json!({});
-        xai_grok_sampling_types::patch_responses_input(&mut raw_input, &request);
-        wrapper.responses_input = raw_input.get("input").cloned();
+        if self.defaults.responses_compact_threshold.is_none() {
+            let mut raw_input = serde_json::json!({});
+            xai_grok_sampling_types::patch_responses_input(&mut raw_input, &request);
+            wrapper.responses_input = raw_input.get("input").cloned();
+        }
         wrapper.responses_history = Some(Box::new(request.clone()));
 
         if let Some(trace) = trace {
@@ -2980,9 +2929,18 @@ mod tests {
     #[test]
     fn responses_native_source_changes_with_credentials_and_route() {
         let client = SamplingClient::new(minimal_config()).unwrap();
-        let first = client.http.post("https://example.test/v1/responses").bearer_auth("key-a");
-        let second = client.http.post("https://example.test/v1/responses").bearer_auth("key-b");
-        let other = client.http.post("https://other.test/v1/responses").bearer_auth("key-a");
+        let first = client
+            .http
+            .post("https://example.test/v1/responses")
+            .bearer_auth("key-a");
+        let second = client
+            .http
+            .post("https://example.test/v1/responses")
+            .bearer_auth("key-b");
+        let other = client
+            .http
+            .post("https://other.test/v1/responses")
+            .bearer_auth("key-a");
         let source = client.responses_source(&first, "model-a").unwrap();
         assert_eq!(source, client.responses_source(&first, "model-a").unwrap());
         assert_ne!(source, client.responses_source(&second, "model-a").unwrap());
@@ -2996,7 +2954,9 @@ mod tests {
         let mut client = SamplingClient::new(minimal_config()).unwrap();
         let source = |client: &SamplingClient| {
             let request = client.post(client.endpoint("responses"));
-            client.responses_source(&request.builder, "test-model").unwrap()
+            client
+                .responses_source(&request.builder, "test-model")
+                .unwrap()
         };
         let without_mtls = source(&client);
         client.mtls_identity_digest = Some([1; 32]);
@@ -3009,23 +2969,28 @@ mod tests {
 
     #[test]
     fn responses_native_origin_is_local_and_context_is_separate() {
-        use xai_grok_sampling_types::{RESPONSE_RAW_OUTPUT_METADATA_KEY, RESPONSE_SOURCE_METADATA_KEY};
+        use xai_grok_sampling_types::{
+            RESPONSE_RAW_OUTPUT_METADATA_KEY, RESPONSE_SOURCE_METADATA_KEY,
+        };
         let mut response: rs::Response = serde_json::from_str(EMPTY_RESPONSE_JSON).unwrap();
-        response.status = rs::Status::Completed;
         response.metadata = Some(std::collections::HashMap::from([
             (RESPONSE_SOURCE_METADATA_KEY.into(), "forged".into()),
-            (RESPONSE_RAW_OUTPUT_METADATA_KEY.into(), serde_json::json!([
-                {"type":"compaction","encrypted_content":"opaque","__grok_context_tokens":1}
-            ]).to_string()),
+            (
+                RESPONSE_RAW_OUTPUT_METADATA_KEY.into(),
+                serde_json::json!([
+                    {"type":"compaction","encrypted_content":"opaque","__grok_context_tokens":1,
+                     "__grok_context_checkpoint":{"tokens":1}}
+                ])
+                .to_string(),
+            ),
         ]));
-        bind_responses_origin(&mut response, Some("trusted"), Some("prefix"), std::num::NonZeroU64::new(2000), Some(1111));
+        native_responses::finish_response(&mut response, None, None);
         let metadata = response.metadata.as_ref().unwrap();
-        assert_eq!(metadata.get(RESPONSE_SOURCE_METADATA_KEY).unwrap(), "trusted");
-        let raw: serde_json::Value = serde_json::from_str(metadata.get(RESPONSE_RAW_OUTPUT_METADATA_KEY).unwrap()).unwrap();
-        assert_eq!(raw.pointer("/0/__grok_context_tokens"), Some(&serde_json::json!(1111)));
-        assert_eq!(raw.pointer("/0/__grok_context_estimated"), Some(&serde_json::json!(false)));
-        bind_responses_origin(&mut response, None, None, None, None);
-        assert!(!response.metadata.as_ref().unwrap().contains_key(RESPONSE_SOURCE_METADATA_KEY));
+        assert!(!metadata.contains_key(RESPONSE_SOURCE_METADATA_KEY));
+        let raw: serde_json::Value =
+            serde_json::from_str(metadata.get(RESPONSE_RAW_OUTPUT_METADATA_KEY).unwrap()).unwrap();
+        assert!(raw.pointer("/0/__grok_context_tokens").is_none());
+        assert!(raw.pointer("/0/__grok_context_checkpoint").is_none());
     }
 
     #[tokio::test]
@@ -3200,13 +3165,13 @@ mod tests {
             ApiBackend::ChatCompletions,
             ApiBackend::Messages,
         ] {
-            for threshold in [None, Some(99_u64), Some(100), Some(101)] {
+            for threshold in [None, Some(999_u64), Some(1000), Some(1001)] {
                 let mut unary_context_management = None;
                 for streaming in [false, true] {
                     let (_, body) = capture_request_with_config(
                         SamplerConfig {
                             api_backend: backend.clone(),
-                            context_window: 100,
+                            context_window: 1000,
                             responses_compact_threshold: threshold
                                 .and_then(std::num::NonZeroU64::new),
                             ..minimal_config()
@@ -3216,12 +3181,15 @@ mod tests {
                     )
                     .await;
                     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    let route = format!("{backend:?} streaming={streaming} threshold={threshold:?}");
+                    let route =
+                        format!("{backend:?} streaming={streaming} threshold={threshold:?}");
                     let actual = body.get("context_management").cloned();
-                    let expected = (backend == ApiBackend::Responses && threshold == Some(99))
-                        .then(|| serde_json::json!([
-                            {"type": "compaction", "compact_threshold": 99}
-                        ]));
+                    let expected = (backend == ApiBackend::Responses && threshold == Some(999))
+                        .then(|| {
+                            serde_json::json!([
+                                {"type": "compaction", "compact_threshold": 999}
+                            ])
+                        });
                     assert_eq!(actual, expected, "{route}: {body}");
                     assert!(
                         body.get("responses_compact_threshold").is_none(),

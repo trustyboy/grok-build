@@ -1772,12 +1772,13 @@ impl MvpAgent {
                 }
                 crate::agent::handlers::model_switch::SwitchContextWindow::Preserve
             };
-            if let Err(err) = crate::agent::handlers::model_switch::apply(
+            if let Err(err) = crate::agent::handlers::model_switch::apply_with_prompt_policy(
                 self,
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id),
                 crate::agent::handlers::model_switch::SwitchEffort::Set(restore_effort),
                 restore_window,
                 crate::agent::handlers::model_switch::ConfigNotice::Skip,
+                crate::agent::handlers::model_switch::SwitchPrompt::Preserve,
             )
             .await
             {

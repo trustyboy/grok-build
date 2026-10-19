@@ -2723,6 +2723,7 @@ impl SessionActor {
         self.record_turn_model().await;
         let mut metrics_drop_guard = TurnMetrics::new();
         let mut turn_tools_called: Vec<String> = Vec::new();
+        self.compaction.native_overflow_recovered.set(false);
         let mut tool_turn_count: usize = 1;
         let mut loop_index: u32 = 0;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
@@ -3378,6 +3379,7 @@ impl SessionActor {
                     "tokens_per_sec": tokens_per_sec,
                 })),
             );
+            self.compaction.native_overflow_recovered.set(false);
             let native_context = self.response_native_context(&response).await;
             if let Some(tokens) = native_context.map(|(tokens, _)| tokens)
                 .or_else(|| response.usage.as_ref().map(|usage| u64::from(usage.total_tokens)))

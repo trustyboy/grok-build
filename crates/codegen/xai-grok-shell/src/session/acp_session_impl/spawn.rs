@@ -1857,6 +1857,7 @@ pub(crate) async fn spawn_session_actor(
         forked_tool_override,
         compaction: super::compaction_config::CompactionConfig {
             native_context: Default::default(),
+            native_overflow_recovered: Default::default(),
             threshold_percent: std::cell::Cell::new(auto_compact_threshold_percent),
             force_compact: force_compact.clone(),
             context_window_override,
