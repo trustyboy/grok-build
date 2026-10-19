@@ -70,7 +70,7 @@ fn role_and_persona<'a>(
 }
 
 /// 按当前父会话目录键读取，临时模型不会借用连接来源的专属默认值。
-fn parent_configured_model(ctx: &SubagentSpawnContext) -> Option<&str> {
+fn parent_config(ctx: &SubagentSpawnContext) -> Option<&crate::agent::config::ConfigModelOverride> {
     let config = ctx.agent_config.as_ref()?;
     let parent_id = ctx.model_id.0.as_ref();
     let key = if config.config_models.contains_key(parent_id) {
@@ -78,7 +78,17 @@ fn parent_configured_model(ctx: &SubagentSpawnContext) -> Option<&str> {
     } else {
         catalog_key(ctx, parent_id)?
     };
-    nonblank(config.config_models.get(key)?.subagent_model.as_deref())
+    config.config_models.get(key)
+}
+
+/// 空白的主模型专属子代理模型沿用较低优先级配置。
+fn parent_configured_model(ctx: &SubagentSpawnContext) -> Option<&str> {
+    nonblank(parent_config(ctx)?.subagent_model.as_deref())
+}
+
+/// 主模型专属推理强度独立于子代理模型选择。
+fn parent_configured_effort(ctx: &SubagentSpawnContext) -> Option<&str> {
+    nonblank(parent_config(ctx)?.subagent_model_reasoning_effort.as_deref())
 }
 
 /// 普通模型优先级：单次 > 会话 > role/persona > 类型配置 > 主模型配置 > 全局 > 定义 > 父模型。
@@ -114,10 +124,15 @@ pub(super) async fn resolve_model(
             resolved.warn(format!("{source} 模型 '{model}' 不存在或不可用，已回退"));
         }
     }
-    if let Some(raw) = nonblank(ctx.subagent_default_reasoning_effort.as_deref())
-        && raw.parse::<ReasoningEffort>().is_err()
-    {
-        resolved.warn(format!("config reasoning_effort '{raw}' 无效，已回退"));
+    for (source, raw) in [
+        ("parent_model_config", parent_configured_effort(ctx)),
+        ("config", ctx.subagent_default_reasoning_effort.as_deref()),
+    ] {
+        if let Some(raw) = nonblank(raw)
+            && raw.parse::<ReasoningEffort>().is_err()
+        {
+            resolved.warn(format!("{source} reasoning_effort '{raw}' 无效，已回退"));
+        }
     }
     let (role, persona) = role_and_persona(subagent_type, overrides, ctx);
     let session_model = match &ctx.subagents_model {
@@ -266,6 +281,7 @@ pub(super) async fn resolve_ordinary_model(
             "persona",
             persona.and_then(|persona| persona.reasoning_effort.as_deref()),
         ),
+        ("parent_model_config", parent_configured_effort(ctx)),
         ("config", ctx.subagent_default_reasoning_effort.as_deref()),
         ("definition", definition_effort.as_deref()),
     ] {
@@ -386,6 +402,7 @@ pub(crate) async fn subagents_model_state(ctx: &SubagentSpawnContext) -> Subagen
         context_window: resolved.sampling.context_window,
         parent_model_id: Some(ctx.model_id.0.to_string()),
         parent_configured_model: parent_configured_model(ctx).map(str::to_owned),
+        parent_configured_effort: parent_configured_effort(ctx).map(str::to_owned),
         configured_model: ctx.subagent_default_model.clone(),
         configured_effort: ctx.subagent_default_reasoning_effort.clone(),
         warning: (!resolved.warnings.is_empty())

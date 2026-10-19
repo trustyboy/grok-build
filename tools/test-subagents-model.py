@@ -67,6 +67,8 @@ class Profile:
     section: str = "subagent"
     legacy_model: str | None = None
     legacy_effort: str | None = None
+    parent_efforts: tuple[tuple[str, str], ...] = ()
+    effort_role: bool = False
 
 
 PROFILES = {
@@ -79,6 +81,19 @@ PROFILES = {
         ("temporary", "   "), ("limited", "fixture-invalid-static"),
     )),
     "parent-model-only": Profile(model="global", parent_models=(("parent", "temporary"),)),
+    "parent-effort": Profile(model="global", effort="high", parent_models=(
+        ("parent", "temporary"), ("alternate", "global"),
+    ), parent_efforts=(
+        ("parent", " medium "), ("alternate", "low"),
+        ("temporary", "high"), ("global", "low"),
+    )),
+    "parent-effort-only": Profile(parent_efforts=(("parent", " high "), ("alternate", "low"))),
+    "parent-effort-priority": Profile(model="global", effort="high",
+        parent_models=(("parent", "temporary"),),
+        parent_efforts=(("parent", "medium"), ("temporary", "high")), effort_role=True),
+    "parent-effort-fallback": Profile(model="global", effort="low", parent_efforts=(
+        ("parent", "high"), ("temporary", "   "), ("alternate", " fixture-invalid-effort "),
+    )),
     "legacy-section": Profile(model="global", effort="high", section="subagents"),
     "mixed-sections": Profile(model="global", legacy_model="plain", legacy_effort="high"),
 }
@@ -309,6 +324,11 @@ prompt_suggestions = false
         config += f'model = "{profile.model}"\n'
     if profile.effort is not None:
         config += f'reasoning_effort = "{profile.effort}"\n'
+    if profile.effort_role:
+        config += f'''[{profile.section}.roles.explore]
+description = "验证角色 effort 优先级"
+reasoning_effort = "high"
+'''
     if profile.legacy_model is not None or profile.legacy_effort is not None:
         config += '[subagents]\n'
         if profile.legacy_model is not None:
@@ -316,6 +336,7 @@ prompt_suggestions = false
         if profile.legacy_effort is not None:
             config += f'reasoning_effort = "{profile.legacy_effort}"\n'
     parent_models = dict(profile.parent_models)
+    parent_efforts = dict(profile.parent_efforts)
     for model in MODELS.values():
         config += f'''
 [model.{model.name}]
@@ -330,6 +351,8 @@ supports_vision = false
 '''
         if model.name in parent_models:
             config += f'subagent_model = "{parent_models[model.name]}"\n'
+        if model.name in parent_efforts:
+            config += f'subagent_model_reasoning_effort = "{parent_efforts[model.name]}"\n'
         if model.effort is None:
             config += "supports_reasoning_effort = false\n"
         else:
@@ -389,7 +412,8 @@ class Checks:
             "子代理操作修改了父会话窗口", info["context"]["total"]
         )
 
-    def effective(self, model, effort, window=None, session=None, warning=False, model_source=None):
+    def effective(self, model, effort, window=None, session=None, warning=False, model_source=None,
+                  effort_source=None):
         """检查默认 general-purpose 的实际值及可选配置值。"""
         session = session or self.sessions[0]
         state = self.state(session=session)
@@ -405,9 +429,13 @@ class Checks:
             assert state.get("parentConfiguredModel") == parent_configured, state
         else:
             assert not (state.get("parentConfiguredModel") or "").strip(), state
+        parent_effort = dict(self.profile.parent_efforts).get(self.parents[session], "").strip() or None
+        assert state.get("parentConfiguredEffort") == parent_effort, state
         assert isinstance(state["modelSource"], str) and isinstance(state["effortSource"], str), state
         if model_source is not None:
             assert state["modelSource"] == model_source, state
+        if effort_source is not None:
+            assert state["effortSource"] == effort_source, state
         assert any(item["modelId"] == model for item in state["availableModels"]), state
         if warning:
             assert state["warning"], state
@@ -420,7 +448,8 @@ class Checks:
         self.state("set", expect_error=True, **params)
         after = self.state()
         for key in ("modelId", "reasoningEffort", "contextWindow", "modelSource", "effortSource",
-                    "configuredModel", "configuredEffort", "parentModelId", "parentConfiguredModel"):
+                    "configuredModel", "configuredEffort", "parentModelId", "parentConfiguredModel",
+                    "parentConfiguredEffort"):
             assert after.get(key) == before.get(key), (key, before, after)
         self.parent_unchanged(self.sessions[0])
 
@@ -640,6 +669,122 @@ def parent_model_discovery(check):
     check.spawn("temporary", "high")
 
 
+def parent_effort_selection(check):
+    """父目录键选 effort，目标自身的专属字段不参与，双会话切换互不影响。"""
+    first, second = check.sessions
+    check.effective("temporary", "medium", model_source="parent_model_config",
+                    effort_source="parent_model_config")
+    check.spawn("temporary", "medium")
+    check.select_parent("alternate", second)
+    check.effective("global", "low", session=second, effort_source="parent_model_config")
+    check.spawn("global", "low", session=second)
+    check.effective("temporary", "medium", session=first, effort_source="parent_model_config")
+    check.select_parent("alternate", first)
+    check.effective("global", "low", effort_source="parent_model_config")
+    check.spawn("global", "low")
+    check.select_parent("parent", second)
+    check.effective("temporary", "medium", session=second, effort_source="parent_model_config")
+    check.spawn("temporary", "medium", session=second)
+    check.effective("global", "low", session=first, effort_source="parent_model_config")
+
+
+def parent_effort_only(check):
+    """专属 effort 可单独配置，trim 后展示，既不依赖也不改变模型选择。"""
+    check.effective("parent", "high", effort_source="parent_model_config")
+    check.spawn("parent", "high")
+    check.state("set", modelId="global")
+    check.effective("global", "high", model_source="session", effort_source="parent_model_config")
+    check.spawn("global", "high")
+    check.state("inherit")
+    check.select_parent("alternate")
+    check.effective("alternate", "low", model_source="session", effort_source="parent_model_config")
+    check.spawn("alternate", "low")
+
+
+def parent_effort_priority(check):
+    """实际请求验证同目标会话、role、父模型专属的覆盖关系及异目标参数隔离。"""
+    check.effective("temporary", "medium", effort_source="parent_model_config")
+    check.spawn("temporary", "high", subagent_type="explore")
+    check.state("set", modelId="temporary", reasoningEffort="low", contextWindow=256000)
+    check.effective("temporary", "low", 256000, effort_source="session")
+    check.spawn("temporary", "low", 256000, subagent_type="explore")
+    # 单次模型与会话目标一致时保留参数；不同目标只应用父模型专属 effort。
+    check.spawn("temporary", "low", 256000, model="temporary")
+    check.spawn("global", "medium", model="global")
+    check.effective("temporary", "low", 256000, effort_source="session")
+
+
+def parent_effort_lifecycle(check):
+    """set 显式 effort 跨父模型保留，inherit 清除临时参数后应用父配置，reset 恢复默认选择。"""
+    first, second = check.sessions
+    check.state("set", modelId="global", reasoningEffort="high", contextWindow=256000)
+    check.effective("global", "high", 256000, effort_source="session")
+    check.spawn("global", "high", 256000)
+    check.select_parent("alternate", first)
+    check.effective("global", "high", 256000, effort_source="session")
+    check.spawn("global", "high", 256000)
+    check.effective("temporary", "medium", session=second, effort_source="parent_model_config")
+    check.state("inherit")
+    check.effective("alternate", "low", model_source="session", effort_source="parent_model_config")
+    check.spawn("alternate", "low")
+    check.select_parent("parent", first)
+    check.effective("parent", "medium", model_source="session", effort_source="parent_model_config")
+    check.spawn("parent", "medium")
+    check.state("reset")
+    check.effective("temporary", "medium", model_source="parent_model_config",
+                    effort_source="parent_model_config")
+    check.spawn("temporary", "medium")
+    check.spawn("temporary", "medium", session=second)
+
+
+def parent_effort_fallback(check):
+    """省略、空白和非法字符串回退全局；合法但不支持的档位保留基础值。"""
+    for parent, warning in (("plain", False), ("temporary", False), ("alternate", True)):
+        check.select_parent(parent)
+        state = check.effective("global", "low", warning=warning, effort_source="config")
+        if warning:
+            assert "fixture-invalid-effort" in state["warning"], state
+        else:
+            assert not state.get("warning"), state
+        check.spawn("global", "low")
+    check.select_parent("parent")
+    check.effective("global", "high", effort_source="parent_model_config")
+    check.spawn("global", "high")
+    for model, effort in (("plain", None), ("limited", "low")):
+        check.state("set", modelId=model)
+        state = check.effective(model, effort, warning=True, effort_source="model_default")
+        assert "high" in state["warning"] and model in state["warning"], state
+        check.spawn(model, effort)
+
+
+def parent_effort_discovery(check):
+    """临时主模型不借来源 effort，临时子模型仍校验能力，两会话配置不串用。"""
+    first, second = check.sessions
+    check.effective("temporary", "medium", effort_source="parent_model_config")
+    check.discover_parent(first)
+    check.effective("global", "high", model_source="config", effort_source="config")
+    check.spawn("global", "high")
+    check.effective("temporary", "medium", session=second, effort_source="parent_model_config")
+    check.spawn("temporary", "medium", session=second)
+    check.select_parent("parent", first)
+    check.state("set", modelId=DISCOVERED)
+    check.effective(DISCOVERED, None, warning=True, effort_source="model_default")
+    check.spawn(DISCOVERED, None)
+    check.state("reset")
+    check.effective("temporary", "medium", effort_source="parent_model_config")
+    check.spawn("temporary", "medium")
+
+
+def parent_effort_resume(check):
+    """父模型与临时 effort 改变后，resume 仍采用原目标及既有基础 effort 规则。"""
+    original = check.spawn("temporary", "medium")
+    check.select_parent("alternate")
+    check.state("set", modelId="global", reasoningEffort="high")
+    check.effective("global", "high", effort_source="session")
+    check.spawn("global", "high")
+    check.spawn("temporary", "medium", resume_from=original)
+
+
 def unsupported_effort(check):
     """无推理能力或缺少 high 档位时告警并保留各自基础值。"""
     for model, effort in (("plain", None), ("limited", "low")):
@@ -698,6 +843,13 @@ SCENARIOS = {
     "parent-model-fallback": ("parent-model", parent_model_fallback),
     "parent-model-lifecycle": ("parent-model", parent_model_lifecycle),
     "parent-model-discovery": ("parent-model", parent_model_discovery),
+    "parent-effort-selection": ("parent-effort", parent_effort_selection),
+    "parent-effort-only": ("parent-effort-only", parent_effort_only),
+    "parent-effort-priority": ("parent-effort-priority", parent_effort_priority),
+    "parent-effort-lifecycle": ("parent-effort", parent_effort_lifecycle),
+    "parent-effort-fallback": ("parent-effort-fallback", parent_effort_fallback),
+    "parent-effort-discovery": ("parent-effort", parent_effort_discovery),
+    "parent-effort-resume": ("parent-effort", parent_effort_resume),
     "temporary-lifecycle": ("global", temporary_lifecycle),
     "unsupported-effort": ("global", unsupported_effort),
     "invalid-parameters": ("global", invalid_parameters),

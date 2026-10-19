@@ -102,6 +102,9 @@ pub struct SubagentsModelState {
     /// 当前主模型配置的子代理默认值。
     #[serde(default)]
     pub parent_configured_model: Option<String>,
+    /// 当前主模型配置的子代理推理强度原值，兼容旧服务端时可缺省。
+    #[serde(default)]
+    pub parent_configured_effort: Option<String>,
     /// 全局模型配置原值，不包含临时选择。
     pub configured_model: Option<String>,
     /// 全局推理强度原值，保留无效字符串供诊断。

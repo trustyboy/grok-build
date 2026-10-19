@@ -221,12 +221,23 @@ async fn subagents_effort_priority_is_independent_of_model_priority() {
         },
     );
     ctx.subagent_default_reasoning_effort = Some("high".into());
+    ctx.agent_config
+        .get_or_insert_with(Default::default)
+        .config_models
+        .insert(
+            "parent".into(),
+            crate::agent::config::ConfigModelOverride {
+                subagent_model_reasoning_effort: Some("xhigh".into()),
+                ..Default::default()
+            },
+        );
     definition.effort = Some(Effort::Low);
     for (source, expected) in [
         ("explicit", ReasoningEffort::High),
         ("session", ReasoningEffort::Low),
         ("role", ReasoningEffort::Xhigh),
         ("persona", ReasoningEffort::Medium),
+        ("parent_model_config", ReasoningEffort::Xhigh),
         ("config", ReasoningEffort::High),
         ("definition", ReasoningEffort::Low),
         ("model_default", ReasoningEffort::Medium),
@@ -246,11 +257,140 @@ async fn subagents_effort_priority_is_independent_of_model_priority() {
             }
             "role" => ctx.subagent_roles.clear(),
             "persona" => ctx.subagent_personas.clear(),
+            "parent_model_config" => ctx.agent_config.as_mut().unwrap().config_models.clear(),
             "config" => ctx.subagent_default_reasoning_effort = None,
             "definition" => definition.effort = None,
             _ => {}
         }
     }
+}
+
+/// 同一上游路由的不同父模型仍使用各自配置，继承和显式模型均可应用专属 effort。
+#[tokio::test]
+async fn subagents_parent_effort_follows_catalog_key_and_inherit() {
+    let (mut ctx, definition) = model_context();
+    let mut second = ctx.available_models["parent"].clone();
+    second.info.model = "parent-wire".into();
+    ctx.available_models.get_mut("parent").unwrap().info.model = "parent-wire".into();
+    ctx.available_models.insert("parent-second".into(), second);
+    for (key, effort) in [("parent", "xhigh"), ("parent-second", "low")] {
+        ctx.agent_config
+            .get_or_insert_with(Default::default)
+            .config_models
+            .insert(
+                key.into(),
+                crate::agent::config::ConfigModelOverride {
+                    subagent_model_reasoning_effort: Some(effort.into()),
+                    ..Default::default()
+                },
+            );
+    }
+    ctx.subagent_default_reasoning_effort = Some("high".into());
+    ctx.subagent_default_model = Some("config".into());
+    for (key, expected) in [
+        ("parent", ReasoningEffort::Xhigh),
+        ("parent-second", ReasoningEffort::Low),
+    ] {
+        ctx.model_id = acp::ModelId::new(key);
+        for (selection, target) in [
+            (SubagentsModelSelection::Default, "config"),
+            (SubagentsModelSelection::Inherit, key),
+            (SubagentsModelSelection::Default, "config"),
+        ] {
+            ctx.subagents_model = selection;
+            let resolved = ordinary(&ctx, &definition, &Default::default()).await;
+            assert_eq!(resolved.model_id.0.as_ref(), target);
+            assert_eq!(resolved.sampling.reasoning_effort, Some(expected));
+            assert_eq!(resolved.effort_source, "parent_model_config");
+            let state = subagents_model_state(&ctx).await;
+            assert_eq!(state.reasoning_effort, Some(expected));
+            assert_eq!(state.effort_source, "parent_model_config");
+            assert_eq!(state.parent_configured_effort, Some(expected.to_string()));
+            assert_eq!(state.configured_effort.as_deref(), Some("high"));
+            assert!(state.parent_configured_model.is_none());
+        }
+        let resolved = ordinary(
+            &ctx,
+            &definition,
+            &SubagentRuntimeOverrides {
+                model: Some("explicit".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(resolved.model_id.0.as_ref(), "explicit");
+        assert_eq!(resolved.sampling.reasoning_effort, Some(expected));
+    }
+    // 临时目录条目与来源路由相同，也不能借用来源的专属 effort。
+    ctx.available_models.insert(
+        "runtime-parent".into(),
+        ctx.available_models["parent"].clone(),
+    );
+    ctx.model_id = acp::ModelId::new("runtime-parent");
+    let resolved = ordinary(&ctx, &definition, &Default::default()).await;
+    assert_eq!(
+        resolved.sampling.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+    assert_eq!(resolved.effort_source, "config");
+    assert!(
+        subagents_model_state(&ctx)
+            .await
+            .parent_configured_effort
+            .is_none()
+    );
+}
+
+/// 空白和非法值回退全局，合法但不受目标支持的档位保留基础值。
+#[tokio::test]
+async fn subagents_parent_effort_fallback_and_target_validation() {
+    let (mut ctx, definition) = model_context();
+    ctx.subagent_default_model = Some("config".into());
+    ctx.subagent_default_reasoning_effort = Some("high".into());
+    for (raw, expected, source, warnings) in [
+        (None, ReasoningEffort::High, "config", 0),
+        (Some("  "), ReasoningEffort::High, "config", 0),
+        (Some("invalid"), ReasoningEffort::High, "config", 1),
+        (Some("max"), ReasoningEffort::Medium, "model_default", 1),
+        (
+            Some(" low "),
+            ReasoningEffort::Low,
+            "parent_model_config",
+            0,
+        ),
+    ] {
+        ctx.agent_config
+            .get_or_insert_with(Default::default)
+            .config_models
+            .insert(
+                "parent".into(),
+                crate::agent::config::ConfigModelOverride {
+                    subagent_model_reasoning_effort: raw.map(str::to_owned),
+                    ..Default::default()
+                },
+            );
+        let resolved = ordinary(&ctx, &definition, &Default::default()).await;
+        assert_eq!(
+            resolved.sampling.reasoning_effort,
+            Some(expected),
+            "{raw:?}"
+        );
+        assert_eq!(resolved.effort_source, source);
+        assert_eq!(resolved.warnings.len(), warnings);
+        let state = subagents_model_state(&ctx).await;
+        assert_eq!(state.reasoning_effort, resolved.sampling.reasoning_effort);
+        assert_eq!(
+            state.parent_configured_effort.as_deref(),
+            raw.map(str::trim).filter(|v| !v.is_empty())
+        );
+    }
+    let entry = ctx.available_models.get_mut("config").unwrap();
+    entry.info.supports_reasoning_effort = false;
+    entry.info.reasoning_effort = None;
+    let resolved = ordinary(&ctx, &definition, &Default::default()).await;
+    assert_eq!(resolved.sampling.reasoning_effort, None);
+    assert_eq!(resolved.effort_source, "model_default");
+    assert_eq!(resolved.warnings.len(), 1);
 }
 
 #[tokio::test]
@@ -490,6 +630,17 @@ async fn subagents_invalid_effort_falls_through_to_definition() {
 #[tokio::test]
 async fn subagents_resume_and_fork_ignore_new_model_overrides() {
     let (mut ctx, _) = model_context();
+    ctx.agent_config
+        .get_or_insert_with(Default::default)
+        .config_models
+        .insert(
+            "parent".into(),
+            crate::agent::config::ConfigModelOverride {
+                subagent_model: Some("per-parent".into()),
+                subagent_model_reasoning_effort: Some("xhigh".into()),
+                ..Default::default()
+            },
+        );
     ctx.subagent_default_model = Some("config".into());
     ctx.subagent_default_reasoning_effort = Some("high".into());
     ctx.subagents_model = SubagentsModelSelection::Model {

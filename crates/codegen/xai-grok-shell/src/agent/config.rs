@@ -3546,6 +3546,8 @@ pub struct ConfigModelOverride {
     pub subagent_rate_limit_max_attempts: Option<u32>,
     /// 此主模型的新建子代理默认模型，按父会话目录键读取。
     pub subagent_model: Option<String>,
+    /// 此主模型的新建子代理推理强度；独立于模型选择，保留原值供状态告警。
+    pub subagent_model_reasoning_effort: Option<String>,
     pub hidden: Option<bool>,
     pub supported_in_api: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,

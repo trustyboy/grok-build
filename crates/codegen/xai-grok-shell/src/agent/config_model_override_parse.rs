@@ -575,6 +575,42 @@ mod tests {
         );
     }
 
+    /// 专属子代理 effort 独立解析，保留诊断原值且不改变父模型参数。
+    #[test]
+    fn subagent_model_reasoning_effort_parses_without_changing_parent_effort() {
+        for value in [None, Some("xhigh"), Some("  "), Some("invalid")] {
+            let field = value
+                .map(|v| format!("subagent_model_reasoning_effort = {v:?}"))
+                .unwrap_or_default();
+            let cfg = parse_cfg(&format!(
+                "[model.parent]\nmodel = 'parent-wire'\nreasoning_effort = 'low'\n{field}"
+            ));
+            assert!(cfg.config_warnings.is_empty());
+            let parent = &cfg.config_models["parent"];
+            assert_eq!(parent.subagent_model_reasoning_effort.as_deref(), value);
+            assert!(parent.subagent_model.is_none());
+            let models = crate::agent::config::resolve_model_list(&cfg, None);
+            assert_eq!(models["parent"].info.model, "parent-wire");
+            assert_eq!(
+                models["parent"].info.reasoning_effort,
+                Some(ReasoningEffort::Low)
+            );
+        }
+        let cfg = parse_cfg(
+            "[model.parent]\nmodel = 'parent-wire'\nsubagent_model = 'child'\nsubagent_model_reasoning_effort = 7",
+        );
+        let parent = &cfg.config_models["parent"];
+        assert!(parent.subagent_model_reasoning_effort.is_none());
+        assert_eq!(parent.subagent_model.as_deref(), Some("child"));
+        assert_eq!(parent.model.as_deref(), Some("parent-wire"));
+        assert!(
+            cfg.config_warnings
+                .iter()
+                .any(|warning| warning.kind == ConfigWarningKind::InvalidValue
+                    && warning.field() == Some("subagent_model_reasoning_effort"))
+        );
+    }
+
     #[test]
     fn fast_mode_parses_and_reaches_the_resolved_model() {
         for fast_mode in [None, Some(false), Some(true)] {
@@ -843,6 +879,7 @@ mod tests {
             rate_limit_retry_threshold: Some(4),
             subagent_rate_limit_max_attempts: Some(8),
             subagent_model: Some("child-model".into()),
+            subagent_model_reasoning_effort: Some("xhigh".into()),
             hidden: Some(false),
             supported_in_api: Some(true),
             reasoning_effort: Some(ReasoningEffort::High),

@@ -228,6 +228,9 @@ fn subagents_model_message(state: &SubagentsModelState) -> String {
     if let Some(model) = &state.parent_configured_model {
         message.push_str(&format!("\n主模型专属子代理配置：{model}"));
     }
+    if let Some(effort) = &state.parent_configured_effort {
+        message.push_str(&format!("\n主模型专属子代理推理强度：{effort}"));
+    }
     if let Some(model) = &state.configured_model {
         message.push_str(&format!("\n配置模型：{model}"));
     }
