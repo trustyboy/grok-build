@@ -187,6 +187,8 @@ if ($LASTEXITCODE -ne 0) { throw "远程 Release 构建失败，SSH 退出码：
 
 - `xai-grok-sampler/src/stream/chat_completions.rs` 按工具调用 `index` 合并响应片段；后续 `function.name` 为空字符串、null 或缺省时保留已有名称，流式事件也应跳过空名称更新。部分 DeepSeek 兼容接口会持续返回空名称占位符，合并上游时需保留此处理。
 - 回归测试位于同文件的 `tool_call_stream_*`，覆盖交错调用、空名称、null、字段缺省和延迟名称；原始流始终缺少名称时保持原有错误路径。
+- 工具图片由 `sampling-types/src/conversation/chat_completions.rs` 在请求转换时追加到完整工具结果组后的用户消息，`tool.content` 保持字符串。多工具结果必须连续，图片按来源调用 ID 标记并保持顺序；历史本体和 Responses/Messages 原生图片格式保持原样。
+- 工具图片定向测试运行 sampling-types 的 `chat_completions`、`tool_result_with_images` 和 sampler 的 `chat_completions_tool_images`；构建后运行 `python -B tools/test-tool-result-images.py`，验证真实读图、视觉模型切换、冷恢复和视觉关闭。
 
 ## 插件系统（vision-bridge）
 

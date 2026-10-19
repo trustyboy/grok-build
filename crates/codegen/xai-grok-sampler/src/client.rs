@@ -2789,6 +2789,92 @@ mod tests {
         }
     }
 
+    /// 流式与非流式请求均将工具图片移到用户消息，关闭视觉时只保留工具文字。
+    #[tokio::test]
+    async fn chat_completions_tool_images_preserve_vision_for_streaming_and_unary() {
+        for supports_vision in [false, true] {
+            for streaming in [false, true] {
+                let (body_tx, body_rx) = oneshot::channel();
+                let body_tx = Arc::new(std::sync::Mutex::new(Some(body_tx)));
+                let app = Router::new().route(
+                    "/v1/chat/completions",
+                    post(move |body: Bytes| {
+                        let body_tx = body_tx.clone();
+                        async move {
+                            body_tx.lock().unwrap().take().unwrap().send(body).unwrap();
+                            let (content_type, body) =
+                                if streaming {
+                                    ("text/event-stream", "data: [DONE]\n\n".to_owned())
+                                } else {
+                                    ("application/json", serde_json::json!({
+                                "id": "fixture", "object": "chat.completion", "created": 0,
+                                "model": "test-model", "choices": [{"index": 0,
+                                    "message": {"role": "assistant", "content": "ok"},
+                                    "finish_reason": "stop"}]
+                            }).to_string())
+                                };
+                            axum::response::Response::builder()
+                                .header("content-type", content_type)
+                                .body(axum::body::Body::from(body))
+                                .unwrap()
+                        }
+                    }),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let client = SamplingClient::new(SamplerConfig {
+                    base_url: format!("http://{addr}/v1"),
+                    supports_vision,
+                    ..minimal_config()
+                })
+                .unwrap();
+                let request = ConversationRequest::from_items(vec![
+                    ConversationItem::assistant_tool_calls(vec![
+                        xai_grok_sampling_types::ToolCall {
+                            id: "call_image".into(),
+                            name: "read_file".into(),
+                            arguments: "{}".into(),
+                        },
+                    ]),
+                    ConversationItem::tool_result_with_images(
+                        "call_image",
+                        "Read image file: fixture.png",
+                        vec![ContentPart::Image {
+                            url: "data:image/png;base64,AAAA".into(),
+                        }],
+                    ),
+                ]);
+                if streaming {
+                    let (_stream, _metadata) = client.conversation_stream(request).await.unwrap();
+                } else {
+                    client.conversation(request).await.unwrap();
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&body_rx.await.unwrap()).unwrap();
+                server.abort();
+                let messages = body["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), if supports_vision { 3 } else { 2 });
+                assert_eq!(messages[1]["role"], "tool");
+                assert_eq!(messages[1]["tool_call_id"], "call_image");
+                assert!(
+                    messages[1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("fixture.png")
+                );
+                assert_eq!(body.to_string().contains("AAAA"), supports_vision);
+                if supports_vision {
+                    assert_eq!(messages[2]["role"], "user");
+                    assert_eq!(
+                        messages[2]["content"][1]["image_url"]["url"],
+                        "data:image/png;base64,AAAA"
+                    );
+                }
+            }
+        }
+    }
+
     /// Verify the serialized shape of StreamingChatRequest matches the
     /// expected wire format: all ChatCompletionRequest fields flattened at
     /// top level, plus `stream: true` and `stream_options.include_usage: true`.

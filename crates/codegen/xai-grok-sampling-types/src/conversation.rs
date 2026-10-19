@@ -307,8 +307,8 @@ pub struct ToolResultItem {
     pub tool_call_id: String,
     /// The result content
     pub content: Arc<str>,
-    /// Inline images associated with this tool result (e.g. from `read_file` on an image/PDF).
-    /// When non-empty, the API conversion layers embed these directly in the tool result message rather than in a separate follow-up user message.
+    /// 工具返回的图片（如 `read_file` 读取的图片或 PDF 页面），在历史中保留工具归属。
+    /// Chat Completions 将图片附在完整工具结果组后的用户消息；Responses 和 Messages 保留原生工具图片结构。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ContentPart>,
 }

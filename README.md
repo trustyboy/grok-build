@@ -151,6 +151,8 @@ subagent_model_reasoning_effort = "high"
 
 Chat Completions 流式工具调用支持后续片段将 `function.name` 留空、设为 `null` 或省略的接口。程序会保留已收到的有效工具名并继续拼接参数，解决部分 DeepSeek 兼容网关触发的空工具名 `Tool not found` 错误。该兼容处理自动生效，使用包含修复的新构建即可。
 
+工具读取的图片和 PDF 页面在 Chat Completions 请求中放到完整工具结果组后的用户消息，工具结果保留文字和调用关联，兼容 DeepSeek 等要求文字工具结果的接口。开启 `supports_vision` 后，切换视觉模型及恢复旧会话均可继续发送历史工具图片。历史存储保留图片原有归属，Responses 和 Messages 继续使用各自的原生工具图片格式。
+
 ## Installing the released binary
 
 Prebuilt binaries are published for macOS, Linux, and Windows:

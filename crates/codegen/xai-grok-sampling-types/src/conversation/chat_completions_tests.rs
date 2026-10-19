@@ -551,33 +551,165 @@ fn test_sanitize_non_ascii_args_preview_does_not_panic() {
     );
 }
 
+/// 旧历史中的工具图片在请求转换时移到用户消息，原有图片和工具关联完整保留。
 #[test]
 fn test_tool_result_with_images_to_chat_completions() {
-    let item = ConversationItem::tool_result_with_images(
-        "call_1",
-        "Read image file: photo.png",
-        vec![ContentPart::Image {
-            url: "data:image/png;base64,iVBOR".into(),
-        }],
+    let items = vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"photo.png"}"#.into(),
+        }]),
+        ConversationItem::tool_result_with_images(
+            "call_1",
+            "Read image file: photo.png",
+            vec![
+                ContentPart::Image {
+                    url: "data:image/png;base64,iVBOR".into(),
+                },
+                ContentPart::Image {
+                    url: "https://example.com/photo.png".into(),
+                },
+            ],
+        ),
+    ];
+    let history = serde_json::to_value(&items).unwrap();
+    let restored = serde_json::from_value(history.clone()).unwrap();
+    let request: ChatCompletionRequest = ConversationRequest::from_items(restored).into();
+    let wire = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        wire["messages"][1],
+        serde_json::json!({
+            "role": "tool", "tool_call_id": "call_1", "content": "Read image file: photo.png"
+        })
     );
-
-    let msg = conversation_item_to_chat_message(item);
-    assert_eq!(msg.role, Role::Tool);
-    assert_eq!(msg.tool_call_id, Some("call_1".to_string()));
-
-    let MessageContent::Blocks(blocks) = &msg.content else {
-        panic!(
-            "Expected Blocks content for image tool result, got {:?}",
-            msg.content
-        );
-    };
-    let [b0, b1] = blocks.as_slice() else {
-        panic!("expected two blocks: {blocks:?}");
-    };
-    assert!(matches!(b0, ChatContentBlock::Text { text } if text == "Read image file: photo.png"));
-    assert!(
-        matches!(b1, ChatContentBlock::ImageUrl { image_url } if image_url.url == "data:image/png;base64,iVBOR")
+    assert_eq!(
+        wire["messages"][2],
+        serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "[工具调用 call_1 返回的图片]"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/photo.png"}}
+            ]
+        })
     );
+    assert_eq!(request.messages.len(), 3);
+    assert_eq!(serde_json::to_value(&items).unwrap(), history);
+}
+
+/// 同一批工具全部返回后才插入图片；文字结果和后续推理继续保持顺序。
+#[test]
+fn tool_images_follow_parallel_results_before_assistant_reasoning() {
+    let mut items = vec![ConversationItem::assistant_tool_calls(
+        ["call_1", "call_2", "call_3"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            })
+            .collect(),
+    )];
+    for (id, url) in [
+        ("call_3", Some("https://example.com/3.png")),
+        ("call_2", None),
+        ("call_1", Some("https://example.com/1.png")),
+    ] {
+        items.push(ConversationItem::tool_result_with_images(
+            id,
+            format!("result {id}"),
+            url.into_iter()
+                .map(|url| ContentPart::Image { url: url.into() })
+                .collect(),
+        ));
+    }
+    items.push(reasoning_sibling("r1", "inspect both images", None));
+    items.push(ConversationItem::assistant("answer"));
+    let messages = conversation_to_chat_messages(items);
+    let [calls, third, second, first, images, answer] = messages.as_slice() else {
+        panic!("unexpected messages: {messages:?}");
+    };
+    assert_eq!(calls.tool_calls.len(), 3);
+    for (message, id) in [(third, "call_3"), (second, "call_2"), (first, "call_1")] {
+        assert_eq!(message.role, Role::Tool);
+        assert_eq!(message.tool_call_id.as_deref(), Some(id));
+        assert_matches!(&message.content, MessageContent::Text(text) if text == &format!("result {id}"));
+    }
+    assert_eq!(images.role, Role::User);
+    assert_eq!(
+        serde_json::to_value(&images.content).unwrap(),
+        serde_json::json!([
+            {"type": "text", "text": "[工具调用 call_3 返回的图片]"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/3.png"}},
+            {"type": "text", "text": "[工具调用 call_1 返回的图片]"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/1.png"}}
+        ])
+    );
+    assert_eq!(
+        answer.reasoning_content.as_deref(),
+        Some("inspect both images")
+    );
+    assert_eq!(answer.text_content(), "answer");
+}
+
+/// 图片停留在原工具结果之后，重试用户消息和下一批工具图片均不重排或重复。
+#[test]
+fn tool_images_preserve_user_and_tool_group_boundaries() {
+    let items = vec![
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "first".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_images(
+            "first",
+            "",
+            vec![ContentPart::Image {
+                url: "https://example.com/first.png".into(),
+            }],
+        ),
+        ConversationItem::user("retry"),
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "text_only".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result("text_only", "plain"),
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "second".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result_with_images(
+            "second",
+            "second image",
+            vec![ContentPart::Image {
+                url: "https://example.com/second.png".into(),
+            }],
+        ),
+    ];
+    let messages = conversation_to_chat_messages(items);
+    assert_eq!(
+        messages.iter().map(|m| m.role.clone()).collect::<Vec<_>>(),
+        vec![
+            Role::Assistant,
+            Role::Tool,
+            Role::User,
+            Role::User,
+            Role::Assistant,
+            Role::Tool,
+            Role::Assistant,
+            Role::Tool,
+            Role::User,
+        ]
+    );
+    assert_eq!(messages[1].text_content(), "");
+    assert_eq!(messages[3].text_content(), "retry");
+    assert_eq!(messages[5].text_content(), "plain");
+    let wire = serde_json::to_string(&messages).unwrap();
+    assert_eq!(wire.matches("https://example.com/first.png").count(), 1);
+    assert_eq!(wire.matches("https://example.com/second.png").count(), 1);
 }
 
 #[test]
