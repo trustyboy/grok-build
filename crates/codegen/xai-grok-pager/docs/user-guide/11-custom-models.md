@@ -123,20 +123,29 @@ fast_mode = true  # 长期默认开启；false 或省略时默认关闭
 
 **优先服务账单更高**。实际可用性、速度和费用取决于上游服务、模型和账户；选择 Responses 协议本身不保证服务商支持 `priority`。若上游拒绝该字段，可用 `/fast off` 恢复上游默认。Fast 不改变模型 ID、思考级别或上下文窗口。
 
-### 主模型专属子代理模型
+### 主模型专属子代理模型与推理强度
 
-在已有主模型配置中添加 `subagent_model`，目标使用已配置或已加载目录中的模型 ID：
+在已有主模型配置中添加专属默认值，目标使用已配置或已加载目录中的模型 ID：
 
 ```toml
 [model.cpa-deepseek-v4-flash]
 subagent_model = "nd-gpt-astra"
+subagent_model_reasoning_effort = "high"
+
+# 也可只设置 effort，模型仍按其他规则选择
+[model.my-model]
+subagent_model_reasoning_effort = "medium"
 ```
 
-该字段只选择模型，不设置子代理 effort；effort 继续遵循全局 `[subagent] reasoning_effort`、会话临时值等既有规则。child 使用目标自己的 API、凭据和能力，不复用主模型凭据。
+示例应合并到已有模型配置，ID 替换为实际模型目录键。`subagent_model` 与 `subagent_model_reasoning_effort` 独立可选；后者是可选字符串，接受 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`，实际可用档位由最终目标模型决定。child 使用目标自己的 API、凭据和能力，不复用主模型凭据。
 
-按当前父会话的**实时模型目录键**取值，而非上游请求中的 `model` 名称。普通模型优先级为「单次显式 > 会话 > role/persona > 按类型 > 主模型 `subagent_model` > 全局 `[subagent] model` > agent 定义 > 父模型」。省略/空白回退全局，无效目标告警并回退全局；临时发现模型若自身未配置，不借用其上游来源模型的该字段。
+两个字段共用父会话**实时模型目录键**查找，不按上游请求中的 `model` 名称查找。省略或空白分别回退全局 `[subagent] model/reasoning_effort`；无效模型告警后回退全局，非法 effort 字符串告警后继续低优先级。选中的合法档位若不受目标支持，则告警并保留基础配置。临时发现父模型不借用其上游来源模型的配置。
 
-切主模型立即影响后续新建 child，但不会覆盖 `/subagent-model` 的临时 set；`inherit` 跳过主模型专属及全局模型规则，`reset` 恢复当前主模型规则。状态来源显示「主模型专属配置」，全局配置值与当前主模型专属值分别显示；已运行 child 不切换。详见[子代理指南](16-subagents.md#主模型专属默认模型)。
+普通新建子代理的模型优先级为「单次显式 > 会话 > role/persona > 按类型 > 主模型 `subagent_model` > 全局 `[subagent] model` > agent 定义 > 父模型」；effort 独立解析为「单次显式 > 会话临时（最终同一目标）> role/persona > 父模型 `subagent_model_reasoning_effort` > `[subagent] reasoning_effort` > agent 定义 > 基础配置」。基础配置在继承路径取父会话当前值，指定其他模型时取目标默认值。
+
+切主模型影响后续新建 child；临时 set 的模型及显式 effort 保持优先，未指定临时 effort 时仍按当前父模型解析。`inherit` 仅决定模型，跳过主模型专属及全局模型规则，仍应用父模型专属及全局 effort；`reset` 恢复当前主模型规则，两者均清除临时窗口与 effort。已有 child 保持启动快照，resume 固定原模型、内部 fork-context 固定父模型。
+
+状态中 `configuredModel`、`configuredEffort` 保留全局值，可选 `parentConfiguredModel`、`parentConfiguredEffort` 分别显示父模型专属模型及 effort 原值，`parentModelId` 表示当前父模型；`modelSource` 或 `effortSource` 为 `parent_model_config` 时显示「主模型专属配置」。详见[子代理指南](16-subagents.md#主模型专属默认模型)。
 
 ### Credential Resolution
 

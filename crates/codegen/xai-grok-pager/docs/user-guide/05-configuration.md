@@ -369,7 +369,19 @@ plan = false
 explore = "grok-4.6"               # route to different models
 ```
 
-按类型指定模型用 `[subagent.models]`；统一默认模型和 effort 用 `[subagent] model/reasoning_effort`，主模型专属默认用 `[model.<id>] subagent_model`。后者只指定模型，低于按类型规则、高于统一默认；完整优先级见[子代理配置](16-subagents.md#模型与推理强度优先级)。
+按类型指定模型用 `[subagent.models]`；统一默认模型和 effort 用 `[subagent] model/reasoning_effort`。主模型专属默认可在已有模型配置中添加：
+
+```toml
+[model.cpa-deepseek-v4-flash]
+subagent_model = "nd-gpt-astra"
+subagent_model_reasoning_effort = "high"
+```
+
+两个字段独立可选，只设置 `subagent_model_reasoning_effort` 不改变模型选择。二者共用父会话实时模型目录键查找，省略或空白分别回退全局模型/effort；无效模型告警后回退全局，非法 effort 字符串告警后继续低优先级，选中的合法档位若不受目标支持则告警并保留基础配置。临时发现父模型不借用来源模型配置。
+
+普通新建子代理的模型优先级为「单次显式 > 会话 > role/persona > 按类型 > 主模型 `subagent_model` > 全局 `[subagent] model` > agent 定义 > 父模型」；effort 为「单次显式 > 会话临时（最终同一目标）> role/persona > 父模型 `subagent_model_reasoning_effort` > `[subagent] reasoning_effort` > agent 定义 > 基础配置」。完整说明见[子代理配置](16-subagents.md#模型与推理强度优先级)。
+
+切父模型影响后续新建子代理，临时 set 的模型及显式 effort 保持优先；未指定临时 effort 时仍按当前父模型解析。`inherit` 仅决定模型，仍应用父模型专属及全局 effort；`inherit/reset` 均清除临时窗口与 effort。resume 固定原模型，内部 fork-context 固定父模型。
 
 正式配置名称为 `[subagent]` 及其 `models/roles/personas/toggle` 子表。旧 `[subagents]` 仍兼容读取，新旧同键单数优先，旧表独有键保留；环境变量和 `--no-subagents` 不改名。会话临时选择用 `/subagent-model`，旧 `/subagents-model` 保留兼容别名。
 

@@ -78,11 +78,15 @@ responses_compact_threshold = 200000
 
 默认关闭，省略该字段沿用客户端摘要压缩。阈值必须为正整数且小于模型当前有效上下文窗口；请预留足够的输出与工具结果空间。Chat Completions 和 Messages 配置该字段会告警并禁用。程序不自动探测上游能力；上游拒绝参数时显示错误，需要自行调整配置。
 
-启用后，Responses 请求携带 `context_management`，服务端负责常规阈值压缩。Grok 使用最新有效压缩项缩短后续请求，同时保留现有本地会话记录；手动 `/compact` 和硬性容量保护继续有效。模型、连接、认证或历史内容变化导致压缩点失效时，回到现有保留历史，避免误用加密上下文。上游未提供压缩后精确用量时，上下文数字为保守估计，累计输入/输出用量仍按上游报告记录。
+启用后，Responses 请求携带 `context_management`，服务端负责常规阈值压缩。Grok 将有效压缩点、请求投影和计数依据随会话历史保存；退出进程再恢复会话时，会重新验证来源、历史前缀与工具配对，再构造实际请求。本地完整记录继续保留，实际请求只包含有效压缩点、必要系统指令和后续内容。
+
+每次发送前，程序按准备完成的实际请求检查上下文、工具定义和输出预留。模型、连接、认证或历史内容变化导致压缩点失效时，使用通用历史重新检查容量；超限时最多尝试一次客户端摘要恢复，仍超限则明确报错。未配置原生阈值时，现有客户端百分比压缩及后台预压缩继续生效；手动 `/compact` 继续可用。
+
+`/context` 显示原生压缩阈值和计数来源；压缩后的总量按有效上下文展示，无法精确拆分的分类另标为本地估算。上游提供 `usage.context_details` 时采用其上下文用量；缺少该字段的压缩响应使用估算，后续普通成功响应可通过上游 usage 校准。新追加内容和工具定义变化仍需估算；重新加载后，界面在下一次请求校验前标记为待校验。累计输入/输出账单与上下文计数分别记录，密文长度不作为精确 token 数。
 
 本功能不提供压缩完成百分比，也不调用独立 `/responses/compact` 接口。原生压缩可能产生额外费用，压缩结果无法人工直接阅读。
 
-Release 构建后运行 `python tools/test-responses-auto-compaction.py`，使用隔离配置和本地假上游验证开关、历史裁剪、工具调用及模型/协议隔离。
+Release 构建后运行 `python tools/test-responses-auto-compaction.py`，使用隔离配置和本地假上游验证开关、历史裁剪、工具调用、模型/协议隔离、进程重启恢复、计数校准、容量拦截及旧客户端摘要。
 
 ## Fast 快速模式（本分支）
 
@@ -113,14 +117,15 @@ model = "nd-gpt-astra"
 reasoning_effort = "high"
 ```
 
-还可在已有主模型配置中添加专属子代理模型（目标 ID 需已配置）：
+还可在已有主模型配置中添加专属子代理模型及推理强度（目标 ID 需已配置）：
 
 ```toml
 [model.cpa-deepseek-v4-flash]
 subagent_model = "nd-gpt-astra"
+subagent_model_reasoning_effort = "high"
 ```
 
-该字段只指定模型，不新增 effort 规则。按父会话**实时模型目录键**读取，主模型切换后立即影响后续新建 child；省略或空白回退全局 `[subagent] model`，无效目标告警后回退全局。临时发现的主模型若自身未配置该字段，也回退全局，不借用其上游来源模型的设置。
+两个字段独立可选；只设置 `subagent_model_reasoning_effort` 不改变模型选择。二者共用父会话**实时模型目录键**查找，省略或空白分别回退全局 `[subagent] model/reasoning_effort`；无效模型告警后回退全局，非法 effort 字符串告警后继续低优先级。临时发现的主模型不借用其上游来源模型的配置。
 
 只设置 `reasoning_effort` 且无其他模型规则时，子代理仍跟随父会话当前模型。模型不支持推理强度或指定档位时，提示原因并使用基础配置。`[subagent]` 及其 `models`、`roles`、`personas`、`toggle` 子表为正式名称；旧 `[subagents]` 仍兼容读取，新旧同键以单数为准，旧表独有键保留。
 
@@ -132,11 +137,11 @@ subagent_model = "nd-gpt-astra"
 | `/subagent-model inherit` | 临时直接跟随父模型，并清除临时窗口和 effort |
 | `/subagent-model reset` | 清除会话覆盖，恢复配置规则 |
 
-模型优先级：**单次显式指定 > 父会话临时选择 > role/persona > 按类型 `[subagent.models]` > 主模型 `subagent_model` > 全局 `[subagent] model` > agent 定义 > 父模型**。effort 独立解析：**单次显式 > 同一临时目标模型的会话 effort > role/persona > 全局 effort > agent 定义 > 基础采样配置**。基础值在继承路径取父会话当前值，其他模型取自身默认值。
+模型优先级：**单次显式指定 > 父会话临时选择 > role/persona > 按类型 `[subagent.models]` > 主模型 `subagent_model` > 全局 `[subagent] model` > agent 定义 > 父模型**。effort 独立解析：**单次显式 > 会话临时（最终同一目标）> role/persona > 父模型 `subagent_model_reasoning_effort` > `[subagent] reasoning_effort` > agent 定义 > 基础配置**。基础值在继承路径取父会话当前值，其他模型取自身默认值。
 
-临时设置只影响当前父会话之后**新建**的子代理，不改变主模型、其他父会话或磁盘配置。切主模型保留临时 set；`inherit` 跳过主模型专属和全局模型配置，仍应用有效的全局 effort；`reset` 恢复当前主模型对应的配置规则。已启动子代理不切换；恢复固定原模型，内部复制父上下文固定父模型。临时选择不跨进程重启或会话重新加载保存。
+临时设置只影响当前父会话之后**新建**的子代理，不改变主模型、其他父会话或磁盘配置。切主模型影响后续新建子代理，临时 set 的模型及显式 effort 保持优先；未指定临时 effort 时仍按当前父模型解析。`inherit` 仅决定模型，跳过主模型专属和全局模型配置，仍应用父模型专属及全局 effort；`reset` 恢复当前主模型对应的配置规则；两者均清除临时窗口与 effort。已启动子代理不切换；恢复固定原模型，内部复制父上下文固定父模型。临时选择不跨进程重启或会话重新加载保存。
 
-正式 ACP 入口为 `x.ai/session/subagent_model`；旧 `/subagents-model` 和 `x.ai/session/subagents_model` 仍是兼容别名。状态中 `configuredModel` 保持全局值，可选 `parentModelId`、`parentConfiguredModel` 表示当前父模型及其专属配置；`modelSource="parent_model_config"` 显示为「主模型专属配置」。
+正式 ACP 入口为 `x.ai/session/subagent_model`；旧 `/subagents-model` 和 `x.ai/session/subagents_model` 仍是兼容别名。状态中 `configuredModel`、`configuredEffort` 保持全局值；可选 `parentModelId`、`parentConfiguredModel`、`parentConfiguredEffort` 分别表示当前父模型、专属模型及专属 effort 原值。`modelSource` 或 `effortSource` 为 `parent_model_config` 时显示「主模型专属配置」。
 
 未知 ID 必须先单独发现，再为已加载模型设置其支持的参数；发现模型默认窗口为 `256000`、不支持原生视觉和 effort，该窗口不是服务商保证的上限。失败不替换已有选择。更多细节见[子代理指南](crates/codegen/xai-grok-pager/docs/user-guide/16-subagents.md)和[配置参考](crates/codegen/xai-grok-pager/docs/user-guide/26-config-reference.md)。
 

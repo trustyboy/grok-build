@@ -2,6 +2,9 @@
 
 ## 编译规则
 
+- 后续 Rust 编译、会触发编译的检查和定向测试统一在服务器 `192.168.136.147` 上执行，SSH 账户为 `Administrator`，仓库目录为 `F:\github\grok-build`。
+- 本机用于源码编辑、同步及无需编译的静态检查；本机 `target` 已清理。将编译产物和 Release 增量缓存集中保存在服务器的 `F:\github\grok-build\target`。
+- 本文所有构建、初始化和测试命令均在服务器的 PowerShell 7、仓库根目录执行；从本机发起 SSH 的示例另有标注。
 - 本项目只允许编译 Release 版本，不编译 Debug 版本。
 - Windows 下唯一的正式编译入口是：
 
@@ -27,6 +30,67 @@
   target\release\xai-grok-pager.exe
   ```
 
+### 远程编译步骤
+
+1. **同步需要构建的工作树。** 本机修改后，先核对两端的提交、`git status --short` 和相关文件内容，再同步源码、配置、测试和文档，包括本次需要的未提交修改及未跟踪文件。服务器已有完整仓库，后续同步保留服务器的 `.git`、`target` 和 `tools/windows-protoc/runtime`；同名文件存在远端独立修改时先比对合并。同步完成后核对文件哈希，避免编译旧代码。文件传输遇到 SCP/SFTP 的 `Connection closed` 时，可使用 SSH 标准输入传输文件或压缩包，并校验 SHA-256；临时包放系统临时目录，用完清理。
+
+2. **登录编译服务器。** 在本机执行：
+
+   ```powershell
+   ssh Administrator@192.168.136.147
+   ```
+
+   登录后进入 PowerShell 7：
+
+   ```powershell
+   pwsh -NoLogo -NoProfile
+   ```
+
+3. **加载环境并构建。** 在服务器 PowerShell 7 中执行：
+
+   ```powershell
+   $ErrorActionPreference = 'Stop'
+   Set-Location -LiteralPath 'F:\github\grok-build'
+   . 'C:\ProgramData\GrokBuild\Enable-GrokBuild.ps1' -UseProxy
+   & .\tools\windows-protoc\build-release.ps1 --locked
+   ```
+
+   环境脚本加载 x64 MSVC 和共享 Rust 工具链。`-UseProxy` 为当前终端及子进程设置 `http://192.168.136.140:1080`，本地回归服务保持直连；不需要代理时省略该参数。长时间构建应后台运行并检查任务退出码；临时日志保存在服务器系统临时目录，验证完成后清理。
+
+4. **核对产物并验证后台启动。** 成功产物为 `F:\github\grok-build\target\release\xai-grok-pager.exe`。在服务器仓库根目录执行：
+
+   ```powershell
+   & .\target\release\xai-grok-pager.exe --version
+   python -B tools/test-fast-mode.py --exe target/release/xai-grok-pager.exe
+   ```
+
+   Fast 回归使用隔离配置和本地假上游，会启动真实后台进程并验证会话及实际请求，无须真实模型凭据。按本次改动再选择相关定向测试；保留 8 MiB 主线程栈要求。
+
+### 从本机自动发起远程构建
+
+自动化使用 UTF-16LE Base64 编码的 PowerShell 命令，避免跨 SSH 的引号和路径转义问题。在本机 PowerShell 中执行以下命令；构建发生在服务器：
+
+```powershell
+$remoteCommand = @'
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+Set-Location -LiteralPath 'F:\github\grok-build'
+. 'C:\ProgramData\GrokBuild\Enable-GrokBuild.ps1' -UseProxy
+& .\tools\windows-protoc\build-release.ps1 --locked
+'@
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remoteCommand))
+ssh -T -o BatchMode=yes -o ServerAliveInterval=30 Administrator@192.168.136.147 "pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+if ($LASTEXITCODE -ne 0) { throw "远程 Release 构建失败，SSH 退出码：$LASTEXITCODE" }
+```
+
+### 服务器环境与缓存
+
+- 全用户 Rust 命令位于 `C:\Program Files\Rust\bin`；系统 `RUSTUP_HOME=C:\ProgramData\Rust\rustup`，已安装仓库固定的 Rust 1.94.0、rustfmt 和 Clippy。Cargo 下载缓存默认归各用户自己的 `%USERPROFILE%\.cargo`。
+- 全用户安装了 VS 2022 Build Tools、MSVC v143、Windows SDK、Python 3.14、ripgrep、CMake 和 Ninja；普通用户可读取和执行公共工具链，安装及升级由管理员维护。
+- ripgrep 实体文件位于 `C:\Program Files\ripgrep\rg.exe`，正式构建脚本会自动打包。仓库内 protoc 继续通过 `tools/windows-protoc/setup.ps1` 管理；公共备用工具包位于 `C:\ProgramData\GrokBuild\tools\windows-protoc\runtime`。
+- 服务器环境说明位于 `C:\ProgramData\GrokBuild\编译环境说明.md`。用户模型配置、凭据和插件仍按账户存放，独立于编译工具链。
+- 定向测试、Python 回归和缓存维护均在服务器运行。保留已生成的 Release 增量缓存；需要清理时先在服务器执行 `& .\tools\windows-protoc\clean-incremental.ps1` 预览，经用户授权后再加 `-Apply`。
+
 ## Windows protoc
 
 - 原生 Windows 构建必须使用 `tools/windows-protoc` 中的永久兼容方案，不要直接使用 PATH 中的 `protoc.exe`。
@@ -37,7 +101,7 @@
   ```
 
 - 初始化脚本固定安装官方 `protoc 29.3` Windows x64 版本，并校验下载包 SHA-256。
-- `tools/windows-protoc/runtime` 保存下载包、官方 `protoc.exe`、include 文件和兼容 Wrapper。该目录不会提交到 Git，但属于本机长期构建环境。
+- `tools/windows-protoc/runtime` 保存下载包、官方 `protoc.exe`、include 文件和兼容 Wrapper。该目录不会提交到 Git，属于编译服务器的长期构建环境；本机已有副本也按持久工具目录保留。
 - 禁止自动删除、清空或移动 `tools/windows-protoc/runtime`。如果确实需要更换版本或清理，必须先获得用户明确许可。
 - 不要修改 `crates/build/xai-proto-build` 来处理 Windows 的 `/dev/stdout` 与 `/dev/null` 问题；兼容逻辑应保持在独立的 `tools/windows-protoc` 模块内，以降低合并上游版本时的冲突。
 - 构建脚本只在子进程期间设置 `PROTOC`，执行完成后会恢复原来的环境变量。
@@ -45,7 +109,7 @@
 ## Windows ripgrep 打包
 
 - `grep` 工具外挂 ripgrep 子进程。Windows 上 `build.rs` 不会自动打包（官方只发 `.zip`，无解压路径），产物默认依赖目标机器 PATH 中的 `rg`，缺失时只报 `program not found`，表现为「搜索永远无结果」。
-- `build-release.ps1` 会自动发现本机 `rg` 并通过 `GROK_TOOLS_BUNDLE_RG_PATH` 打包进产物，使 exe 自包含、可直接复制到其他 Windows 机器。构建机需先 `winget install BurntSushi.ripgrep.MSVC`；找不到时只警告不阻断构建。
+- `build-release.ps1` 会自动发现编译服务器上的 `rg` 并通过 `GROK_TOOLS_BUNDLE_RG_PATH` 打包进产物，使 exe 自包含、可直接复制到其他 Windows 机器。当前服务器已全用户安装 ripgrep；新构建环境可使用 `winget install BurntSushi.ripgrep.MSVC` 安装。找不到时只警告不阻断构建。
 - winget 的 `rg.exe` 是 0 字节符号链接，必须解析到真实文件后再打包。
 - `resolve_bundled_rg()` 在 Windows 下必须给解出的文件补 `.exe` 后缀，否则 `CreateProcessW` 无法执行。
 - 排查 grep 异常时，先看会话 `updates.jsonl` 中 `rawOutput.stderr` 的字节数组 —— 解出 `program not found` 即为此问题。
@@ -76,7 +140,7 @@
 - 临时模型不写配置或默认模型，能力默认为视觉关闭、256000 上下文、无思考参数。
 - 临时目录在 `agent/remote_config/manager/runtime.rs` 保存来源引用；鉴权路径必须识别临时模型，不能只从磁盘查找后误判为登录认证。
 - `/support_vision [on|off]` 的覆盖只属于当前会话和模型；hook 与 sampler 使用 `session/acp_session_impl/sampler_turn.rs` 的同一轮次快照，禁止改回读取共享 `current_model_id`。
-- 本地端到端验证：先完成 Release 构建，再运行 `python tools/test-model-discovery.py`。脚本使用临时配置和本地假上游，不需要真实凭据。
+- 服务器端到端验证：先完成 Release 构建，再运行 `python tools/test-model-discovery.py`。脚本使用临时配置和本地假上游，不需要真实凭据。
 
 ## GPT Fast 模式
 
@@ -89,13 +153,14 @@
 
 - `[subagent] model`、`reasoning_effort` 独立可选；`/subagent-model [status|inherit|reset|模型ID或名称 [window] [effort]]` 只改变当前父会话后续新建子代理，不改主模型或磁盘配置。状态描述默认 `general-purpose`，不是所有角色的最终结果。
 - 用户可见正式名称为 `[subagent]` 及 `models/roles/personas/toggle` 子表、`/subagent-model`、`x.ai/session/subagent_model`。旧 `[subagents]` 兼容读取，同键单数优先、旧表独有键保留；旧命令与旧 endpoint 保留别名。内部复数目录、集合和历史文件名无需改名。
-- 普通模型优先级：单次显式 > 会话 > role/persona > type pins > 主模型 `subagent_model` > global > agent definition > parent。effort：单次显式 > 会话（最终采用同一临时目标）> role/persona > global > definition > 基础配置。主模型专属字段只指定 model；目标不支持 effort 或具体档位时告警并回退基础值。
-- `[model.cpa-deepseek-v4-flash] subagent_model = "nd-gpt-astra"` 按父会话实时模型目录键读取；省略/空白回退 global，无效目标告警回退 global。切主模型立即改变后续 child，临时 set 保持；临时发现模型自身未配置时不得借用上游来源模型字段。
-- 状态可选字段 `parentModelId`、`parentConfiguredModel` 分别描述当前父模型及其专属配置，`configuredModel` 始终保留全局值；`modelSource="parent_model_config"` 的中文展示为「主模型专属配置」。
-- `inherit` 直接使用父会话实时模型，跳过主模型专属及全局模型配置，仍应用有效全局 effort；`reset` 清除覆盖恢复当前主模型规则，两者均清除临时窗口及 effort。已有子代理保持启动快照，resume 固定原模型，内部 fork-context 固定父模型，不允许会话覆盖接管这些路径。
+- 普通模型优先级：单次显式 > 会话 > role/persona > 按类型 > 主模型 `subagent_model` > 全局 > agent 定义 > 父模型。effort：单次显式 > 会话（最终采用同一临时目标）> role/persona > 父模型 `subagent_model_reasoning_effort` > `[subagent] reasoning_effort` > agent 定义 > 基础配置。非法 effort 字符串告警并继续低优先级；选中合法档位但目标不支持时告警并保留基础配置。
+- `[model.<父模型ID>] subagent_model`、`subagent_model_reasoning_effort` 独立可选，后者为 `Option<String>`；共用父会话实时模型目录键查找，省略/空白分别回退全局模型/effort，无效模型告警回退全局。切主模型立即影响后续 child；临时 set 的模型及显式 effort 保持优先，未指定临时 effort 时仍按当前父模型解析。临时发现父模型不得借用上游来源模型字段。
+- 状态可选字段 `parentModelId`、`parentConfiguredModel`、`parentConfiguredEffort` 分别描述当前父模型、专属模型及专属 effort 原值；`configuredModel`、`configuredEffort` 始终保留全局值。`modelSource` 或 `effortSource` 为 `parent_model_config` 时，中文展示「主模型专属配置」。
+- `inherit` 仅决定模型：直接使用父会话实时模型，跳过主模型专属及全局模型配置，仍按优先级应用父模型专属及全局 effort；`reset` 清除覆盖恢复当前主模型规则，两者均清除临时窗口及 effort。已有子代理保持启动快照，resume 固定原模型，内部 fork-context 固定父模型，不允许普通新建子代理的配置或会话覆盖接管这些路径。
 - ACP 扩展 `x.ai/session/subagent_model` 使用 `sessionId`、可选 `expectedModelId`、`action`；`set` 接受 `modelId`、可选 `reasoningEffort/contextWindow`。未知单 ID 复用跨上游发现，只注册临时目录并更新子代理选择，不切换父模型；失败保持原值。
 - Release 构建后运行 `python tools/test-subagents-model.py`（Python 3.11+）；可重复指定 `--scenario`。脚本复用模型发现 `Rpc`，隔离配置及本地假上游驱动真实 parent 工具调用，校验 child 模型/API/认证/effort 以及 `x.ai/subagent/list_running` 的实际窗口，临时资源始终清理。
 - 脚本保留原有继承/全局/临时/发现/resume 场景；新增 `parent-model-selection/only/fallback/lifecycle/discovery`，覆盖主模型专属路由、不同凭据、双会话隔离、切主模型与 set/inherit/reset、空白/无效回退及临时发现不借用来源配置，同时核对全局和父模型状态值。`legacy-section/mixed-sections` 覆盖旧表读取及同键单数优先、旧表独有字段保留。
+- `parent-effort-selection/only/priority/lifecycle/fallback/discovery/resume` 覆盖主模型专属 effort、独立配置、role/会话优先级、双会话与切主模型、set/inherit/reset、无效或不支持档位回退、临时发现隔离及恢复；核对 `parentConfiguredEffort`、全局 `configuredEffort` 和真实请求。
 - role/persona/type pins/definition 完整优先级、显式 effort、内部 fork-context、并发时序和 TUI 补全/旧命令别名需另行定向测试，不以该 ACP 脚本代替。
 
 ## Responses 协议兼容
@@ -111,8 +176,12 @@
 - 模型配置 `responses_compact_threshold` 为可选正整数，默认关闭；仅 Responses 且小于实际窗口有效，统一通过 `effective_responses_compact_threshold` 校验。无能力探测，参数被拒绝时明确报错。辅助摘要/分类请求关闭该字段。
 - 来源绑定实际请求模型、连接及认证快照哈希；`responses_source` 和 `responses_input_fingerprint` 只由客户端在成功完成响应写入。切连接/模型/认证或前缀改写时旧加密项不得重放。
 - `patch_responses_input_for_source` 仅在同来源完整前缀匹配、工具配对安全时采用最新压缩点；保留必要系统指令，仅裁请求，不主动替换本地历史。普通兼容投影不发送无来源 compaction。
-- 原生模式跳过常规百分比摘要及后台预压缩，保留手动压缩和硬溢出保护。上下文估计与上游计费用量分离，不能按加密字节宣称精确 token。
-- Release 构建后运行 `python tools/test-responses-auto-compaction.py`，使用本地假上游覆盖启用、来源隔离、裁剪、工具配对和参数拒绝。
+- 冷恢复模型使用 `SwitchPrompt::Preserve`，只恢复模型、认证、effort 和窗口，不重写已有系统头；客户端显式 `systemPromptOverride` 由独立入口处理。不得依赖 gateway 开关间接判断是否保留提示，否则恢复会丢失创建时规则并使压缩点失效。
+- `project_responses_input` 统一计算最终合法 input；`__grok_context_checkpoint` 保存版本化投影与计数锚点，普通响应只保存小型哈希/用量记录。完整通用历史保留，恢复时重新验证来源、准备后历史前缀、工具配对及计数覆盖范围；内部字段不得进入线上请求。
+- 原生模式跳过常规百分比摘要及后台预压缩；容量门禁位于 sampler 完成提示、图片及认证准备后的实际请求层，同时计算工具和输出预留。明确超限最多进行一次客户端摘要恢复；关闭原生模式时保持旧百分比与预压缩机制。手动压缩继续可用。
+- 未配对工具调用使新压缩点暂时失效时，保留客户端签发的阈值候选计数，完整配对后才能采用；不得退回短密文字节数。原生记录签发后，流式推理增量仅用于展示，禁止再补写 reasoning sibling 破坏检查点；旧模式保留原有推理补全。
+- 上下文计数优先使用 `usage.context_details`，缺少该字段的压缩响应标记估算，普通成功响应可用 usage 校准。`reported_usage` 仅供显示本次服务端报告，投影容量检查始终使用经过完整前缀校验的安全预算，禁止把工具待配对时的小计数用于全量历史。上下文与累计账单独立，流式及非流式必须一致；不能按加密字节宣称精确 token。`/context` 展示原生阈值和计数来源，恢复后未验证的界面标记待校验。
+- Release 构建后运行 `python tools/test-responses-auto-compaction.py`，使用本地假上游覆盖启用、来源隔离、裁剪、工具配对、参数拒绝、进程重启恢复、计数校准、容量拦截和关闭原生模式后的旧客户端摘要。
 
 ## Chat Completions 工具调用兼容
 

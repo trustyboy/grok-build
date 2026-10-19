@@ -106,7 +106,7 @@ Switch models. Accepts a model ID or display name (case-insensitive). When the m
 
 ### `/subagent-model [status|inherit|reset|模型 [window] [effort]]`
 
-查询或临时选择**当前父会话之后新建子代理**的默认模型，不切换主模型，也不写入配置。旧 `/subagents-model` 保留为兼容别名。无参等同于 `status`，显示默认 `general-purpose` 子代理的模型、实际推理强度、上下文窗口、来源和警告；主模型 `subagent_model` 生效时来源显示「主模型专属配置」，全局配置值与当前父模型专属值分开显示。有角色、persona 或单次显式参数时，实际选择按[子代理优先级](16-subagents.md#模型与推理强度优先级)解析。
+查询或临时选择**当前父会话之后新建子代理**的默认模型，不切换主模型，也不写入配置。旧 `/subagents-model` 保留为兼容别名。无参等同于 `status`，显示默认 `general-purpose` 子代理的模型、实际推理强度、上下文窗口、来源和警告；主模型 `subagent_model` 或 `subagent_model_reasoning_effort` 生效时，对应来源显示「主模型专属配置」。状态中 `configuredModel`、`configuredEffort` 保留全局值，可选 `parentModelId`、`parentConfiguredModel`、`parentConfiguredEffort` 分别表示当前父模型、专属模型及专属 effort 原值；`modelSource`、`effortSource` 使用 `parent_model_config` 标识该来源。有角色、persona 或单次显式参数时，实际选择按[子代理优先级](16-subagents.md#模型与推理强度优先级)解析。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -119,7 +119,9 @@ Switch models. Accepts a model ID or display name (case-insensitive). When the m
 
 未知模型只接受单个完整 ID，先复用 `/model` 的跨上游发现，再选择命中来源的接口和认证；发现成功只注册临时模型与子代理选择，**主模型不变**。未知 ID 带参数时先单独发现，再为已经加载的模型设置参数。发现模型默认窗口 `256000`、视觉关闭且无 effort 能力，不代表真实服务能力上限。发现、参数校验或过期会话请求失败均保留原值。
 
-临时窗口和 effort 只对最终采用该临时目标模型的子代理生效，不会泄漏到单次显式指定的其他模型。`inherit`、`reset` 均清除临时窗口与 effort，但不会删除全局 `[subagent] reasoning_effort`。指定模型在父模型切换后仍保留；`inherit` 跳过主模型专属及全局模型配置，动态跟随父模型；`reset` 恢复当前主模型 `subagent_model` 等配置规则。覆盖按父会话隔离，重启或重新加载会话后恢复配置。已启动子代理不变，恢复子代理使用原模型，内部复制父上下文的路径使用父模型。
+临时窗口和 effort 只对最终采用同一临时目标模型的子代理生效。effort 优先级为「单次显式 > 会话临时（最终同一目标）> role/persona > 父模型 `subagent_model_reasoning_effort` > `[subagent] reasoning_effort` > agent 定义 > 基础配置」。父模型专属 effort 可独立于 `subagent_model` 配置，二者共用父会话实时模型目录键查找；省略或空白回退全局，非法 effort 字符串告警并继续低优先级，合法档位不受目标支持时告警并保留基础配置。临时发现父模型不借用来源模型配置。
+
+`inherit`、`reset` 均清除临时窗口与 effort，仍按优先级应用父模型专属及全局 effort。`inherit` 仅决定模型，跳过主模型专属及全局模型默认值、动态跟随父模型；`reset` 恢复当前主模型配置规则。切父模型影响后续新建子代理，临时 set 的模型及显式 effort 保持优先；未指定临时 effort 时仍按当前父模型解析。覆盖按父会话隔离，重启或重新加载会话后恢复配置。已启动子代理保留快照，resume 固定原模型，内部 fork-context 固定父模型。
 
 ### `/fast [on|off|status]`
 

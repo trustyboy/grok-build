@@ -418,7 +418,8 @@ User-level configuration lives in `$GROK_HOME/config.toml` (default `~/.grok/con
 | `model.<id>.reasoning_summary` | `none / auto / concise / detailed` | `yes` | `user` | Responses API `reasoning.summary` for this model; default `concise`. `none` omits the field for endpoints that reject it (e.g. AWS Bedrock Mantle). |
 | `model.<id>.show_model_fingerprint` | `boolean` | `yes` | `user` | Show the provider model fingerprint in the UI when present. |
 | `model.<id>.stream_tool_calls` | `boolean` | `yes` | `user` | Per-model tool-call streaming request shape. |
-| `model.<id>.subagent_model` | `string` | `yes` | `user` | 当前主模型专属子代理默认模型，仅指定 model，effort 保持原规则。按父会话实时目录键读取；低于按类型覆盖、高于全局 `subagent.model`。省略/空白回退全局，无效目标告警后回退全局；临时发现模型不借用来源模型配置。 |
+| `model.<id>.subagent_model` | `string` | `yes` | `user` | 当前主模型专属子代理默认模型，与 `subagent_model_reasoning_effort` 独立可选，共用父会话实时模型目录键查找。低于按类型覆盖、高于全局 `subagent.model`；省略/空白回退全局，无效目标告警后回退全局；临时发现父模型不借用来源模型配置。 |
+| `model.<id>.subagent_model_reasoning_effort` | `string`（可选） | `yes` | `user` | 当前父模型专属子代理推理强度，与 `subagent_model` 独立；接受 `none / minimal / low / medium / high / xhigh / max`。共用父会话实时模型目录键查找，低于单次显式、同一临时目标的会话 effort 及 role/persona，高于全局 `subagent.reasoning_effort`。省略/空白回退全局，非法字符串告警并继续低优先级；合法档位不受目标支持时告警并保留基础配置。临时发现父模型不借用来源模型配置。 |
 | `model.<id>.subagent_rate_limit_max_attempts` | `number` | `yes` | `user` | Maximum subagent 429 wait-loop attempts when `rate_limit_retry_threshold` is unset; default 8, maximum 32, and `0` disables the wait loop. |
 | `model.<id>.supported_in_api` | `boolean` | `yes` | `user` | Whether this catalog entry is offered as a public API model. |
 | `model.<id>.supports_backend_search` | `boolean` | `yes` | `user` | Whether the endpoint supports Grok-hosted server-side search tools. |
@@ -548,13 +549,13 @@ User-level configuration lives in `$GROK_HOME/config.toml` (default `~/.grok/con
 | `subagent.max_concurrent` | `integer` | `yes` | `user` | Max concurrent subagents. |
 | `subagent.max_depth` | `integer` | `yes` | `user` | Max nested subagent depth (clamped ≥1). |
 | `subagent.model` | `string` | `yes` | `user` | 可选统一默认模型，使用已配置或已加载目录中的模型 ID；省略或空白表示未设置。低于单次显式、会话、role/persona、按类型及主模型 `subagent_model`，高于 agent 定义及父模型；不改变主模型。 |
-| `subagent.reasoning_effort` | `none / minimal / low / medium / high / xhigh / max` | `yes` | `user` | 可选统一推理强度，与 `model` 独立。省略或空白沿用基础规则；非法值或目标模型不支持的档位告警并回退，不使其他有效子代理配置失效。实际可用档位由目标模型决定。 |
+| `subagent.reasoning_effort` | `none / minimal / low / medium / high / xhigh / max` | `yes` | `user` | 可选统一推理强度，与 `model` 独立，低于父模型 `subagent_model_reasoning_effort`、高于 agent 定义。省略/空白继续低优先级；非法字符串告警并继续低优先级，合法档位不受目标支持时告警并保留基础配置。实际可用档位由目标模型决定。 |
 | `subagent.models.<name>` | `string` | `yes` | `user` | 按子代理类型覆盖模型，例如 `general-purpose`、`explore`；优先于统一 `subagent.model`，低于会话选择及 role/persona。 |
 | `subagent.roles.<name>` | `table` | `yes` | `user` | 角色默认配置，可设置模型、effort、能力和 persona 等；模型优先于按类型及主模型专属默认，低于会话选择。 |
 | `subagent.personas.<name>` | `table` | `yes` | `user` | persona 提示词与模型、effort 等默认值；角色默认优先于 persona 默认。 |
 | `subagent.toggle.<name>` | `boolean` | `yes` | `user` | Enable or disable an individual subagent type. Omitted agents default on. |
 
-统一默认值示例：
+全局与父模型专属默认值示例：
 
 ```toml
 [subagent]
@@ -566,13 +567,18 @@ explore = "nd-explorer"
 
 [model.cpa-deepseek-v4-flash]
 subagent_model = "nd-gpt-astra"
+subagent_model_reasoning_effort = "medium"
+
+# 可独立设置 effort，不改变模型选择
+[model.my-parent]
+subagent_model_reasoning_effort = "high"
 ```
 
-示例 ID 需替换为实际模型目录中的 ID。只保留 `reasoning_effort` 时，未受其他模型规则覆盖的子代理跟随父模型。省略 effort 时，继承路径保留父会话当前 effort，指定其他模型的路径采用目标自身默认值。
+示例应合并到已有模型配置，ID 替换为实际模型目录键。两个父模型专属字段独立可选；只设置 effort 不改变模型选择。无更高优先级 effort 时，示例父模型 `cpa-deepseek-v4-flash` 使用 `medium`，覆盖全局 `high`。无任何 effort 覆盖时，继承路径取父会话当前值，指定其他模型时取目标自身默认值。
 
-模型优先级为「单次显式 > 会话 > role/persona > 按类型 > 主模型 `subagent_model` > 统一默认 > agent 定义 > 父模型」；effort 为「单次显式 > 同一临时目标的会话 effort > role/persona > 统一默认 > agent 定义 > 基础配置」。推理能力和具体档位在最终模型确定后校验。
+模型优先级为「单次显式 > 会话 > role/persona > 按类型 > 主模型 `subagent_model` > 统一默认 > agent 定义 > 父模型」；effort 为「单次显式 > 会话临时（最终同一目标）> role/persona > 父模型 `subagent_model_reasoning_effort` > `[subagent] reasoning_effort` > agent 定义 > 基础配置」。推理能力和具体档位在最终模型确定后校验。
 
-会话命令 `/subagent-model <模型ID或名称> [window] [effort]` 不写这些字段，旧 `/subagents-model` 保留别名。切主模型即时影响后续 child，但保留临时 set；`inherit` 跳过主模型专属和全局模型规则，`reset` 恢复当前主模型规则，二者均清除临时窗口与 effort，但保留全局 effort 规则。已运行子代理不改变，恢复固定原模型、内部 fork-context 固定父模型；状态查询描述普通 `general-purpose` 的默认选择。未知单 ID 可先跨上游发现，失败保留原值；临时模型和选择不修改主模型或全局默认，也不跨进程/会话重载保存。详见[子代理配置与回归说明](16-subagents.md#全局默认模型与推理强度)。
+会话命令 `/subagent-model <模型ID或名称> [window] [effort]` 不写这些字段，旧 `/subagents-model` 保留别名。切主模型影响后续新建 child，临时 set 的模型及显式 effort 保持优先；未指定临时 effort 时仍按当前父模型解析。`inherit` 仅决定模型，跳过主模型专属和全局模型默认值，`reset` 恢复当前主模型规则；二者均清除临时窗口与 effort，仍按优先级应用父模型专属及全局 effort。已运行子代理不改变，恢复固定原模型、内部 fork-context 固定父模型；状态查询描述普通 `general-purpose` 的默认选择。未知单 ID 可先跨上游发现，失败保留原值；临时模型和选择不修改主模型或全局默认，也不跨进程/会话重载保存。状态中 `configuredModel`、`configuredEffort` 保留全局值，可选 `parentModelId`、`parentConfiguredModel`、`parentConfiguredEffort` 分别报告当前父模型、专属模型及专属 effort 原值；`modelSource` 或 `effortSource` 为 `parent_model_config` 时显示「主模型专属配置」。详见[子代理配置与回归说明](16-subagents.md#全局默认模型与推理强度)。
 
 ### `telemetry`
 
