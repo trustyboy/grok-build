@@ -43,32 +43,42 @@ impl ChatStateActor {
             }
             self.rebase_turn_capture_offset();
         }
-        let (trigger_bytes, reclaim_target_bytes) =
-            image_budget_limits(self.state.sampling_config.max_request_bytes);
-        let budgeted = apply_image_budget_with_limits(
-            self.state.conversation.clone(),
-            trigger_bytes,
-            reclaim_target_bytes,
-        );
-        let ImageBudgetOutcome {
-            body_bytes,
-            body_bytes_after,
-            inline_images,
-            needs_image_compaction,
-            evicted,
-        } = budgeted.outcome;
-        let mut items = budgeted.items;
-        if inline_images > 0 {
-            self.send_event(ChatStateEvent::ImageBudget {
-                body_bytes,
+        // 原生压缩先验证完整前缀，图片预算由 sampler 对最终投影执行。
+        let mut items = if self
+            .state
+            .sampling_config
+            .effective_responses_compact_threshold()
+            .is_some()
+        {
+            self.state.conversation.clone()
+        } else {
+            let (trigger_bytes, reclaim_target_bytes) =
+                image_budget_limits(self.state.sampling_config.max_request_bytes);
+            let budgeted = apply_image_budget_with_limits(
+                self.state.conversation.clone(),
                 trigger_bytes,
                 reclaim_target_bytes,
+            );
+            let ImageBudgetOutcome {
+                body_bytes,
+                body_bytes_after,
                 inline_images,
                 needs_image_compaction,
                 evicted,
-                body_bytes_after,
-            });
-        }
+            } = budgeted.outcome;
+            if inline_images > 0 {
+                self.send_event(ChatStateEvent::ImageBudget {
+                    body_bytes,
+                    trigger_bytes,
+                    reclaim_target_bytes,
+                    inline_images,
+                    needs_image_compaction,
+                    evicted,
+                    body_bytes_after,
+                });
+            }
+            budgeted.items
+        };
         items = self.prune_items_for_turn_request(items);
         if let Some(reminder) = memory_reminder {
             inject_memory_reminder(&mut items, &reminder);
@@ -108,6 +118,14 @@ impl ChatStateActor {
         &self,
         mut items: Vec<ConversationItem>,
     ) -> Vec<ConversationItem> {
+        if self
+            .state
+            .sampling_config
+            .effective_responses_compact_threshold()
+            .is_some()
+        {
+            return items;
+        }
         if should_prune(
             self.state.total_tokens,
             self.state.sampling_config.context_window,

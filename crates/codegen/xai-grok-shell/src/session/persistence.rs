@@ -669,8 +669,8 @@ thread_local! {
     pub(crate) static FAIL_NEXT_STAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Find and read a session summary given only its ID (scans all CWD directories).
-pub(crate) fn find_summary_by_session_id(session_id: &str) -> Option<Summary> {
+/// 按 ID 查找唯一会话，只读取目标摘要；目录扫描限于本地会话存储。
+pub fn find_summary_by_session_id(session_id: &str) -> Option<Summary> {
     #[cfg(test)]
     assert!(
         !FIND_SUMMARY_BY_SESSION_ID_FORBIDDEN.get(),

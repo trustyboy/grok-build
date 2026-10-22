@@ -11,6 +11,78 @@ use xai_grok_sampling_types::{
     response_to_conversation_items,
 };
 
+/// 图片预算只作用于实际发送内容，后续压缩点仍绑定未改写的归档。
+#[tokio::test]
+async fn responses_native_image_budget_keeps_compaction_reusable() {
+    for streaming in [false, true] {
+        let (url, captured, server) = upstream(streaming, response(true, true)).await;
+        let client = SamplingClient::new(crate::config::SamplerConfig {
+            context_window: 10_000,
+            max_request_bytes: NonZeroU64::new(8192),
+            ..config(url)
+        })
+        .unwrap();
+        let mut original = history("archive-before-compaction");
+        if let ConversationItem::User(user) = &mut original.items[0] {
+            user.content.push(ContentPart::Image {
+                url: format!("data:image/png;base64,{}", "a".repeat(100_000)).into(),
+            });
+        }
+        let saved = serde_json::to_value(&original.items).unwrap();
+        let completed = call(&client, original.clone(), streaming).await.unwrap();
+        assert_eq!(serde_json::to_value(&original.items).unwrap(), saved);
+        let mut next = original;
+        next.items.extend(response_to_conversation_items(completed));
+        next.items.extend(history("next turn").items);
+        call(&client, next, streaming).await.unwrap();
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]["input"]
+                .to_string()
+                .contains("image was removed")
+        );
+        assert!(requests[1]["input"].to_string().contains("opaque"));
+        assert!(
+            !requests[1]["input"]
+                .to_string()
+                .contains("archive-before-compaction")
+        );
+        assert!(!requests[1]["input"].to_string().contains("data:image"));
+        assert!(serde_json::to_vec(&requests[1]).unwrap().len() < 8192);
+        server.abort();
+    }
+}
+
+/// 普通响应的计数锚点记录图片预算后的输入，下一次请求可继续校准。
+#[tokio::test]
+async fn responses_native_image_budget_preserves_usage_anchor() {
+    let (url, captured, server) = upstream(false, response(false, true)).await;
+    let client = SamplingClient::new(crate::config::SamplerConfig {
+        max_request_bytes: NonZeroU64::new(8192),
+        ..config(url)
+    })
+    .unwrap();
+    let mut original = history("image");
+    if let ConversationItem::User(user) = &mut original.items[0] {
+        user.content.push(ContentPart::Image {
+            url: format!("data:image/png;base64,{}", "a".repeat(100_000)).into(),
+        });
+    }
+    let completed = call(&client, original.clone(), false).await.unwrap();
+    let mut next = original;
+    next.items.extend(response_to_conversation_items(completed));
+    next.items.extend(history("next").items);
+    call(&client, next.clone(), false).await.unwrap();
+    let source = assistant_source(&next);
+    let mut projection = project_responses_input(&next, Some(&source));
+    let requests = captured.lock().unwrap();
+    projection.input = requests[1]["input"].as_array().unwrap().clone();
+    let usage = responses_projection_context(&projection, &json!([]));
+    assert!(usage.tokens >= 150 && usage.tokens < 200, "{usage:?}");
+    server.abort();
+}
+
 /// 普通请求使用可容纳真实短输入的小窗口。
 fn config(base_url: String) -> crate::config::SamplerConfig {
     crate::config::SamplerConfig {
@@ -257,6 +329,7 @@ fn compressed_history(client: &SamplingClient) -> ConversationRequest {
     let builder = client.post(client.endpoint("responses")).builder;
     let source = client.responses_source(&builder, "test-model").unwrap();
     let prepared = PreparedResponses {
+        sent_input: project_responses_input(&request, Some(&source)).input,
         fingerprint: responses_input_fingerprint(&request, &source),
         history: Box::new(request.clone()),
         source,

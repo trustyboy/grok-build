@@ -137,6 +137,17 @@ pub(crate) async fn run_request_task(
             return request_id;
         }
 
+        // 每轮重新绑定尝试编号；HTTP/1.1 重建后也使用新的观察器。
+        let diagnostics_tx = event_tx.clone();
+        let diagnostics_request_id = request_id.clone();
+        let attempt = retry_count + doom_retry_count + 1;
+        client.set_responses_diagnostics_observer(Arc::new(move |diagnostics| {
+            let _ = diagnostics_tx.send(SamplingEvent::ResponsesDiagnostics {
+                request_id: diagnostics_request_id.clone(),
+                attempt,
+                diagnostics,
+            });
+        }));
         // Once the resample budget is spent, the attempt runs with the abort disarmed so it can complete and be accepted as-is
         let doom_check = doom_policy.filter(|_| doom_retry_count < doom_max_retries);
         let outcome = run_one_attempt(

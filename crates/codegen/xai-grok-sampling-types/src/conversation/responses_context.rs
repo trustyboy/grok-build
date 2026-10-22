@@ -22,6 +22,10 @@ pub struct ResponsesInputProjection {
     pub input: Vec<serde_json::Value>,
     /// 实际通过来源、前缀和工具边界检查的压缩点身份。
     pub checkpoint_key: Option<String>,
+    /// 历史中的压缩候选数量。
+    pub compaction_candidates: usize,
+    /// 压缩点失效原因计数，不包含历史正文。
+    pub compaction_rejections: std::collections::BTreeMap<String, usize>,
     /// 实际请求来源，关闭原生模式时为空。
     pub(super) source: Option<String>,
     /// 外层来源、完整历史前缀和 sibling 已验证的候选记录。
@@ -299,6 +303,27 @@ pub fn checkpoint_responses_context(
     context_tokens: Option<u64>,
     threshold: std::num::NonZeroU64,
 ) -> Option<ResponsesContextUsage> {
+    checkpoint_responses_context_for_input(
+        response,
+        history,
+        source,
+        tools,
+        context_tokens,
+        threshold,
+        None,
+    )
+}
+
+/// 将图片预算后的实际 input 纳入计数锚点，归档指纹仍绑定完整历史。
+pub fn checkpoint_responses_context_for_input(
+    response: &mut rs::Response,
+    history: &ConversationRequest,
+    source: &str,
+    tools: &serde_json::Value,
+    context_tokens: Option<u64>,
+    threshold: std::num::NonZeroU64,
+    sent_input: Option<&[serde_json::Value]>,
+) -> Option<ResponsesContextUsage> {
     let mut raw = response_raw_output(response);
     for item in &mut raw {
         clear_context_fields(item);
@@ -324,7 +349,7 @@ pub fn checkpoint_responses_context(
     completed_history
         .items
         .extend(response_to_conversation_items(response.clone()));
-    let projection = project_responses_input(&completed_history, Some(source));
+    let mut projection = project_responses_input(&completed_history, Some(source));
     let has_compaction = raw
         .iter()
         .any(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("compaction"));
@@ -336,7 +361,19 @@ pub fn checkpoint_responses_context(
     });
     let selected_latest = selected_new && projection.selected_raw_index == last_raw_compaction;
     let previous = project_responses_input(history, Some(source));
-    let lost_checkpoint = !selected_new && projection.checkpoint_key != previous.checkpoint_key;
+    let same_prefix = projection.checkpoint_key == previous.checkpoint_key
+        && projection.input.starts_with(&previous.input);
+    if !selected_new
+        && same_prefix
+        && let Some(sent_input) = sent_input
+    {
+        projection
+            .input
+            .splice(..previous.input.len(), sent_input.iter().cloned());
+    }
+    let lost_checkpoint = !selected_new
+        && (projection.checkpoint_key != previous.checkpoint_key
+            || sent_input.is_some() && !same_prefix);
     let usage = if (has_compaction && !selected_new) || lost_checkpoint {
         // 不安全的新点或未闭合工具尾部不能用低计数替换回退历史的预算。
         let mut usage = responses_projection_context(&projection, tools);

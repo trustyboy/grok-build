@@ -2,7 +2,7 @@
 
 ## 编译规则
 
-- 后续 Rust 编译、会触发编译的检查和定向测试统一在服务器 `192.168.136.147` 上执行，SSH 账户为 `Administrator`，仓库目录为 `F:\github\grok-build`。
+- 后续 Rust 编译、会触发编译的检查和定向测试统一通过 `ssh root@hkh.vnt.win11sj.top` 执行。该入口为 WSL，调用 `/mnt/d/Program Files/PowerShell/7/pwsh.exe` 使用同机 Windows 工具链；仓库为 `F:\github\grok-build`，WSL 路径为 `/mnt/f/github/grok-build`。下文 Windows 命令在该 PowerShell 7 环境执行。
 - 本机用于源码编辑、同步及无需编译的静态检查；本机 `target` 已清理。将编译产物和 Release 增量缓存集中保存在服务器的 `F:\github\grok-build\target`。
 - 本文所有构建、初始化和测试命令均在服务器的 PowerShell 7、仓库根目录执行；从本机发起 SSH 的示例另有标注。
 - 本项目只允许编译 Release 版本，不编译 Debug 版本。
@@ -37,13 +37,13 @@
 2. **登录编译服务器。** 在本机执行：
 
    ```powershell
-   ssh Administrator@192.168.136.147
+   ssh root@hkh.vnt.win11sj.top
    ```
 
    登录后进入 PowerShell 7：
 
    ```powershell
-   pwsh -NoLogo -NoProfile
+   '/mnt/d/Program Files/PowerShell/7/pwsh.exe' -NoLogo -NoProfile
    ```
 
 3. **加载环境并构建。** 在服务器 PowerShell 7 中执行：
@@ -79,7 +79,7 @@ Set-Location -LiteralPath 'F:\github\grok-build'
 & .\tools\windows-protoc\build-release.ps1 --locked
 '@
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remoteCommand))
-ssh -T -o BatchMode=yes -o ServerAliveInterval=30 Administrator@192.168.136.147 "pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+ssh -T -o BatchMode=yes -o ServerAliveInterval=30 root@hkh.vnt.win11sj.top "cd /mnt/f/github/grok-build && '/mnt/d/Program Files/PowerShell/7/pwsh.exe' -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
 if ($LASTEXITCODE -ne 0) { throw "远程 Release 构建失败，SSH 退出码：$LASTEXITCODE" }
 ```
 
@@ -118,6 +118,13 @@ if ($LASTEXITCODE -ne 0) { throw "远程 Release 构建失败，SSH 退出码：
 
 - `xai-grok-workspace/src/session/tool_config.rs` 的 `session_tmp_root()` 统一供工具产物与绑定环境使用；Windows 使用 `std::env::temp_dir()/grok/sessions/<id>`，Unix 保持 `/tmp/sessions/<id>`。
 - Windows 的 `/tmp` 会解析到当前盘符根目录；生产会话路径不得绕过上述入口硬编码 `/tmp`。旧目录清理需要用户许可。
+
+## 历史会话读取
+
+- 全量列表、最近列表及搜索索引读取只访问本地会话存储；禁止在查询路径调用 `repair_untagged_worktree_summary` 或逐条解析历史 `cwd`。Windows 离线映射盘的 `canonicalize` 会阻塞整个查询。
+- 工作树身份由创建流程写入，旧摘要补全仅保留在 `init_session`；普通历史读取保留已存字段及文件时间，不等待摘要写锁。
+- CLI 按 ID 恢复的标题使用 `find_summary_by_session_id` 定向读取，并保留 hidden 过滤；不得为标题重新调用 `list_summaries(None)`。
+- Release 定向测试使用 shell 的 `worktree_heal_tests`、`find_summary_by_session_id`；构建后运行 `python -B tools/test-session-history.py`，使用隔离历史验证离线项目记录、列表只读及 CLI 恢复。
 
 ## 文件编码
 
@@ -178,6 +185,8 @@ if ($LASTEXITCODE -ne 0) { throw "远程 Release 构建失败，SSH 退出码：
 - `patch_responses_input_for_source` 仅在同来源完整前缀匹配、工具配对安全时采用最新压缩点；保留必要系统指令，仅裁请求，不主动替换本地历史。普通兼容投影不发送无来源 compaction。
 - 冷恢复模型使用 `SwitchPrompt::Preserve`，只恢复模型、认证、effort 和窗口，不重写已有系统头；客户端显式 `systemPromptOverride` 由独立入口处理。不得依赖 gateway 开关间接判断是否保留提示，否则恢复会丢失创建时规则并使压缩点失效。
 - `project_responses_input` 统一计算最终合法 input；`__grok_context_checkpoint` 保存版本化投影与计数锚点，普通响应只保存小型哈希/用量记录。完整通用历史保留，恢复时重新验证来源、准备后历史前缀、工具配对及计数覆盖范围；内部字段不得进入线上请求。
+- 原生模式关闭归档年龄清理及请求工具裁剪；图片预算只处理最终投影。完整前缀以增量 SHA-256 校验，维持 v1 指纹兼容。计数锚点使用图片预算后的实际 input；来源或用户明确修改导致的前缀失效继续保守回退。
+- `shell.turn.responses_diagnostics` 分别记录准备、HTTP 响应头等待、流接收及终止解码；`compaction_projection` 为准备阶段内的子阶段，记录固定失效原因、候选数、选中状态及图片预算。禁止向该事件加入正文、密文或认证数据。
 - 原生模式跳过常规百分比摘要及后台预压缩；容量门禁位于 sampler 完成提示、图片及认证准备后的实际请求层，同时计算工具和输出预留。明确超限最多进行一次客户端摘要恢复；关闭原生模式时保持旧百分比与预压缩机制。手动压缩继续可用。
 - 未配对工具调用使新压缩点暂时失效时，保留客户端签发的阈值候选计数，完整配对后才能采用；不得退回短密文字节数。原生记录签发后，流式推理增量仅用于展示，禁止再补写 reasoning sibling 破坏检查点；旧模式保留原有推理补全。
 - 上下文计数优先使用 `usage.context_details`，缺少该字段的压缩响应标记估算，普通成功响应可用 usage 校准。`reported_usage` 仅供显示本次服务端报告，投影容量检查始终使用经过完整前缀校验的安全预算，禁止把工具待配对时的小计数用于全量历史。上下文与累计账单独立，流式及非流式必须一致；不能按加密字节宣称精确 token。`/context` 展示原生阈值和计数来源，恢复后未验证的界面标记待校验。

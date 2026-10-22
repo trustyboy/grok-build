@@ -336,7 +336,14 @@ impl ChatStateActor {
     /// Unlike API-copy pruning, this mutates `self.state.conversation` after every user turn.
     /// `updates.jsonl` is never touched, so replay stays intact; synthetic User items raise the age threshold.
     pub(super) fn prune_retained_conversation(&mut self) -> usize {
-        if !self.pruning_config.enabled {
+        // 压缩点绑定旧前缀；原生模式保留归档，由发送投影缩短模型上下文。
+        if !self.pruning_config.enabled
+            || self
+                .state
+                .sampling_config
+                .effective_responses_compact_threshold()
+                .is_some()
+        {
             return 0;
         }
         // Fast exit: not enough turns have elapsed for any hard-clear to apply.

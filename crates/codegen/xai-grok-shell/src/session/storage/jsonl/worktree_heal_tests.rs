@@ -53,100 +53,60 @@ fn mark_summary_used(session_dir: &std::path::Path) {
     .unwrap();
 }
 
+/// 历史读取保持旧摘要原样，并在其他写入者持锁时正常返回。
 #[tokio::test]
 #[serial]
-async fn list_sessions_repairs_untagged_worktree_summary_in_rows_and_on_disk() {
+async fn session_history_reads_preserve_legacy_worktree_metadata_without_write_locks() {
     let home = TempDir::new().unwrap();
     let _env = EnvGuard::set("GROK_HOME", home.path());
-    let info = Info {
-        id: acp::SessionId::new("untagged-listed"),
-        cwd: worktree_cwd_under(home.path()),
-    };
     let adapter = JsonlStorageAdapter::with_root(home.path().to_path_buf());
-    let session_dir = adapter.session_dir(&info);
-    write_untagged_summary(&session_dir, &info);
+    for kind in [None, Some("fork")] {
+        let info = Info {
+            id: acp::SessionId::new("legacy-history"),
+            cwd: worktree_cwd_under(home.path()),
+        };
+        let session_dir = adapter.session_dir(&info);
+        write_untagged_summary(&session_dir, &info);
+        let mut summary = read_summary_from(&session_dir);
+        summary.num_messages = 1;
+        summary.session_kind = kind.map(str::to_owned);
+        summary.source_workspace_dir = Some("/home/user/repo".to_owned());
+        let summary_path = session_dir.join("summary.json");
+        let before = serde_json::to_vec_pretty(&summary).unwrap();
+        std::fs::write(&summary_path, &before).unwrap();
+        let mtime = std::fs::metadata(&summary_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let lock = std::fs::File::create(session_dir.join("summary.json.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
 
-    let listed = adapter.list_sessions(None).await.unwrap();
-
-    assert_eq!(listed.len(), 1);
-    assert_eq!(
-        listed.first().and_then(|x| x.session_kind.as_deref()),
-        Some("worktree")
-    );
-    assert_eq!(
-        listed.first().and_then(|x| x.worktree_label.as_deref()),
-        Some("fix-bug")
-    );
-    let rows = crate::session::merge::merge(Vec::new(), listed, None, &[], 20);
-    assert_eq!(
-        rows.first().and_then(|x| x.session_kind.as_deref()),
-        Some("worktree")
-    );
-    assert_eq!(
-        rows.first().and_then(|x| x.worktree_label.as_deref()),
-        Some("fix-bug")
-    );
-    let on_disk = read_summary_from(&session_dir);
-    assert_eq!(on_disk.session_kind.as_deref(), Some("worktree"));
-    assert_eq!(on_disk.worktree_label.as_deref(), Some("fix-bug"));
-    assert!(on_disk.source_workspace_dir.is_none());
-}
-
-#[tokio::test]
-#[serial]
-async fn list_sessions_fills_missing_label_on_kinded_fork_without_changing_kind() {
-    let home = TempDir::new().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
-    let info = Info {
-        id: acp::SessionId::new("kinded-listed"),
-        cwd: worktree_cwd_under(home.path()),
-    };
-    let adapter = JsonlStorageAdapter::with_root(home.path().to_path_buf());
-    let session_dir = adapter.session_dir(&info);
-    std::fs::create_dir_all(&session_dir).unwrap();
-    let mut kinded = Summary::new(&info, default_model_id()).unwrap();
-    kinded.session_kind = Some("fork".to_owned());
-    kinded.worktree_label = None;
-    kinded.source_workspace_dir = Some("/home/user/repo".to_owned());
-    std::fs::write(
-        session_dir.join("summary.json"),
-        serde_json::to_vec_pretty(&kinded).unwrap(),
-    )
-    .unwrap();
-
-    let listed = adapter.list_sessions(None).await.unwrap();
-
-    assert_eq!(listed.len(), 1);
-    assert_eq!(
-        listed.first().and_then(|x| x.session_kind.as_deref()),
-        Some("fork")
-    );
-    assert_eq!(
-        listed.first().and_then(|x| x.worktree_label.as_deref()),
-        Some("fix-bug")
-    );
-    assert_eq!(
-        listed
-            .first()
-            .and_then(|x| x.source_workspace_dir.as_deref()),
-        Some("/home/user/repo")
-    );
-    let rows = crate::session::merge::merge(Vec::new(), listed, None, &[], 20);
-    assert_eq!(
-        rows.first().and_then(|x| x.session_kind.as_deref()),
-        Some("fork")
-    );
-    assert_eq!(
-        rows.first().and_then(|x| x.worktree_label.as_deref()),
-        Some("fix-bug")
-    );
-    let on_disk = read_summary_from(&session_dir);
-    assert_eq!(on_disk.session_kind.as_deref(), Some("fork"));
-    assert_eq!(on_disk.worktree_label.as_deref(), Some("fix-bug"));
-    assert_eq!(
-        on_disk.source_workspace_dir.as_deref(),
-        Some("/home/user/repo")
-    );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut summaries = adapter.list_sessions(None).await.unwrap();
+            summaries.extend(adapter.list_sessions(Some(&info.cwd)).await.unwrap());
+            summaries.extend(adapter.list_sessions_recent(10).await.unwrap());
+            summaries.push(adapter.load_summary(&info).await.unwrap());
+            summaries
+        })
+        .await;
+        fs2::FileExt::unlock(&lock).unwrap();
+        let summaries = result.expect("历史读取不应等待摘要写锁");
+        assert_eq!(summaries.len(), 4);
+        for actual in summaries {
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&summary).unwrap()
+            );
+        }
+        assert_eq!(std::fs::read(&summary_path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&summary_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            mtime
+        );
+    }
 }
 
 #[tokio::test]
@@ -371,83 +331,7 @@ async fn init_session_load_fills_missing_label_on_kinded_fork_without_changing_k
 
 #[tokio::test]
 #[serial]
-async fn list_sessions_recent_fills_missing_label_on_kinded_fork_without_changing_kind() {
-    let home = TempDir::new().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
-    let info = Info {
-        id: acp::SessionId::new("kinded-recent"),
-        cwd: worktree_cwd_under(home.path()),
-    };
-    let adapter = JsonlStorageAdapter::with_root(home.path().to_path_buf());
-    let session_dir = adapter.session_dir(&info);
-    std::fs::create_dir_all(&session_dir).unwrap();
-    let mut kinded = Summary::new(&info, default_model_id()).unwrap();
-    kinded.session_kind = Some("fork".to_owned());
-    kinded.worktree_label = None;
-    kinded.source_workspace_dir = Some("/home/user/repo".to_owned());
-    std::fs::write(
-        session_dir.join("summary.json"),
-        serde_json::to_vec_pretty(&kinded).unwrap(),
-    )
-    .unwrap();
-
-    let listed = adapter.list_sessions_recent(10).await.unwrap();
-
-    assert_eq!(listed.len(), 1);
-    assert_eq!(
-        listed.first().and_then(|x| x.session_kind.as_deref()),
-        Some("fork")
-    );
-    assert_eq!(
-        listed.first().and_then(|x| x.worktree_label.as_deref()),
-        Some("fix-bug")
-    );
-    assert_eq!(
-        listed
-            .first()
-            .and_then(|x| x.source_workspace_dir.as_deref()),
-        Some("/home/user/repo")
-    );
-    let on_disk = read_summary_from(&session_dir);
-    assert_eq!(on_disk.session_kind.as_deref(), Some("fork"));
-    assert_eq!(on_disk.worktree_label.as_deref(), Some("fix-bug"));
-}
-
-#[tokio::test]
-#[serial]
-async fn list_sessions_recent_repairs_untagged_worktree_summary_in_rows_and_on_disk() {
-    let home = TempDir::new().unwrap();
-    let _env = EnvGuard::set("GROK_HOME", home.path());
-    let info = Info {
-        id: acp::SessionId::new("untagged-recent"),
-        cwd: worktree_cwd_under(home.path()),
-    };
-    let adapter = JsonlStorageAdapter::with_root(home.path().to_path_buf());
-    let session_dir = adapter.session_dir(&info);
-    write_untagged_summary(&session_dir, &info);
-    // Recent list omits empty untitled rows, so this must be a used row to observe the heal.
-    mark_summary_used(&session_dir);
-
-    let listed = adapter.list_sessions_recent(10).await.unwrap();
-
-    assert_eq!(listed.len(), 1);
-    assert_eq!(
-        listed.first().and_then(|x| x.session_kind.as_deref()),
-        Some("worktree")
-    );
-    assert_eq!(
-        listed.first().and_then(|x| x.worktree_label.as_deref()),
-        Some("fix-bug")
-    );
-    let on_disk = read_summary_from(&session_dir);
-    assert_eq!(on_disk.session_kind.as_deref(), Some("worktree"));
-    assert_eq!(on_disk.worktree_label.as_deref(), Some("fix-bug"));
-    assert!(on_disk.source_workspace_dir.is_none());
-}
-
-#[tokio::test]
-#[serial]
-async fn list_sessions_heal_does_not_evict_recent_sessions_from_mtime_window() {
+async fn list_sessions_preserve_recent_sessions_in_mtime_window() {
     let home = TempDir::new().unwrap();
     let _env = EnvGuard::set("GROK_HOME", home.path());
     let adapter = JsonlStorageAdapter::with_root(home.path().to_path_buf());
@@ -470,17 +354,13 @@ async fn list_sessions_heal_does_not_evict_recent_sessions_from_mtime_window() {
     };
     let recent_dir = adapter.session_dir(&recent);
     write_untagged_summary(&recent_dir, &recent);
-    // Used so the mtime assertion is not the husk filter dropping an empty row.
+    // 标记为已使用，确保最近列表保留该会话。
     mark_summary_used(&recent_dir);
     set_summary_mtime(&recent_dir, now);
 
     let listed = adapter.list_sessions(None).await.unwrap();
     assert_eq!(listed.len(), 4);
-    assert!(
-        listed
-            .iter()
-            .all(|s| s.session_kind.as_deref() == Some("worktree"))
-    );
+    assert!(listed.iter().all(|s| s.session_kind.is_none()));
 
     let window = adapter.list_sessions_recent(1).await.unwrap();
     assert_eq!(window.len(), 1);

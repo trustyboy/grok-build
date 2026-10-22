@@ -4,6 +4,9 @@
 #[path = "native_responses_tests.rs"]
 mod tests;
 
+#[path = "native_responses_images.rs"]
+mod images;
+
 use std::num::NonZeroU64;
 
 use serde_json::Value;
@@ -11,7 +14,7 @@ use xai_grok_sampling_types::{
     ApiErrorCode, ConversationRequest, RESPONSE_CONTEXT_CHECKPOINT_FIELD,
     RESPONSE_INPUT_FINGERPRINT_METADATA_KEY, RESPONSE_RAW_OUTPUT_METADATA_KEY,
     RESPONSE_SOURCE_METADATA_KEY, ResponseModelMetadata, Result, SamplingError,
-    checkpoint_responses_context, project_responses_input, responses_input_fingerprint,
+    checkpoint_responses_context_for_input, project_responses_input, responses_input_fingerprint,
     responses_projection_context, rs,
 };
 
@@ -27,6 +30,8 @@ pub(super) struct PreparedResponses {
     fingerprint: String,
     tools: Value,
     threshold: NonZeroU64,
+    /// 图片预算之后实际发送的输入，用于计数锚点。
+    sent_input: Vec<Value>,
 }
 
 impl SamplingClient {
@@ -55,8 +60,52 @@ impl SamplingClient {
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let projection_started = std::time::Instant::now();
         let source = self.responses_source(builder, model)?;
-        let projection = project_responses_input(&history, Some(&source));
+        let mut projection = project_responses_input(&history, Some(&source));
+        // 完整归档中的旧图片与密文不参与最终请求体预算。
+        body["input"] = Value::Null;
+        let envelope_bytes = serde_json::to_vec(body)?.len().saturating_sub(4);
+        let cap = self
+            .defaults
+            .max_request_bytes
+            .unwrap_or_else(|| {
+                xai_grok_sampling_types::ApiBackend::Responses.default_max_request_bytes()
+            })
+            .get() as usize;
+        let image_budget = images::apply(&mut projection.input, envelope_bytes, cap)?;
+        if let Some(observer) = &self.responses_diagnostics_observer {
+            observer(super::diagnostics::ResponsesDiagnostics {
+                stage: super::diagnostics::ResponsesDiagnosticStage::CompactionProjection,
+                streaming: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                elapsed_ms: projection_started.elapsed().as_secs_f64() * 1000.0,
+                completed: true,
+                input_items: Some(projection.input.len() as u64),
+                request_body_bytes: None,
+                status_code: None,
+                compaction: Some(super::diagnostics::ResponsesCompactionDiagnostics {
+                    history_items: history.items.len(),
+                    selected: projection.checkpoint_key.is_some(),
+                    candidates: projection.compaction_candidates,
+                    rejections: projection.compaction_rejections.clone(),
+                    body_bytes: image_budget.body_bytes,
+                    images_evicted: image_budget.evicted,
+                }),
+            });
+        }
+        if image_budget.body_bytes > cap {
+            return Err(SamplingError::Api {
+                status: reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+                message: format!(
+                    "Responses 请求体超过限制：{} bytes，限制 {cap} bytes",
+                    image_budget.body_bytes
+                ),
+                model_metadata: None,
+                retry_after_secs: None,
+                should_retry: Some(false),
+                error_code: None,
+            });
+        }
         let tools = body
             .get("tools")
             .filter(|tools| !tools.is_null())
@@ -86,7 +135,8 @@ impl SamplingClient {
                 )),
             });
         }
-        body["input"] = Value::Array(projection.input);
+        let sent_input = projection.input;
+        body["input"] = Value::Array(sent_input.clone());
         let fingerprint = responses_input_fingerprint(&history, &source);
         Ok(Some(PreparedResponses {
             history,
@@ -94,6 +144,7 @@ impl SamplingClient {
             fingerprint,
             tools,
             threshold,
+            sent_input,
         }))
     }
 }
@@ -170,13 +221,14 @@ pub(super) fn finish_response(
         RESPONSE_INPUT_FINGERPRINT_METADATA_KEY.into(),
         prepared.fingerprint.clone(),
     );
-    let _ = checkpoint_responses_context(
+    let _ = checkpoint_responses_context_for_input(
         response,
         &prepared.history,
         &prepared.source,
         &prepared.tools,
         context_tokens,
         prepared.threshold,
+        Some(&prepared.sent_input),
     );
 }
 

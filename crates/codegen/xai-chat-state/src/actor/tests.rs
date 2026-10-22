@@ -4459,6 +4459,43 @@ async fn prune_retained_synthetic_user_does_not_advance_age() {
     }
 }
 
+/// 原生压缩的归档与请求副本都保留旧工具结果，避免新轮次破坏检查点。
+#[tokio::test]
+async fn native_responses_preserves_history_across_turn_pruning() {
+    let (mock, _rx) = crate::persistence::MockChatPersistence::new();
+    let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = test_config_with_window(10_000);
+    config.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    config.responses_compact_threshold = NonZeroU64::new(1000);
+    let handle = crate::actor::ChatStateActor::spawn_with_pruning(
+        vec![],
+        config,
+        crate::types::PruningConfig {
+            hard_clear_age_turns: 3,
+            keep_last_n_turns: 1,
+            ..Default::default()
+        },
+        Box::new(mock),
+        event_tx,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    push_turns(&handle, 12, 8000).await;
+    handle.record_token_usage(9000);
+    let stored = handle.get_conversation().await;
+    let prepared = handle.apply_turn_request_pruning(stored.clone()).await;
+    for items in [&stored, &prepared] {
+        let results: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::ToolResult(result) => Some(result.content.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 12);
+        assert!(results.iter().all(|length| *length == 8000));
+    }
+}
+
 #[tokio::test]
 async fn get_last_model_metadata_returns_both_fields() {
     let h = TestHarness::with_conversation(vec![

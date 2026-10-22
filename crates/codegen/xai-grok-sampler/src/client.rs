@@ -43,7 +43,10 @@ use crate::span_timing::{ERROR, STATUS_CODE, SUCCESS, StreamSpanTiming};
 use crate::stream_classify::{chat_chunk_class, message_event_class, responses_event_class};
 use xai_grok_auth::bearer_suffix;
 
+pub mod diagnostics;
 mod native_responses;
+
+use diagnostics::{ResponsesDiagnosticStage, ResponsesDiagnosticsObserver, StageTimer};
 
 pub use native_responses::NATIVE_CONTEXT_OVERFLOW_PREFIX;
 pub use xai_grok_sampling_types::ApiBackend;
@@ -343,6 +346,8 @@ pub struct SamplingClient {
     /// Endpoint URL builder, resolved once from `base_url` and `query_params`.
     endpoint: EndpointTemplate,
     first_use_noted: Arc<AtomicBool>,
+    /// 每次调用独立创建计时器；观察器不接收正文或认证信息。
+    responses_diagnostics_observer: Option<ResponsesDiagnosticsObserver>,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -365,6 +370,8 @@ struct ClientDefaults {
     max_completion_tokens: Option<u32>,
     /// 仅原生 Responses 请求按投影后的输入和输出预留执行容量保护。
     context_window: u64,
+    /// 原生压缩完成投影后的请求体上限。
+    max_request_bytes: Option<std::num::NonZeroU64>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     api_backend: ApiBackend,
@@ -710,6 +717,7 @@ impl SamplingClient {
             model: config.model,
             max_completion_tokens: config.max_completion_tokens,
             context_window: config.context_window,
+            max_request_bytes: config.max_request_bytes,
             temperature: config.temperature,
             top_p: config.top_p,
             api_backend: config.api_backend,
@@ -737,7 +745,22 @@ impl SamplingClient {
             header_injector: config.header_injector,
             endpoint,
             first_use_noted: Arc::new(AtomicBool::new(false)),
+            responses_diagnostics_observer: None,
         })
+    }
+
+    /// 绑定安全诊断观察器，供 actor 或直接调用方写入统一日志。
+    pub fn set_responses_diagnostics_observer(&mut self, observer: ResponsesDiagnosticsObserver) {
+        self.responses_diagnostics_observer = Some(observer);
+    }
+
+    /// 每次请求重新计时，不在克隆客户端之间共享阶段数据。
+    fn responses_preparation_timer(&self, streaming: bool) -> StageTimer {
+        StageTimer::new(
+            self.responses_diagnostics_observer.clone(),
+            streaming,
+            ResponsesDiagnosticStage::RequestPreparation,
+        )
     }
 
     pub fn api_backend(&self) -> ApiBackend {
@@ -1454,9 +1477,16 @@ impl SamplingClient {
     }
 
     /// Create a response using the Responses API (non-streaming).
-    pub async fn create_response(
+    pub async fn create_response(&self, request: CreateResponseWrapper) -> Result<rs::Response> {
+        self.create_response_inner(request, self.responses_preparation_timer(false))
+            .await
+    }
+
+    /// 会话转换与直接 SDK 调用共用同一准备阶段。
+    async fn create_response_inner(
         &self,
         mut request: CreateResponseWrapper,
+        mut diagnostics: StageTimer,
     ) -> Result<rs::Response> {
         self.apply_response_defaults(&mut request)?;
 
@@ -1515,7 +1545,11 @@ impl SamplingClient {
         let built_request = self
             .build_json_request(grok_headers.apply(builder), &request_body)
             .await?;
+        diagnostics.record_request(request_body.get("input"), &built_request);
+        let mut diagnostics = diagnostics.next(ResponsesDiagnosticStage::HttpHeaders);
         let response = self.send(built_request).await?;
+        diagnostics.record_status(response.status());
+        let diagnostics = diagnostics.next(ResponsesDiagnosticStage::StreamReceive);
 
         let status = response.status();
         request_region
@@ -1526,6 +1560,7 @@ impl SamplingClient {
         let retry_after_secs = extract_retry_after(response.headers());
         let should_retry = extract_should_retry(response.headers());
         let bytes = response.bytes().await?;
+        let diagnostics = diagnostics.next(ResponsesDiagnosticStage::TerminalDecode);
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -1578,6 +1613,7 @@ impl SamplingClient {
             prepared_responses.as_ref(),
             context_tokens,
         );
+        diagnostics.finish(true);
         Ok(response_obj)
     }
 
@@ -1593,6 +1629,21 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
+        self.create_response_stream_prepared(request, self.responses_preparation_timer(true))
+            .await
+    }
+
+    /// 保留会话转换开始时的计时器，不重复记录准备阶段。
+    #[allow(clippy::type_complexity)]
+    async fn create_response_stream_prepared(
+        &self,
+        request: CreateResponseWrapper,
+        diagnostics: StageTimer,
+    ) -> Result<(
+        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        Option<ResponseModelMetadata>,
+        Option<crate::doom_loop::DoomLoopSignalCollector>,
+    )> {
         let region = crate::span_timing::stream_span!(
             "http.create_response_stream",
             endpoint = %self.endpoint("responses"),
@@ -1600,10 +1651,11 @@ impl SamplingClient {
         );
         self.adopt_traceparent(region.span(), request.traceparent.as_deref());
         if region.span().is_disabled() {
-            self.create_response_stream_inner(request, region).await
+            self.create_response_stream_inner(request, region, diagnostics)
+                .await
         } else {
             let span = region.span().clone();
-            self.create_response_stream_inner(request, region)
+            self.create_response_stream_inner(request, region, diagnostics)
                 .instrument(span)
                 .await
         }
@@ -1614,6 +1666,7 @@ impl SamplingClient {
         &self,
         mut request: CreateResponseWrapper,
         region: crate::span_timing::Region,
+        mut diagnostics: StageTimer,
     ) -> Result<(
         BoxStream<'static, Result<rs::ResponseStreamEvent>>,
         Option<ResponseModelMetadata>,
@@ -1699,9 +1752,13 @@ impl SamplingClient {
             "Sending responses API stream request"
         );
         Self::log_request_headers(&built_request, "responses");
+        diagnostics.record_request(request_body.get("input"), &built_request);
+        let mut diagnostics = diagnostics.next(ResponsesDiagnosticStage::HttpHeaders);
         let response = self
             .execute_stream_request(built_request, &mut span_timing)
             .await?;
+        diagnostics.record_status(response.status());
+        let diagnostics = diagnostics.next(ResponsesDiagnosticStage::StreamReceive);
 
         let status = response.status();
         span_timing
@@ -1770,15 +1827,19 @@ impl SamplingClient {
 
         // The scan item is an `Option`: `Some(None)` skips an absorbed doom-loop event without terminating the stream (`filter_map` below)
         // An outer `None` still ends the stream
+        let mut receive_diagnostics = Some(diagnostics);
         let events = event_stream
             .scan(false, move |attempt_finished, event_res| {
                 if *attempt_finished {
+                    drop(receive_diagnostics.take());
                     return std::future::ready(None);
                 }
+                let arrived = std::time::Instant::now();
                 let item = match event_res {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
+                            drop(receive_diagnostics.take());
                             return std::future::ready(None);
                         }
 
@@ -1801,9 +1862,30 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            let prepared = serde_json::from_str(data)
-                                .map_err(SamplingError::Serialization)
-                                .and_then(crate::responses_compat::prepare_event);
+                            let parsed = serde_json::from_str::<serde_json::Value>(data)
+                                .map_err(SamplingError::Serialization);
+                            let terminal = matches!(
+                                event.event.as_str(),
+                                "response.completed" | "response.incomplete" | "response.failed"
+                            ) || parsed.as_ref().ok().is_some_and(|value| {
+                                matches!(
+                                    value.get("type").and_then(serde_json::Value::as_str),
+                                    Some(
+                                        "response.completed"
+                                            | "response.incomplete"
+                                            | "response.failed"
+                                    )
+                                )
+                            });
+                            // 使用到达时刻分界，终止帧的 JSON 解码也归入收尾阶段。
+                            let terminal_diagnostics = if terminal {
+                                receive_diagnostics
+                                    .take()
+                                    .map(|timer| timer.terminal(arrived))
+                            } else {
+                                None
+                            };
+                            let prepared = parsed.and_then(crate::responses_compat::prepare_event);
                             match prepared {
                                 Ok(Some(value)) => {
                                     let decoded = if native_responses_enabled {
@@ -1814,7 +1896,7 @@ impl SamplingClient {
                                     } else {
                                         deserialize_response_event(&value.to_string())
                                     };
-                                    Some(Some(decoded.map(|mut event| {
+                                    let decoded = decoded.map(|mut event| {
                                         match &mut event {
                                             rs::ResponseStreamEvent::ResponseCompleted(e) => {
                                                 native_responses::finish_response(
@@ -1842,7 +1924,11 @@ impl SamplingClient {
                                             _ => {}
                                         }
                                         event
-                                    })))
+                                    });
+                                    if let Some(timer) = terminal_diagnostics {
+                                        timer.finish(decoded.is_ok());
+                                    }
+                                    Some(Some(decoded))
                                 }
                                 Ok(None) => Some(None),
                                 Err(error) => Some(Some(Err(error))),
@@ -1854,6 +1940,9 @@ impl SamplingClient {
                         Some(Some(Err(SamplingError::EventStreamError(e.to_string()))))
                     }
                 };
+                if matches!(&item, Some(Some(Err(_)))) {
+                    drop(receive_diagnostics.take());
+                }
                 if native_responses_enabled
                     && match &item {
                         Some(Some(Err(_))) => true,
@@ -2335,6 +2424,7 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
+        let diagnostics = self.responses_preparation_timer(true);
         self.apply_conversation_defaults(&mut request)?;
 
         let trace = request.trace.take();
@@ -2370,7 +2460,8 @@ impl SamplingClient {
             wrapper.trace = Some(trace);
         }
 
-        self.create_response_stream(wrapper).await
+        self.create_response_stream_prepared(wrapper, diagnostics)
+            .await
     }
 
     /// Send a conversation request using the Responses API (non-streaming).
@@ -2378,6 +2469,7 @@ impl SamplingClient {
         &self,
         mut request: ConversationRequest,
     ) -> Result<rs::Response> {
+        let diagnostics = self.responses_preparation_timer(false);
         self.apply_conversation_defaults(&mut request)?;
 
         let trace = request.trace.take();
@@ -2412,7 +2504,7 @@ impl SamplingClient {
             wrapper.trace = Some(trace);
         }
 
-        self.create_response(wrapper).await
+        self.create_response_inner(wrapper, diagnostics).await
     }
 
     /// Send a conversation request using the Anthropic Messages API (streaming).
@@ -2951,6 +3043,199 @@ mod tests {
     }
 
     const EMPTY_RESPONSE_JSON: &str = r#"{"id":"resp","object":"response","created_at":0,"model":"test-model","status":"completed","output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}}"#;
+
+    /// 真实假上游验证两种传输的规模、收尾失败分段与诊断脱敏。
+    #[tokio::test]
+    async fn responses_diagnostics_cover_transports_and_terminal_errors() {
+        use diagnostics::ResponsesDiagnosticStage::*;
+
+        for streaming in [false, true] {
+            for malformed in [false, true] {
+                let mut response: serde_json::Value =
+                    serde_json::from_str(EMPTY_RESPONSE_JSON).unwrap();
+                response["output"] = serde_json::json!([
+                    {"type":"compaction", "id":"cp", "encrypted_content":"ciphertext-sentinel"}
+                ]);
+                if malformed {
+                    response = serde_json::json!({});
+                }
+                let reply = if streaming {
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        serde_json::json!({
+                            "type":"response.completed", "sequence_number":1, "response":response
+                        })
+                    )
+                } else {
+                    response.to_string()
+                };
+                let (body_tx, body_rx) = oneshot::channel();
+                let body_tx = Arc::new(std::sync::Mutex::new(Some(body_tx)));
+                let app = Router::new().route(
+                    "/v1/responses",
+                    post(move |body: Bytes| {
+                        body_tx.lock().unwrap().take().unwrap().send(body).unwrap();
+                        let reply = reply.clone();
+                        async move {
+                            axum::response::Response::builder()
+                                .header(
+                                    "content-type",
+                                    if streaming {
+                                        "text/event-stream"
+                                    } else {
+                                        "application/json"
+                                    },
+                                )
+                                .body(axum::body::Body::from(reply))
+                                .unwrap()
+                        }
+                    }),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut client = SamplingClient::new(SamplerConfig {
+                    base_url: format!("http://{addr}/v1"),
+                    api_backend: ApiBackend::Responses,
+                    responses_compact_threshold: std::num::NonZeroU64::new(4096),
+                    ..minimal_config()
+                })
+                .unwrap();
+                let diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let captured = diagnostics.clone();
+                client.set_responses_diagnostics_observer(Arc::new(move |event| {
+                    captured.lock().unwrap().push(event);
+                }));
+                let request =
+                    ConversationRequest::from_items(vec![user_item(vec![ContentPart::Text {
+                        text: Arc::from("message-sentinel"),
+                    }])]);
+                let result = if streaming {
+                    let (mut stream, _, _) =
+                        client.conversation_stream_responses(request).await.unwrap();
+                    let result = stream.next().await.unwrap().map(drop);
+                    drop(stream);
+                    result
+                } else {
+                    client.conversation_responses(request).await.map(drop)
+                };
+                let body = body_rx.await.unwrap();
+                server.abort();
+                assert_eq!(result.is_err(), malformed);
+                let body_value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let diagnostics = diagnostics.lock().unwrap();
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .map(|event| event.stage)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        CompactionProjection,
+                        RequestPreparation,
+                        HttpHeaders,
+                        StreamReceive,
+                        TerminalDecode
+                    ],
+                );
+                for event in diagnostics.iter() {
+                    assert_eq!(event.streaming, streaming);
+                    assert!(event.elapsed_ms.is_finite() && event.elapsed_ms >= 0.0);
+                    assert_eq!(event.completed, event.stage != TerminalDecode || !malformed);
+                    assert_eq!(
+                        event.input_items,
+                        Some(body_value["input"].as_array().unwrap().len() as u64)
+                    );
+                    if event.stage == CompactionProjection {
+                        assert_eq!(event.request_body_bytes, None);
+                        let compaction = event.compaction.as_ref().unwrap();
+                        assert_eq!(compaction.body_bytes, body.len());
+                        assert_eq!(compaction.history_items, 1);
+                        assert!(!compaction.selected);
+                        assert_eq!(compaction.candidates, 0);
+                        assert!(compaction.rejections.is_empty());
+                        assert_eq!(compaction.images_evicted, 0);
+                    } else {
+                        assert_eq!(event.request_body_bytes, Some(body.len() as u64));
+                        assert!(event.compaction.is_none());
+                    }
+                }
+                let wire = serde_json::to_string(&*diagnostics).unwrap();
+                for secret in [
+                    "message-sentinel",
+                    "ciphertext-sentinel",
+                    "test-key",
+                    "127.0.0.1",
+                ] {
+                    assert!(!wire.contains(secret));
+                }
+            }
+        }
+    }
+
+    /// 本地准备失败与下一次连接失败分开记录，不依赖成功建立流。
+    #[tokio::test]
+    async fn responses_diagnostics_retain_init_failures_per_call() {
+        use diagnostics::ResponsesDiagnosticStage::*;
+
+        for streaming in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let mut client = SamplingClient::new(SamplerConfig {
+                base_url: format!("http://{addr}/v1"),
+                api_backend: ApiBackend::Responses,
+                responses_compact_threshold: std::num::NonZeroU64::new(4096),
+                ..minimal_config()
+            })
+            .unwrap();
+            let diagnostics = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = diagnostics.clone();
+            client.set_responses_diagnostics_observer(Arc::new(move |event| {
+                captured.lock().unwrap().push(event);
+            }));
+            for max_output_tokens in [Some(8193), None] {
+                let request = ConversationRequest {
+                    max_output_tokens,
+                    items: vec![user_item(vec![ContentPart::Text {
+                        text: Arc::from("hi"),
+                    }])],
+                    ..Default::default()
+                };
+                if streaming {
+                    assert!(client.conversation_stream_responses(request).await.is_err());
+                } else {
+                    assert!(client.conversation_responses(request).await.is_err());
+                }
+            }
+            let diagnostics = diagnostics.lock().unwrap();
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|event| event.stage)
+                    .collect::<Vec<_>>(),
+                vec![
+                    CompactionProjection,
+                    RequestPreparation,
+                    CompactionProjection,
+                    RequestPreparation,
+                    HttpHeaders
+                ]
+            );
+            for index in [0, 2] {
+                let event = nth(&diagnostics, index);
+                assert!(event.completed);
+                assert_eq!(event.streaming, streaming);
+                assert_eq!(event.input_items, Some(1));
+                assert!(event.compaction.is_some());
+            }
+            assert!(!nth(&diagnostics, 1).completed);
+            assert_eq!(nth(&diagnostics, 1).request_body_bytes, None);
+            assert!(nth(&diagnostics, 3).completed);
+            assert!(nth(&diagnostics, 3).request_body_bytes.is_some());
+            assert!(!nth(&diagnostics, 4).completed);
+            assert_eq!(nth(&diagnostics, 4).status_code, None);
+        }
+    }
 
     async fn capture_response_body(streaming: bool) -> serde_json::Value {
         let (body_tx, body_rx) = oneshot::channel();

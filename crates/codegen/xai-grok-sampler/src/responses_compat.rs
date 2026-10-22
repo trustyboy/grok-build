@@ -128,8 +128,20 @@ fn check_execution(item: &Value) -> Result<(), SamplingError> {
     Ok(())
 }
 
+/// 仅将错误码中的 JSON 数字转为文本，其他字段继续严格校验。
+fn prepare_error_code(error: &mut Value) {
+    if let Some(code) = error.get_mut("code") {
+        if let Value::Number(number) = code {
+            *code = Value::String(number.to_string());
+        }
+    }
+}
+
 /// 保留原始输出，再构造 SDK 能消费的投影；原始数据由历史转换层保存。
 pub(crate) fn prepare_response(response: &mut Value) -> Result<(), SamplingError> {
+    if let Some(error) = response.get_mut("error") {
+        prepare_error_code(error);
+    }
     if let Some(output) = response.get("output").and_then(Value::as_array) {
         for item in output {
             check_execution(item)?;
@@ -191,6 +203,9 @@ pub(crate) fn prepare_event(mut event: Value) -> Result<Option<Value>, SamplingE
             "已接收 Responses 扩展事件，当前无对应消费功能"
         );
         return Ok(None);
+    }
+    if kind == "error" {
+        prepare_error_code(&mut event);
     }
     if let Some(item) = event.get_mut("item") {
         check_execution(item)?;
@@ -306,6 +321,168 @@ mod tests {
             assistant.responses_output.as_ref().unwrap(),
             raw.as_array().unwrap()
         );
+    }
+
+    /// 提供失败响应的最小合法结构。
+    fn failed_response() -> Value {
+        json!({
+            "id":"r1", "object":"response", "created_at":1, "model":"test",
+            "status":"failed", "output":[],
+            "error":{"code":1400,"message":"原始上游错误：请求被拒绝"}
+        })
+    }
+
+    #[test]
+    fn responses_compat_top_level_error_preserves_numeric_and_string_codes() {
+        for (code, expected) in [
+            (json!(1400), "1400"),
+            (json!(-1400), "-1400"),
+            (json!(1400.5), "1400.5"),
+            (json!(u64::MAX), "18446744073709551615"),
+            (json!("1400"), "1400"),
+            (json!("invalid_request_error"), "invalid_request_error"),
+        ] {
+            let raw = json!({
+                "type":"error", "sequence_number":1, "code":code,
+                "message":"原始上游错误：请求被拒绝"
+            });
+            assert!(
+                xai_grok_sampling_types::error::try_parse_stream_error(&raw.to_string()).is_none()
+            );
+            let prepared = prepare_event(raw).unwrap().unwrap();
+            let event = crate::client::deserialize_response_event(&prepared.to_string()).unwrap();
+            let rs::ResponseStreamEvent::ResponseError(error) = event else {
+                panic!("错误事件被丢弃或改写")
+            };
+            assert_eq!(error.code.as_deref(), Some(expected));
+            assert_eq!(error.message, "原始上游错误：请求被拒绝");
+        }
+    }
+
+    #[test]
+    fn responses_compat_top_level_error_allows_null_or_missing_code() {
+        for raw in [
+            json!({"type":"error","sequence_number":1,"message":"boom","code":null}),
+            json!({"type":"error","sequence_number":1,"message":"boom"}),
+        ] {
+            let prepared = prepare_event(raw).unwrap().unwrap();
+            let event = crate::client::deserialize_response_event(&prepared.to_string()).unwrap();
+            let rs::ResponseStreamEvent::ResponseError(error) = event else {
+                panic!("错误事件被丢弃或改写")
+            };
+            assert_eq!(error.code, None);
+            assert_eq!(error.message, "boom");
+        }
+    }
+
+    #[test]
+    fn responses_compat_failed_event_preserves_numeric_and_string_codes() {
+        for (code, expected) in [
+            (json!(1400), "1400"),
+            (json!("1400"), "1400"),
+            (json!("server_error"), "server_error"),
+        ] {
+            let mut response = failed_response();
+            response["error"]["code"] = code;
+            let raw = json!({"type":"response.failed","sequence_number":1,"response":response});
+            assert!(
+                xai_grok_sampling_types::error::try_parse_stream_error(&raw.to_string()).is_none()
+            );
+            let prepared = prepare_event(raw).unwrap().unwrap();
+            let event = crate::client::deserialize_response_event(&prepared.to_string()).unwrap();
+            let rs::ResponseStreamEvent::ResponseFailed(failed) = event else {
+                panic!("失败事件被丢弃或改写")
+            };
+            let error = failed.response.error.unwrap();
+            assert_eq!(error.code, expected);
+            assert_eq!(error.message, "原始上游错误：请求被拒绝");
+        }
+    }
+
+    #[test]
+    fn responses_compat_full_response_preserves_error_code_and_message() {
+        for (code, expected) in [
+            (json!(1400), "1400"),
+            (json!("server_error"), "server_error"),
+        ] {
+            let mut response = failed_response();
+            response["error"]["code"] = code;
+            prepare_response(&mut response).unwrap();
+            let response = serde_json::from_value::<rs::Response>(response).unwrap();
+            assert!(matches!(response.status, rs::Status::Failed));
+            let error = response.error.unwrap();
+            assert_eq!(error.code, expected);
+            assert_eq!(error.message, "原始上游错误：请求被拒绝");
+        }
+        for error in [Some(Value::Null), None] {
+            let mut response = failed_response();
+            if let Some(error) = error {
+                response["error"] = error;
+            } else {
+                response.as_object_mut().unwrap().remove("error");
+            }
+            prepare_response(&mut response).unwrap();
+            let response = serde_json::from_value::<rs::Response>(response).unwrap();
+            assert!(response.error.is_none());
+        }
+    }
+
+    #[test]
+    fn responses_compat_error_fields_keep_sdk_validation() {
+        for code in [json!(true), json!([]), json!({})] {
+            let raw = json!({"type":"error","sequence_number":1,"code":code,"message":"boom"});
+            let prepared = prepare_event(raw).unwrap().unwrap();
+            assert!(matches!(
+                crate::client::deserialize_response_event(&prepared.to_string()),
+                Err(SamplingError::Serialization(_))
+            ));
+        }
+        for field in ["code", "message"] {
+            for value in [json!(null), json!(true), json!([]), json!({})] {
+                let mut response = failed_response();
+                response["error"][field] = value;
+                prepare_response(&mut response).unwrap();
+                assert!(serde_json::from_value::<rs::Response>(response.clone()).is_err());
+                let raw = json!({"type":"response.failed","sequence_number":1,"response":response});
+                assert!(matches!(
+                    crate::client::deserialize_response_event(&raw.to_string()),
+                    Err(SamplingError::Serialization(_))
+                ));
+            }
+            let mut response = failed_response();
+            response["error"].as_object_mut().unwrap().remove(field);
+            prepare_response(&mut response).unwrap();
+            assert!(serde_json::from_value::<rs::Response>(response).is_err());
+        }
+        for raw in [
+            json!({"type":"error","sequence_number":1,"code":1400,"message":1400}),
+            json!({"type":"error","sequence_number":"1","code":1400,"message":"boom"}),
+        ] {
+            let prepared = prepare_event(raw).unwrap().unwrap();
+            assert!(matches!(
+                crate::client::deserialize_response_event(&prepared.to_string()),
+                Err(SamplingError::Serialization(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn responses_compat_numeric_error_code_does_not_relax_success_or_tools() {
+        for output in [
+            json!([{"type":"function_call","id":"f1","call_id":"c1","name":1400,"arguments":"{}","status":"completed"}]),
+            json!([{"type":"function_call","id":"f1","call_id":"c1","name":"lookup","arguments":1400,"status":"completed"}]),
+        ] {
+            let mut response = failed_response();
+            response["status"] = json!("completed");
+            response["output"] = output;
+            prepare_response(&mut response).unwrap();
+            assert!(serde_json::from_value::<rs::Response>(response).is_err());
+        }
+        let mut response = failed_response();
+        response["status"] = json!("completed");
+        response["model"] = json!(1400);
+        prepare_response(&mut response).unwrap();
+        assert!(serde_json::from_value::<rs::Response>(response).is_err());
     }
 
     #[test]

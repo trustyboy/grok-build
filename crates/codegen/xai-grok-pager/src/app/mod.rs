@@ -898,12 +898,13 @@ pub async fn run(
         && !args.chat()
         && let Some(id) = title_lookup_id
     {
-        let summaries = xai_grok_shell::session::persistence::list_summaries(None).await?;
-        if let Some(s) = summaries.iter().find(|s| s.info.id.0.as_ref() == id)
-            && let Some(title) = s.display_title_opt()
-        {
-            session_title = Some(title);
-        }
+        let id = id.to_owned();
+        session_title = tokio::task::spawn_blocking(move || {
+            xai_grok_shell::session::persistence::find_summary_by_session_id(&id)
+                .filter(|summary| !summary.is_hidden())
+                .and_then(|summary| summary.display_title_opt())
+        })
+        .await?;
     }
     let session_cwd = match &materialized {
         session_startup::MaterializedStartup::Resume { original_cwd, .. }

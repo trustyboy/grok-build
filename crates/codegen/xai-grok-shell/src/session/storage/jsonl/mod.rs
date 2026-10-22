@@ -278,6 +278,7 @@ impl JsonlStorageAdapter {
             .and_then(|view| view.session_dirs(cwd))
             .map_err(io::Error::other)
     }
+    /// 历史列表只读本地摘要；工作树信息由会话创建及初始化流程维护。
     fn list_sessions_sync(&self, cwd: Option<&str>) -> io::Result<Vec<Summary>> {
         let session_dirs = self.scan_session_dirs(cwd)?;
         let mut summaries = Vec::new();
@@ -285,14 +286,9 @@ impl JsonlStorageAdapter {
             let summary_path = session_dir.join(super::SUMMARY_FILE);
             match std::fs::read(&summary_path) {
                 Ok(bytes) => {
-                    if let Ok(mut summary) = serde_json::from_slice::<Summary>(&bytes)
+                    if let Ok(summary) = serde_json::from_slice::<Summary>(&bytes)
                         && !summary.is_hidden()
                     {
-                        super::summary_write::repair_untagged_worktree_summary(
-                            &mut summary,
-                            &summary_path,
-                            &session_dir.join(format!("{}.lock", super::SUMMARY_FILE)),
-                        );
                         summaries.push(summary);
                     }
                 }
@@ -342,20 +338,12 @@ impl JsonlStorageAdapter {
             }
             match std::fs::read(&summary_path) {
                 Ok(bytes) => {
-                    if let Ok(mut summary) = serde_json::from_slice::<Summary>(&bytes)
+                    if let Ok(summary) = serde_json::from_slice::<Summary>(&bytes)
                         && !summary.is_hidden()
                         && !summary.is_headless()
+                        && !summary.is_unused_optimistic_husk()
                     {
-                        let lock_path =
-                            summary_path.with_file_name(format!("{}.lock", super::SUMMARY_FILE));
-                        super::summary_write::repair_untagged_worktree_summary(
-                            &mut summary,
-                            &summary_path,
-                            &lock_path,
-                        );
-                        if !summary.is_unused_optimistic_husk() {
-                            summaries.push(summary);
-                        }
+                        summaries.push(summary);
                     }
                 }
                 Err(_) => continue,

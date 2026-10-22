@@ -294,9 +294,8 @@ pub(crate) fn repair_worktree_identity(
     result
 }
 
-/// Read-site repair for a `summary` that is untagged, or kinded but still missing `worktree_label`, when its cwd is inside a grok-managed worktree.
-/// Stamps the missing identity on disk via [`repair_worktree_identity`] and replaces `summary` with the lock-fresh on-disk state.
-/// Memory then mirrors disk whichever way the repair went.
+/// 初始化已有会话时补全缺失的工作树信息；历史查询保持只读，避免访问离线项目目录。
+/// 持锁写入后同步内存摘要，保留已有会话类型及来源信息。
 pub(crate) fn repair_untagged_worktree_summary(
     summary: &mut Summary,
     summary_path: &Path,

@@ -137,11 +137,35 @@ impl SessionActor {
         ) {
             self.close_stream_apply_span(event.request_id());
         }
-        if !request_owned && !closes_backend_tool && !resolves_pending_strip {
+        let is_diagnostic = matches!(event, SamplingEvent::ResponsesDiagnostics { .. });
+        if !request_owned && !closes_backend_tool && !resolves_pending_strip && !is_diagnostic {
             return;
         }
 
         match event {
+            SamplingEvent::ResponsesDiagnostics {
+                request_id,
+                attempt,
+                diagnostics,
+            } => {
+                // 辅助请求和已结束流的析构诊断也保留，只写安全计数，不改变轮次状态。
+                xai_grok_telemetry::unified_log::info(
+                    "shell.turn.responses_diagnostics",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "sampler_request_id": request_id.as_str(),
+                        "attempt": attempt,
+                        "stage": diagnostics.stage,
+                        "streaming": diagnostics.streaming,
+                        "elapsed_ms": diagnostics.elapsed_ms,
+                        "completed": diagnostics.completed,
+                        "input_items": diagnostics.input_items,
+                        "request_body_bytes": diagnostics.request_body_bytes,
+                        "status_code": diagnostics.status_code,
+                        "compaction": diagnostics.compaction,
+                    })),
+                );
+            }
             SamplingEvent::StreamStarted {
                 request_id,
                 timestamp_ms,

@@ -1,11 +1,13 @@
 use super::*;
+use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 
 #[path = "responses_context.rs"]
 mod context;
 pub use context::{
     RESPONSE_CONTEXT_CHECKPOINT_FIELD, ResponsesContextUsage, ResponsesInputProjection,
-    assistant_context_usage, checkpoint_responses_context, response_context_usage,
-    responses_projection_context,
+    assistant_context_usage, checkpoint_responses_context, checkpoint_responses_context_for_input,
+    response_context_usage, responses_projection_context,
 };
 
 /// 流适配器通过 metadata 传递完整 output 数组的 JSON 字符串。
@@ -24,13 +26,87 @@ pub fn responses_input_fingerprint(req: &ConversationRequest, source: &str) -> S
 
 /// 保留图片、原始输出及 sibling 内容，任何删除或改写均使指纹失效。
 fn responses_history_fingerprint(items: &[ConversationItem], source: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(&("responses-history-v1", source, items))
+    let mut writer = ResponsesHistoryHasher::default();
+    serde_json::to_writer(&mut writer, &("responses-history-v1", source, items))
         .expect("conversation history is serializable");
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    writer.finish()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// 仅统计历史指纹写入量，避免用耗时断言验证线性复杂度。
+    static RESPONSES_HISTORY_HASHED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 读取并清零当前测试线程的历史指纹写入量。
+#[cfg(test)]
+pub(super) fn take_responses_history_hashed_bytes() -> usize {
+    RESPONSES_HISTORY_HASHED_BYTES.with(|bytes| bytes.replace(0))
+}
+
+/// 将 JSON 直接写入摘要，不分配完整历史缓冲区。
+#[derive(Clone, Default)]
+struct ResponsesHistoryHasher {
+    hash: Sha256,
+}
+
+impl Write for ResponsesHistoryHasher {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.hash.update(bytes);
+        #[cfg(test)]
+        RESPONSES_HISTORY_HASHED_BYTES.with(|count| count.set(count.get() + bytes.len()));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ResponsesHistoryHasher {
+    /// 保持已持久化的十六进制 SHA-256 格式。
+    fn finish(self) -> String {
+        self.hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
+/// 未闭合的 v1 元组与历史数组，按递增前缀共享 SHA-256 状态。
+struct ResponsesHistoryFingerprint {
+    writer: ResponsesHistoryHasher,
+    item_count: usize,
+}
+
+impl ResponsesHistoryFingerprint {
+    /// 固定元组头与 serde_json 的紧凑序列化逐字节一致。
+    fn new(source: &str) -> Self {
+        let mut writer = ResponsesHistoryHasher::default();
+        writer.write_all(b"[\"responses-history-v1\",").unwrap();
+        serde_json::to_writer(&mut writer, source).expect("source is serializable");
+        writer.write_all(b",[").unwrap();
+        Self {
+            writer,
+            item_count: 0,
+        }
+    }
+
+    /// 每项仅序列化一次；只在状态副本上闭合元组，不影响后续追加。
+    fn prefix(&mut self, items: &[ConversationItem]) -> String {
+        for item in &items[self.item_count..] {
+            if self.item_count > 0 {
+                self.writer.write_all(b",").unwrap();
+            }
+            serde_json::to_writer(&mut self.writer, item)
+                .expect("conversation history is serializable");
+            self.item_count += 1;
+        }
+        let mut snapshot = self.writer.clone();
+        snapshot.write_all(b"]]").unwrap();
+        snapshot.finish()
+    }
 }
 
 /// X 搜索服务端工具名；保留旧历史中的聚合名称。
@@ -377,6 +453,9 @@ fn project_responses_history(
     let mut records = Vec::new();
     let mut siblings = Vec::new();
     let mut sibling_start = None;
+    let mut history_fingerprint = None;
+    let mut compaction_candidates = 0;
+    let mut compaction_rejections = std::collections::BTreeMap::<String, usize>::new();
     for (index, item) in req.items.iter().enumerate() {
         if matches!(
             item,
@@ -390,23 +469,54 @@ fn project_responses_history(
             );
             continue;
         }
+        let candidate_count = match item {
+            ConversationItem::Assistant(assistant) => {
+                assistant.responses_output.as_ref().map_or(0, |raw| {
+                    raw.iter()
+                        .filter(|entry| {
+                            entry.get("type").and_then(|v| v.as_str()) == Some("compaction")
+                        })
+                        .count()
+                })
+            }
+            _ => 0,
+        };
+        compaction_candidates += candidate_count;
         if let ConversationItem::Assistant(assistant) = item
             && let Some(raw) = &assistant.responses_output
             && (legacy || source.is_some())
             && responses_output_matches_assistant(raw, assistant)
         {
-            let valid_checkpoint = source.is_some_and(|source| {
-                assistant.responses_source.as_deref() == Some(source)
-                    && assistant.responses_input_fingerprint.as_deref()
-                        == Some(
-                            responses_history_fingerprint(
-                                &req.items[..sibling_start.unwrap_or(index)],
-                                source,
-                            )
-                            .as_str(),
-                        )
-                    && responses_siblings_match(raw, &siblings)
-            });
+            let rejection = match source {
+                None => Some("native_disabled"),
+                Some(source) if assistant.responses_source.as_deref() != Some(source) => {
+                    Some("source_changed")
+                }
+                Some(source) => {
+                    let matches = assistant
+                        .responses_input_fingerprint
+                        .as_deref()
+                        .is_some_and(|expected| {
+                            history_fingerprint
+                                .get_or_insert_with(|| ResponsesHistoryFingerprint::new(source))
+                                .prefix(&req.items[..sibling_start.unwrap_or(index)])
+                                == expected
+                        });
+                    if !matches {
+                        Some("history_changed")
+                    } else if !responses_siblings_match(raw, &siblings) {
+                        Some("siblings_changed")
+                    } else {
+                        None
+                    }
+                }
+            };
+            let valid_checkpoint = rejection.is_none();
+            if candidate_count > 0
+                && let Some(reason) = rejection
+            {
+                *compaction_rejections.entry(reason.to_owned()).or_default() += candidate_count;
+            }
             if valid_checkpoint && let Some(record) = context::assistant_record(assistant) {
                 records.push(record);
             }
@@ -472,6 +582,14 @@ fn project_responses_history(
             ));
             input.append(&mut replay);
         } else {
+            if candidate_count > 0 {
+                let reason = if source.is_none() {
+                    "native_disabled"
+                } else {
+                    "output_changed"
+                };
+                *compaction_rejections.entry(reason.to_owned()).or_default() += candidate_count;
+            }
             input.append(&mut siblings);
             input.extend(
                 conversation_item_to_input_items(item)
@@ -518,6 +636,9 @@ fn project_responses_history(
             selected = Some(projected);
             break;
         }
+        *compaction_rejections
+            .entry("tool_boundary_unpaired".to_owned())
+            .or_default() += 1;
     }
     if let Some(projected) = selected {
         input = projected;
@@ -535,6 +656,8 @@ fn project_responses_history(
     ResponsesInputProjection {
         input,
         checkpoint_key,
+        compaction_candidates,
+        compaction_rejections,
         source: source.map(str::to_owned),
         records,
         selected_assistant,

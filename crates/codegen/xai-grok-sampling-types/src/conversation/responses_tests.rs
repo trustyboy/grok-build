@@ -1925,6 +1925,170 @@ fn responses_mcp_and_compaction_are_sdk_input_items() {
     }
 }
 
+/// 使用原 v1 算法作为持久化兼容性基准。
+fn legacy_responses_history_fingerprint(items: &[ConversationItem], source: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(serde_json::to_vec(&("responses-history-v1", source, items)).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn responses_history_streaming_fingerprint_matches_v1_at_every_prefix() {
+    let mut items = vec![
+        ConversationItem::system("中文 🦀\n\t\"quoted\"\\path\u{0000}"),
+        ConversationItem::User(UserItem {
+            content: vec![
+                ContentPart::Text {
+                    text: Arc::from("多模态\r\n\\\""),
+                },
+                ContentPart::Image {
+                    url: Arc::from(format!("data:image/png;base64,{}", "aB09".repeat(1_024))),
+                },
+            ],
+            synthetic_reason: SyntheticReason::AgentMessage,
+            cwd_generation: Some(7),
+            ..UserItem::default()
+        }),
+    ];
+    items.extend(response_to_conversation_items(raw_history_response(
+        serde_json::json!([
+            {"type":"reasoning", "id":"r1", "summary":[{"type":"summary_text", "text":"推理\n\\\""}], "encrypted_content":"密文🦀"},
+            {"type":"web_search_call", "id":"ws1", "status":"completed", "action":{"type":"search", "query":"中文搜索"}},
+            {"type":"reasoning", "id":"r2", "summary":[], "encrypted_content":"second"},
+            {"type":"compaction", "encrypted_content":"opaque", "metadata":{"unicode":"中文", "escaped":"\n\\\"", "nested":[null, true, 42]}},
+            {"type":"message", "id":"m1", "role":"assistant", "content":[{"type":"output_text", "text":"答案🦀\n", "annotations":[]}]}
+        ]),
+    )));
+    let Some(ConversationItem::Assistant(assistant)) = items.last_mut() else {
+        panic!("expected assistant");
+    };
+    assistant.responses_source = Some("原始来源".into());
+    assistant.responses_input_fingerprint = Some("persisted fingerprint".into());
+    assistant.model_fingerprint = Some("模型指纹".into());
+    assistant.reasoning_effort = Some(crate::ReasoningEffort::High);
+    items.push(ConversationItem::assistant_tool_calls(vec![ToolCall {
+        id: Arc::from("c1"),
+        name: "read_file".into(),
+        arguments: Arc::from(r#"{"path":"中文\\file\n\""}"#),
+    }]));
+    items.push(ConversationItem::tool_result("c1", "结果\t🦀"));
+
+    for source in ["", "source", "来源🦀\n\"\\"] {
+        for end in 0..=items.len() {
+            let req = ConversationRequest::from_items(items[..end].to_vec());
+            let expected = legacy_responses_history_fingerprint(&req.items, source);
+            let expected_bytes = serde_json::to_vec(&("responses-history-v1", source, &req.items))
+                .unwrap()
+                .len();
+            super::responses::take_responses_history_hashed_bytes();
+            assert_eq!(
+                responses_input_fingerprint(&req, source),
+                expected,
+                "prefix {end}"
+            );
+            assert_eq!(
+                super::responses::take_responses_history_hashed_bytes(),
+                expected_bytes
+            );
+        }
+    }
+}
+
+#[test]
+fn responses_history_incremental_prefixes_match_v1_with_linear_hash_bytes() {
+    let mut req = ConversationRequest::from_items(Vec::new());
+    let mut checkpoints = Vec::new();
+    for turn in 0..8 {
+        if turn > 0 {
+            req.items
+                .push(ConversationItem::user("追加🦀\n\\\"".repeat(128)));
+        }
+        let source = if turn % 3 == 1 { "other" } else { "source" };
+        let prefix_end = req.items.len();
+        let cipher = format!("checkpoint-{turn}");
+        let mut response = raw_history_response(serde_json::json!([
+            {"type":"reasoning", "id":format!("r-{turn}"), "summary":[], "encrypted_content":"推理🦀"},
+            {"type":"web_search_call", "id":format!("ws-{turn}"), "status":"completed", "action":{"type":"search", "query":"搜索\n\\\""}},
+            {"type":"reasoning", "id":format!("r-after-{turn}"), "summary":[], "encrypted_content":"尾部推理"},
+            {"type":"compaction", "encrypted_content":cipher},
+            {"type":"message", "id":format!("m-{turn}"), "role":"assistant", "content":[{"type":"output_text", "text":"答案🦀", "annotations":[]}], "metadata":{"turn":turn, "escaped":"\n\\\""}}
+        ]));
+        let metadata = response.metadata.as_mut().unwrap();
+        metadata.insert(RESPONSE_SOURCE_METADATA_KEY.into(), source.into());
+        metadata.insert(
+            RESPONSE_INPUT_FINGERPRINT_METADATA_KEY.into(),
+            legacy_responses_history_fingerprint(&req.items, source),
+        );
+        req.items.extend(response_to_conversation_items(response));
+        checkpoints.push((source, prefix_end, cipher));
+
+        for selected_source in ["source", "other"] {
+            let matching: Vec<_> = checkpoints
+                .iter()
+                .filter(|(source, _, _)| *source == selected_source)
+                .collect();
+            super::responses::take_responses_history_hashed_bytes();
+            let projection = project_responses_input(&req, Some(selected_source));
+            let hashed_bytes = super::responses::take_responses_history_hashed_bytes();
+            if let Some((_, end, expected_cipher)) = matching.last() {
+                let full_prefix_bytes = serde_json::to_vec(&(
+                    "responses-history-v1",
+                    selected_source,
+                    &req.items[..*end],
+                ))
+                .unwrap()
+                .len();
+                // 完整前缀只写入一次，每个快照仅额外写入两个闭合括号。
+                assert_eq!(hashed_bytes, full_prefix_bytes - 2 + matching.len() * 2);
+                assert_eq!(
+                    projection.input[0]["encrypted_content"],
+                    expected_cipher.as_str()
+                );
+                assert!(projection.checkpoint_key.is_some());
+            } else {
+                assert_eq!(hashed_bytes, 0);
+                assert!(projection.checkpoint_key.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn responses_history_skips_hashing_without_a_source_candidate() {
+    let mut req = ConversationRequest::from_items(vec![ConversationItem::user("history")]);
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([{"type":"compaction", "encrypted_content":"opaque"}]),
+        "source",
+    );
+    for source in [None, Some(""), Some("other")] {
+        super::responses::take_responses_history_hashed_bytes();
+        assert!(
+            project_responses_input(&req, source)
+                .checkpoint_key
+                .is_none()
+        );
+        assert_eq!(super::responses::take_responses_history_hashed_bytes(), 0);
+    }
+    super::responses::take_responses_history_hashed_bytes();
+    let mut body = serde_json::json!({});
+    patch_responses_input(&mut body, &req);
+    assert_eq!(super::responses::take_responses_history_hashed_bytes(), 0);
+
+    let Some(ConversationItem::Assistant(assistant)) = req.items.last_mut() else {
+        panic!("expected assistant");
+    };
+    assistant.responses_input_fingerprint = None;
+    assert!(
+        project_responses_input(&req, Some("source"))
+            .checkpoint_key
+            .is_none()
+    );
+    assert_eq!(super::responses::take_responses_history_hashed_bytes(), 0);
+}
+
 /// 模拟客户端使用发送前的本地历史签发压缩来源。
 fn append_checkpoint(req: &mut ConversationRequest, raw: serde_json::Value, source: &str) {
     let mut response = raw_history_response(raw);
@@ -1976,6 +2140,34 @@ fn responses_checkpoint_latest_boundary_and_system_instructions() {
     assert_eq!(input.as_array().unwrap().len(), 3);
     assert_eq!(input[1]["content"], "new instruction");
     assert_eq!(input[2]["encrypted_content"], "second");
+}
+
+#[test]
+fn responses_checkpoint_diagnostics_explain_fallback_without_content() {
+    let mut req = ConversationRequest::from_items(vec![ConversationItem::user("private")]);
+    append_checkpoint(
+        &mut req,
+        serde_json::json!([
+            {"type":"compaction","encrypted_content":"opaque"}
+        ]),
+        "source",
+    );
+    let valid = project_responses_input(&req, Some("source"));
+    assert_eq!(valid.compaction_candidates, 1);
+    assert!(valid.checkpoint_key.is_some());
+    assert!(valid.compaction_rejections.is_empty());
+    let foreign = project_responses_input(&req, Some("other"));
+    assert_eq!(
+        foreign.compaction_rejections.get("source_changed"),
+        Some(&1)
+    );
+    req.items[0] = ConversationItem::user("edited");
+    let edited = project_responses_input(&req, Some("source"));
+    assert_eq!(
+        edited.compaction_rejections.get("history_changed"),
+        Some(&1)
+    );
+    assert!(edited.checkpoint_key.is_none());
 }
 
 #[test]

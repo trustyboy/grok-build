@@ -580,14 +580,13 @@ struct FlatErrorResponse {
     code: Option<String>,
 }
 
-/// Some provider dialects put non-strings in the nested `code` slot (e.g. `"code": 429`).
-/// A strict `Option<String>` would fail the whole envelope parse and demote a retryable stream error to a fatal `Serialization` error.
-/// Swallow non-string codes instead of rejecting the envelope.
+/// 错误码保留字符串及 JSON 数字，其他类型沿用宽容解析。
 fn lenient_code<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<Option<String>, D::Error> {
     Ok(match serde_json::Value::deserialize(d)? {
         serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(number) => Some(number.to_string()),
         _ => None,
     })
 }
@@ -1216,27 +1215,27 @@ mod tests {
         assert_eq!(msg, "rate_limit_error: rate limit exceeded");
     }
 
-    /// Non-string `code` slots (numeric HTTP codes from provider dialects) must not fail the envelope parse.
-    /// Mid-stream, a failed parse falls through to the chunk parse and surfaces a `Serialization` error where a retryable `StreamError` is correct.
+    /// 数字错误码保留文本值，流式错误继续走原有错误路径。
     #[test]
     fn numeric_code_dialects_still_parse_as_envelopes() {
-        // Nested envelope: the code is swallowed, the message surfaces.
         let bytes = br#"{"error":{"message":"Provider returned error","code":429}}"#;
         let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
         assert_eq!(msg, "Provider returned error");
-        assert_eq!(parse_error_code(bytes), None);
+        assert_eq!(parse_error_code(bytes), Some(ApiErrorCode::parse("429")));
 
-        // Mid-stream: still a retryable StreamError.
         let data =
             r#"{"error":{"message":"upstream overloaded","type":"overloaded_error","code":503}}"#;
         let err = try_parse_stream_error(data).expect("numeric-code envelope must still parse");
         assert!(err.is_retryable(), "stream errors must stay retryable");
         match err {
             SamplingError::StreamError {
-                error_type, code, ..
+                error_type,
+                message,
+                code,
             } => {
                 assert_eq!(error_type, "overloaded_error");
-                assert_eq!(code, None);
+                assert_eq!(message, "upstream overloaded");
+                assert_eq!(code, Some(ApiErrorCode::parse("503")));
             }
             other => panic!("expected StreamError, got {other:?}"),
         }
@@ -1252,6 +1251,74 @@ mod tests {
             !msg.contains("[WKE="),
             "flat numeric-code bodies must reach the WKE-stripping fallback, got: {msg}"
         );
+    }
+
+    #[test]
+    fn try_parse_stream_error_preserves_numeric_and_string_codes() {
+        for (code, expected) in [
+            (serde_json::json!(1400), "1400"),
+            (serde_json::json!(-1400), "-1400"),
+            (serde_json::json!(1400.5), "1400.5"),
+            (serde_json::json!(u64::MAX), "18446744073709551615"),
+            (serde_json::json!("1400"), "1400"),
+            (serde_json::json!("invalid_image"), "invalid_image"),
+        ] {
+            let data = serde_json::json!({"error":{
+                "message":" 原始上游错误：请求被拒绝\n", "type":"invalid_request_error", "code":code
+            }})
+            .to_string();
+            let expected = Some(ApiErrorCode::parse(expected));
+            assert_eq!(parse_error_code(data.as_bytes()), expected);
+            match try_parse_stream_error(&data) {
+                Some(SamplingError::StreamError {
+                    error_type,
+                    message,
+                    code,
+                }) => {
+                    assert_eq!(error_type, "invalid_request_error");
+                    assert_eq!(message, " 原始上游错误：请求被拒绝\n");
+                    assert_eq!(code, expected);
+                }
+                other => panic!("应保留流式错误，实际为 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn try_parse_stream_error_keeps_lenient_code_boundaries() {
+        for code in [
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!({})),
+            None,
+        ] {
+            let mut data = serde_json::json!({"error":{"message":"boom","type":"server_error"}});
+            if let Some(code) = code {
+                data["error"]["code"] = code;
+            }
+            let data = data.to_string();
+            assert_eq!(parse_error_code(data.as_bytes()), None);
+            match try_parse_stream_error(&data) {
+                Some(SamplingError::StreamError {
+                    error_type,
+                    message,
+                    code,
+                }) => {
+                    assert_eq!(error_type, "server_error");
+                    assert_eq!(message, "boom");
+                    assert_eq!(code, None);
+                }
+                other => panic!("应保留流式错误，实际为 {other:?}"),
+            }
+        }
+        for data in [
+            r#"{"error":{"message":1400,"code":1400}}"#,
+            r#"{"error":{"message":"boom","type":1400,"code":1400}}"#,
+            r#"{"error":{"message":"boom","code":1400}"#,
+        ] {
+            assert!(try_parse_stream_error(data).is_none());
+        }
     }
 
     #[test]

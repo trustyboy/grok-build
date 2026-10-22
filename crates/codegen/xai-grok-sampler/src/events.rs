@@ -37,6 +37,13 @@ pub enum StripReason {
 /// The session translates these into ACP notifications.
 #[derive(Debug, Clone)]
 pub enum SamplingEvent {
+    /// Responses 安全分段诊断；每次尝试独立，正文与认证信息不进入事件。
+    ResponsesDiagnostics {
+        request_id: RequestId,
+        attempt: u32,
+        diagnostics: crate::client::diagnostics::ResponsesDiagnostics,
+    },
+
     /// HTTP stream established, headers read. Emitted before any content.
     StreamStarted {
         request_id: RequestId,
@@ -158,7 +165,8 @@ impl SamplingEvent {
     /// Sampler request that owns this event.
     pub fn request_id(&self) -> &RequestId {
         match self {
-            Self::StreamStarted { request_id, .. }
+            Self::ResponsesDiagnostics { request_id, .. }
+            | Self::StreamStarted { request_id, .. }
             | Self::FirstToken { request_id }
             | Self::ChannelToken { request_id, .. }
             | Self::ToolCallDelta { request_id, .. }
