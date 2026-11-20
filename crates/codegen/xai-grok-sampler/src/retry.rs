@@ -1113,7 +1113,8 @@ mod tests {
         assert!(
             matches!(
                 classify_error_with_mode(&empty, 0, 15, 2, true),
-                RetryDecision::Retry { .. }
+                // 首次可重试错误会顺带重建客户端，仍属于普通预算内的重试。
+                RetryDecision::Retry { .. } | RetryDecision::RetryWithClientRebuild { .. }
             ),
             "空响应保留普通预算内的重试"
         );
