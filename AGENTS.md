@@ -173,6 +173,7 @@ if ($LASTEXITCODE -ne 0) { throw "hkh-win Release 构建失败，SSH 退出码�
 - 开启后采样器对限流、5xx、传输错误与流中断跳过重试预算，按固定 1 秒间隔持续重试；回合级重试同样忽略每步、每提示与时间窗口预算，并使用 1 秒间隔。
 - 鉴权、上下文超长、空响应、图片/请求体错误与 doom-loop 保留各自现有的终止或独立恢复路径；`max_retries = 0`（含子代理输出预算耗尽）仍立即终止。
 - 界面显示 `Retrying (N/∞)`；实现位于 `session/acp_session_impl/unlimited_retry.rs`，ACP 扩展为 `x.ai/session/unlimited_retry`，状态由 `SamplerConfig.unlimited_retry` 下发。
+- Release 构建后运行 `python -B tools/test-unlimited-retry.py`（Python 3.11+），使用临时配置和本地假上游连续返回 20 次 503，校验重试预算被绕过、相邻请求间隔约 1 秒、会话隔离及关闭复位，不需要真实凭据。
 
 ## 子代理模型配置与会话覆盖
 
