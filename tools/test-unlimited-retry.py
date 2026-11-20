@@ -182,11 +182,11 @@ def run_checks(exe, root, server):
 
 def main():
     """只使用已构建的 Release 程序，结束时清理临时目录和服务器。"""
+    global FAILURES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", default="target/release/xai-grok-pager.exe")
     parser.add_argument("--failures", type=int, default=FAILURES, help="首次成功前返回 503 的次数")
     args = parser.parse_args()
-    global FAILURES
     FAILURES = args.failures
     exe = Path(args.exe).resolve()
     if not exe.is_file() or "debug" in (part.lower() for part in exe.parts):
