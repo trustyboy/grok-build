@@ -1811,6 +1811,7 @@ pub(crate) async fn spawn_session_actor(
                     .as_ref()
                     .and_then(|r| r.turn_transient_retry),
             ),
+        unlimited_retry: std::cell::Cell::new(false),
         transient_retries_prompt_total: std::cell::Cell::new(0),
         transient_episode_start: std::cell::Cell::new(None),
         auth_method_id,

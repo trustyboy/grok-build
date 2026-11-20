@@ -965,6 +965,9 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::SupportVision { enabled } => super::model_requests::support_vision(app, enabled),
         Action::FastMode { action } => super::model_requests::fast_mode(app, action),
+        Action::UnlimitedRetry { action } => {
+            super::model_requests::unlimited_retry(app, action)
+        }
         Action::SubagentsModel { action } => super::model_requests::subagents_model(app, action),
         Action::NextModel => vec![],
         Action::SwitchModel(mut choice) => {

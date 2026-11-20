@@ -4851,6 +4851,8 @@ pub(crate) fn sampling_config_for_model(
         responses_compact_threshold: info.responses_compact_threshold,
         force_http1: false,
         max_retries: info.max_retries,
+        // 模型配置不提供该开关；会话覆盖由 `reconstruct_full_config` 注入。
+        unlimited_retry: false,
         rate_limit_retry_threshold: info.rate_limit_retry_threshold,
         stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
         idle_timeout_secs: None,

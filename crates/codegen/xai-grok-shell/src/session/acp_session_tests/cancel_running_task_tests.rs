@@ -89,6 +89,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
             let actor = Arc::new(SessionActor {
                 vcs_root: None,
                 transient_retry_enabled: true,
+                unlimited_retry: Default::default(),
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
@@ -627,6 +628,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             let actor = Arc::new(SessionActor {
                 vcs_root: None,
                 transient_retry_enabled: true,
+                unlimited_retry: Default::default(),
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
@@ -965,6 +967,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
             let actor = SessionActor {
                 vcs_root: None,
                 transient_retry_enabled: true,
+                unlimited_retry: Default::default(),
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),
@@ -2525,6 +2528,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
             let actor = SessionActor {
                 vcs_root: None,
                 transient_retry_enabled: true,
+                unlimited_retry: Default::default(),
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),

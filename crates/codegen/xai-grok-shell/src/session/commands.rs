@@ -373,6 +373,27 @@ pub struct FastModeState {
     pub supported: bool,
 }
 
+/// 当前会话的无限重试状态，不参与持久化。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlimitedRetryState {
+    /// 下一轮是否对上游不稳定错误无限重试。
+    pub enabled: bool,
+    /// 固定重试间隔（秒）。
+    pub interval_secs: u64,
+}
+
+/// 无限重试操作由 actor 原子执行，避免查询与切换之间发生竞争。
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlimitedRetryAction {
+    Toggle,
+    On,
+    Off,
+    #[default]
+    Status,
+}
+
 /// Fast 操作由 actor 原子执行，避免查询与切换之间发生竞争。
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -521,6 +542,11 @@ pub enum SessionCommand {
         action: FastModeAction,
         expected_model_id: Option<String>,
         responds_to: oneshot::Sender<Result<FastModeState, acp::Error>>,
+    },
+    /// 查询或修改当前会话的无限重试开关，从下一轮生效。
+    UnlimitedRetry {
+        action: UnlimitedRetryAction,
+        responds_to: oneshot::Sender<Result<UnlimitedRetryState, acp::Error>>,
     },
     /// Zero-turn harness rebuild: build a brand-new `Agent` from the session's `AgentRebuildSpec` and the new `AgentDefinition`.
     /// Re-register MCP tools, swap the live `Agent`, and rewrite the system message in the conversation.

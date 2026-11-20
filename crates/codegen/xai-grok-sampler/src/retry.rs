@@ -10,6 +10,10 @@ pub const DEFAULT_MAX_RETRIES: u32 = 15;
 
 pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
+/// 无限重试模式下每次重试的固定间隔。
+/// 上游持续 503/429 时保持 1 秒一次的稳定节奏，长任务不会被重试预算中断。
+pub const UNLIMITED_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
 pub const TRANSPORT_REBUILD_BACKOFF: Duration = Duration::from_millis(200);
 
 pub(crate) fn resolve_max_retries_with_env(
@@ -98,12 +102,27 @@ pub fn classify_error(
     max_retries: u32,
     rate_limit_threshold: u32,
 ) -> RetryDecision {
+    classify_error_with_mode(err, retry_count, max_retries, rate_limit_threshold, false)
+}
+
+/// 与 [`classify_error`] 相同，但 `unlimited_retry` 可跳过重试预算。
+///
+/// 开启后，限流、5xx、传输错误与流中断固定按 [`UNLIMITED_RETRY_BACKOFF`] 持续重试；
+/// 鉴权、上下文超长、空响应、doom-loop 等仍有各自的上限或独立恢复路径。
+pub fn classify_error_with_mode(
+    err: &SamplingError,
+    retry_count: u32,
+    max_retries: u32,
+    rate_limit_threshold: u32,
+    unlimited_retry: bool,
+) -> RetryDecision {
     if err.is_auth_error() {
         return RetryDecision::EmitToSession(clone_error(err));
     }
     if err.is_encrypted_content_error() {
         return RetryDecision::EmitToSession(clone_error(err));
     }
+    // `0` 同时表示显式关闭重试与子代理输出预算耗尽，任何模式都必须立即终止。
     if max_retries == 0 {
         return RetryDecision::Fatal(clone_error(err));
     }
@@ -124,6 +143,21 @@ pub fn classify_error(
     if matches!(err, SamplingError::DoomLoopDetected { .. }) {
         return RetryDecision::Retry {
             backoff: doom_loop_backoff(retry_count + 1),
+        };
+    }
+
+    // 无限重试只覆盖上游不稳定类错误：限流、5xx、传输与流中断。
+    // 空响应属于模型输出问题，保留原有预算，避免 1 秒一次地空转烧额度。
+    if unlimited_retry && !matches!(err, SamplingError::EmptyResponse { .. }) && err.is_retryable() {
+        return if retry_count == 0 && matches!(err, SamplingError::Http(_)) {
+            // 首次传输失败仍重建 HTTP/1.1 客户端，摆脱卡死的连接池。
+            RetryDecision::RetryWithClientRebuild {
+                backoff: UNLIMITED_RETRY_BACKOFF,
+            }
+        } else {
+            RetryDecision::Retry {
+                backoff: UNLIMITED_RETRY_BACKOFF,
+            }
         };
     }
 
@@ -1029,6 +1063,80 @@ mod tests {
                 other => panic!("expected Retry, got {other:?}"),
             }
         }
+    }
+
+    /// 无限重试：限流与 5xx 不再受预算约束，固定 1 秒间隔。
+    #[test]
+    fn unlimited_retry_keeps_retrying_instability_errors_with_one_second_backoff() {
+        let rate_limited = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 120);
+        match classify_error_with_mode(&rate_limited, 99, 15, 2, true) {
+            RetryDecision::Retry { backoff } => assert_eq!(backoff, UNLIMITED_RETRY_BACKOFF),
+            other => panic!("429 must retry forever, got {other:?}"),
+        }
+
+        let server_error = api_err(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        match classify_error_with_mode(&server_error, 99, 15, 2, true) {
+            RetryDecision::Retry { backoff } => assert_eq!(backoff, UNLIMITED_RETRY_BACKOFF),
+            other => panic!("503 must retry forever, got {other:?}"),
+        }
+
+        let stream_error = SamplingError::EventStreamError("reset".into());
+        match classify_error_with_mode(&stream_error, 99, 15, 2, true) {
+            RetryDecision::Retry { backoff } => assert_eq!(backoff, UNLIMITED_RETRY_BACKOFF),
+            other => panic!("stream error must retry forever, got {other:?}"),
+        }
+    }
+
+    /// 无限重试不改变确定性失败与非上游类错误的上限。
+    #[test]
+    fn unlimited_retry_keeps_deterministic_and_budgeted_failures_terminal() {
+        let bad_request = api_err(StatusCode::BAD_REQUEST, "bad");
+        assert!(matches!(
+            classify_error_with_mode(&bad_request, 99, 15, 2, true),
+            RetryDecision::Fatal(_)
+        ));
+
+        let empty = SamplingError::EmptyResponse {
+            context: xai_grok_sampling_types::EmptyResponseContext {
+                reason: xai_grok_sampling_types::EmptyReason::NoVisibleContent,
+                had_reasoning: false,
+                content_len: 0,
+                tool_call_count: 0,
+                finish_reason: Some("stop".into()),
+                completion_tokens: Some(0),
+                reasoning_tokens: Some(0),
+                prompt_tokens: Some(10),
+                model: "m".into(),
+                first_choice_seen: true,
+            },
+        };
+        assert!(
+            matches!(
+                classify_error_with_mode(&empty, 0, 15, 2, true),
+                RetryDecision::Retry { .. }
+            ),
+            "空响应保留普通预算内的重试"
+        );
+        assert!(matches!(
+            classify_error_with_mode(&empty, 99, 15, 2, true),
+            RetryDecision::Fatal(_)
+        ));
+
+        let auth = SamplingError::auth_unknown("bad token");
+        assert!(matches!(
+            classify_error_with_mode(&auth, 99, 15, 2, true),
+            RetryDecision::EmitToSession(_)
+        ));
+    }
+
+    /// 显式 `max_retries = 0`（含子代理输出预算耗尽）优先于无限重试。
+    #[test]
+    fn unlimited_retry_does_not_override_a_zero_budget() {
+        let server_error = api_err(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
+        assert!(matches!(
+            classify_error_with_mode(&server_error, 0, 0, 2, true),
+            RetryDecision::Fatal(_)
+        ));
     }
 
     #[test]

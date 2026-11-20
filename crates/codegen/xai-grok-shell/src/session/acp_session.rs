@@ -159,6 +159,8 @@ mod mcp_argument_coercion;
 mod mcp_failed_reminder;
 #[path = "acp_session_impl/fast_mode.rs"]
 mod fast_mode;
+#[path = "acp_session_impl/unlimited_retry.rs"]
+mod unlimited_retry;
 #[path = "acp_session_impl/model_switch.rs"]
 mod model_switch;
 #[path = "acp_session_impl/slash_exec.rs"]
@@ -749,6 +751,8 @@ pub(crate) struct SessionActor {
     pub(crate) session_info: SessionInfo,
     /// Transient turn-retry kill switch, resolved once at spawn; flips apply to new sessions.
     pub(crate) transient_retry_enabled: bool,
+    /// 会话级无限重试开关，由 `/retry` 控制；只影响本会话后续轮次，不写入配置或存档。
+    pub(crate) unlimited_retry: std::cell::Cell<bool>,
     /// Cumulative transient resubmits this prompt.
     /// Prompt-scoped on the actor: auto-recovery, stop-hook continuations, and the goal loop re-enter the turn loop within one prompt.
     /// A loop-local counter would reset the cap (exhaustion itself triggers auto-recovery).

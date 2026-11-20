@@ -777,6 +777,8 @@ async fn read_parent_sampling_config(
                 responses_compact_threshold: cfg.responses_compact_threshold,
                 force_http1: false,
                 max_retries: cfg.max_retries.or(ctx.sampling_config.max_retries),
+                // 子代理继承父会话的无限重试开关，长任务链上的限流同样不中断。
+                unlimited_retry: ctx.sampling_config.unlimited_retry,
                 rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,
                 stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
                 idle_timeout_secs: None,

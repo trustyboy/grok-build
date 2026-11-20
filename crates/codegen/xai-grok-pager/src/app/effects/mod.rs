@@ -1943,6 +1943,13 @@ pub(crate) fn execute(
                 TaskResult::FastModeComplete { request, result }
             });
         }
+        Effect::UnlimitedRetry { request, action } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let result = model_requests::unlimited_retry(&request, action, &tx).await;
+                TaskResult::UnlimitedRetryComplete { request, result }
+            });
+        }
         Effect::SubagentsModel { request, action } => {
             let tx = acp_tx.clone();
             tasks.spawn(async move {

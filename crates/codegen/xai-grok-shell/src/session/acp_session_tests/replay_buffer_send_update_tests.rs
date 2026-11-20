@@ -90,6 +90,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
     let actor = SessionActor {
         vcs_root: None,
         transient_retry_enabled: true,
+        unlimited_retry: Default::default(),
         transient_retries_prompt_total: std::cell::Cell::new(0),
         transient_episode_start: std::cell::Cell::new(None),
         status_wake: Default::default(),

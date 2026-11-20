@@ -29,7 +29,7 @@ use crate::events::{SamplingErrorInfo, SamplingErrorKind, SamplingEvent, StripRe
 use crate::handle::CollectedSamplingResult;
 use crate::metrics::InferenceLatencyStats;
 use crate::retry::{
-    self as retry_mod, RetryDecision, classify_error, clone_error, resolve_max_retries,
+    self as retry_mod, RetryDecision, classify_error_with_mode, clone_error, resolve_max_retries,
 };
 use crate::stream::responses::stream_responses_tracked;
 use crate::stream::{stream_chat_completions, stream_messages};
@@ -96,6 +96,8 @@ pub(crate) async fn run_request_task(
     } else {
         resolve_max_retries(configured_max_retries)
     };
+    // 会话级无限重试：只放宽上游不稳定错误的重试预算，间隔固定 1 秒。
+    let unlimited_retry = config.unlimited_retry;
 
     // Build the initial client
     // Configuration errors here are fatal (no point retrying with the same broken config)
@@ -239,6 +241,7 @@ pub(crate) async fn run_request_task(
                     &err,
                     &mut retry_count,
                     effective_max_retries,
+                    unlimited_retry,
                     &retry_policy,
                     &event_tx,
                     &request_id,
@@ -314,6 +317,7 @@ pub(crate) async fn run_request_task(
                     &error,
                     &mut retry_count,
                     effective_max_retries,
+                    unlimited_retry,
                     &retry_policy,
                     &event_tx,
                     &request_id,
@@ -338,6 +342,7 @@ pub(crate) async fn run_request_task(
                     &error,
                     &mut retry_count,
                     effective_max_retries,
+                    unlimited_retry,
                     &retry_policy,
                     &event_tx,
                     &request_id,
@@ -364,6 +369,7 @@ async fn apply_retry_decision(
     err: &SamplingError,
     retry_count: &mut u32,
     max_retries: u32,
+    unlimited_retry: bool,
     retry_policy: &RetryPolicy,
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
     request_id: &RequestId,
@@ -377,7 +383,15 @@ async fn apply_retry_decision(
     let rate_limit_threshold = config
         .rate_limit_retry_threshold
         .unwrap_or(retry_policy.rate_limit_retry_threshold);
-    let decision = classify_error(err, *retry_count, max_retries, rate_limit_threshold);
+    let decision = classify_error_with_mode(
+        err,
+        *retry_count,
+        max_retries,
+        rate_limit_threshold,
+        unlimited_retry,
+    );
+    // 无限重试对外显示 0 作为上限占位，界面据此渲染 ∞。
+    let display_max_retries = if unlimited_retry { 0 } else { max_retries };
 
     // Connection-reset / broken-pipe on body upload often means nginx rejected an oversized payload before responding 413
     // Strip images proactively before any retry of those errors so we don't burn budget re-uploading the same large body
@@ -408,7 +422,13 @@ async fn apply_retry_decision(
     match decision {
         RetryDecision::Retry { backoff } => {
             *retry_count += 1;
-            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
+            emit_retrying(
+                event_tx,
+                request_id,
+                *retry_count,
+                display_max_retries,
+                err,
+            );
             if sleep_or_cancel(backoff, cancel_token, *retry_count, parent).await {
                 true
             } else {
@@ -418,7 +438,13 @@ async fn apply_retry_decision(
         }
         RetryDecision::RetryWithBackoff { backoff, .. } => {
             *retry_count += 1;
-            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
+            emit_retrying(
+                event_tx,
+                request_id,
+                *retry_count,
+                display_max_retries,
+                err,
+            );
             if sleep_or_cancel(backoff, cancel_token, *retry_count, parent).await {
                 true
             } else {
@@ -444,12 +470,24 @@ async fn apply_retry_decision(
             );
             emit_images_stripped(event_tx, request_id, stripped_urls, reason);
             *retry_count += 1;
-            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
+            emit_retrying(
+                event_tx,
+                request_id,
+                *retry_count,
+                display_max_retries,
+                err,
+            );
             true
         }
         RetryDecision::RetryWithClientRebuild { backoff } => {
             *retry_count += 1;
-            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
+            emit_retrying(
+                event_tx,
+                request_id,
+                *retry_count,
+                display_max_retries,
+                err,
+            );
             if !sleep_or_cancel(backoff, cancel_token, *retry_count, parent).await {
                 handle_cancellation(event_tx, request_id, completion);
                 return false;
@@ -1510,6 +1548,7 @@ mod tests {
             &error,
             &mut retry_count,
             2,
+            false,
             &RetryPolicy::default(),
             &event_tx,
             &RequestId::from("cancel-backoff"),

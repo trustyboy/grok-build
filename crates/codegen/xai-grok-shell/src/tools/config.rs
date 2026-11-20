@@ -225,6 +225,7 @@ impl ShellToolsetConfig {
             responses_compact_threshold: None,
             force_http1: false,
             max_retries: None,
+            unlimited_retry: false,
             rate_limit_retry_threshold: None,
             stream_tool_calls: false,
             idle_timeout_secs: None,

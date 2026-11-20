@@ -457,6 +457,7 @@ async fn planner_fork_inherits_parent_model() {
             // Without that forcing, the configured model would flow through and the assertion below would catch the regression
             let actor = StdArc::new(SessionActor {
                 transient_retry_enabled: true,
+                unlimited_retry: Default::default(),
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
                 status_wake: Default::default(),

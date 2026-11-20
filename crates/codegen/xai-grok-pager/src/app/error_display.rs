@@ -132,6 +132,10 @@ pub(crate) fn retry_clause(attempt: u32, max_retries: u32, style: RetryLabelStyl
     // Longer headline plus U+2026 wraps this status row into the prompt.
     match style {
         RetryLabelStyle::Status => format!("Retrying (attempt {attempt})..."),
+        // `0` 是无限重试的上限占位（服务端不设预算）。
+        RetryLabelStyle::Compact if max_retries == 0 => {
+            format!("Retrying ({attempt}/\u{221e})")
+        }
         RetryLabelStyle::Compact => format!("Retrying ({attempt}/{max_retries})"),
     }
 }

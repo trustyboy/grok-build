@@ -3,6 +3,7 @@ pub(crate) mod fast_mode;
 pub(crate) mod model_discovery;
 pub(crate) mod model_switch;
 pub(crate) mod support_vision;
+pub(crate) mod unlimited_retry;
 pub(crate) mod subagents_model;
 pub(crate) mod models;
 pub(crate) mod session;

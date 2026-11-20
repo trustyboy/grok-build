@@ -9,9 +9,10 @@
 
 ## 编译规则
 
-- 后续 Rust 编译、会触发编译的检查和定向测试统一通过 `ssh root@hkh.vnt.win11sj.top` 执行。该入口为 WSL，调用 `/mnt/d/Program Files/PowerShell/7/pwsh.exe` 使用同机 Windows 工具链；仓库为 `F:\github\grok-build`，WSL 路径为 `/mnt/f/github/grok-build`。下文 Windows 命令在该 PowerShell 7 环境执行。
-- 本机用于源码编辑、同步及无需编译的静态检查；本机 `target` 已清理。将编译产物和 Release 增量缓存集中保存在服务器的 `F:\github\grok-build\target`。
-- 本文所有构建、初始化和测试命令均在服务器的 PowerShell 7、仓库根目录执行；从本机发起 SSH 的示例另有标注。
+- 后续 Rust 编译、会触发编译的检查和定向测试统一交给 **hkh-win** 主机的 `F:\github\grok-build` 执行（与本机同路径）；本机只负责源码编辑、同步和无需编译的静态检查，**禁止在本机执行任何编译构建**。本机 `target` 已清理。
+- hkh-win 直接登录：`ssh -p 2222 Administrator@hkh.vnt.win11sj.top`，在该机的 PowerShell 7（`D:\Program Files\PowerShell\7\pwsh.exe`）中构建。该机的 `F:\github\grok-build` 与 hkh WSL 的 `/mnt/f/github/grok-build` 是同一目录，编译产物和 Release 增量缓存统一保存在该目录的 `target`。
+- hkh-win 仓库已切换到私人仓库并配置 Git 代理；构建前先在该机执行 `git pull --ff-only` 拉取最新 `gf`，避免编译旧代码。
+- 本文所有构建、初始化和测试命令均在 hkh-win 的 PowerShell 7、仓库根目录执行；从本机发起 SSH 的示例另有标注。
 - 本项目只允许编译 Release 版本，不编译 Debug 版本。
 - Windows 下唯一的正式编译入口是：
 
@@ -39,19 +40,21 @@
 
 ### 远程编译步骤
 
-1. **同步需要构建的工作树。** 本机修改后，先核对两端的提交、`git status --short` 和相关文件内容，再同步源码、配置、测试和文档，包括本次需要的未提交修改及未跟踪文件。服务器已有完整仓库，后续同步保留服务器的 `.git`、`target` 和 `tools/windows-protoc/runtime`；同名文件存在远端独立修改时先比对合并。同步完成后核对文件哈希，避免编译旧代码。文件传输遇到 SCP/SFTP 的 `Connection closed` 时，可使用 SSH 标准输入传输文件或压缩包，并校验 SHA-256；临时包放系统临时目录，用完清理。
+1. **同步代码。** 本机提交并推送 `gf` 后，在 hkh-win 执行 `git pull --ff-only`；只存在于本机、尚未提交的验证性改动再单独同步对应文件。服务器保留自身的 `.git`、`target` 和 `tools/windows-protoc/runtime`；拉取后核对 `git rev-parse HEAD` 与相关文件哈希，避免编译旧代码。
 
-2. **登录编译服务器。** 在本机执行：
+2. **登录 hkh-win。** 在本机执行：
 
    ```powershell
-   ssh root@hkh.vnt.win11sj.top
+   ssh -p 2222 Administrator@hkh.vnt.win11sj.top
    ```
 
    登录后进入 PowerShell 7：
 
    ```powershell
-   '/mnt/d/Program Files/PowerShell/7/pwsh.exe' -NoLogo -NoProfile
+   & 'D:\Program Files\PowerShell\7\pwsh.exe' -NoLogo -NoProfile
    ```
+
+   也可沿用 WSL 入口 `ssh root@hkh.vnt.win11sj.top`，再执行 `/mnt/d/Program Files/PowerShell/7/pwsh.exe`；两个入口指向同一份仓库，实际编译始终发生在 hkh-win 的 Windows 工具链上。
 
 3. **加载环境并构建。** 在服务器 PowerShell 7 中执行：
 
@@ -82,12 +85,13 @@ $remoteCommand = @'
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 Set-Location -LiteralPath 'F:\github\grok-build'
+git pull --ff-only
 . 'C:\ProgramData\GrokBuild\Enable-GrokBuild.ps1' -UseProxy
 & .\tools\windows-protoc\build-release.ps1 --locked
 '@
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remoteCommand))
-ssh -T -o BatchMode=yes -o ServerAliveInterval=30 root@hkh.vnt.win11sj.top "cd /mnt/f/github/grok-build && '/mnt/d/Program Files/PowerShell/7/pwsh.exe' -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
-if ($LASTEXITCODE -ne 0) { throw "远程 Release 构建失败，SSH 退出码：$LASTEXITCODE" }
+ssh -T -o BatchMode=yes -o ServerAliveInterval=30 -p 2222 Administrator@hkh-win.vnt.win11sj.top "`"D:\Program Files\PowerShell\7\pwsh.exe`" -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+if ($LASTEXITCODE -ne 0) { throw "hkh-win Release 构建失败，SSH 退出码：$LASTEXITCODE" }
 ```
 
 ### 服务器环境与缓存
@@ -162,6 +166,13 @@ if ($LASTEXITCODE -ne 0) { throw "远程 Release 构建失败，SSH 退出码：
 - 仅 Responses 请求在开启时发送 `service_tier: "priority"`（OpenAI Fast 的兼容值）；关闭时省略字段，Chat Completions 与 Messages 不发送。
 - 会话覆盖位于 `session/acp_session_impl/fast_mode.rs`，采样器与视觉开关共用轮次快照。保持模型切换、会话隔离及执行中轮次归属。
 - Release 构建后运行 `python tools/test-fast-mode.py`，使用临时配置和本地假上游校验实际请求。
+
+## 无限重试模式
+
+- `/retry [on|off|status]` 仅覆盖当前会话，无参切换，下一轮生效，不写入配置或会话存档；子代理在 spawn 时继承父会话开关。
+- 开启后采样器对限流、5xx、传输错误与流中断跳过重试预算，按固定 1 秒间隔持续重试；回合级重试同样忽略每步、每提示与时间窗口预算，并使用 1 秒间隔。
+- 鉴权、上下文超长、空响应、图片/请求体错误与 doom-loop 保留各自现有的终止或独立恢复路径；`max_retries = 0`（含子代理输出预算耗尽）仍立即终止。
+- 界面显示 `Retrying (N/∞)`；实现位于 `session/acp_session_impl/unlimited_retry.rs`，ACP 扩展为 `x.ai/session/unlimited_retry`，状态由 `SamplerConfig.unlimited_retry` 下发。
 
 ## 子代理模型配置与会话覆盖
 

@@ -340,6 +340,7 @@ async fn create_test_actor_inner(
     let actor = SessionActor {
         vcs_root: None,
         transient_retry_enabled: true,
+        unlimited_retry: Default::default(),
         transient_retries_prompt_total: std::cell::Cell::new(0),
         transient_episode_start: std::cell::Cell::new(None),
         status_wake: Default::default(),
@@ -1180,6 +1181,7 @@ pub(crate) fn transient_state(step_attempts: u32, enabled: bool) -> TransientRet
         prompt_attempts: 0,
         episode_start: None,
         enabled,
+        unlimited: false,
     }
 }
 pub(crate) fn ms(n: u64) -> std::time::Duration {

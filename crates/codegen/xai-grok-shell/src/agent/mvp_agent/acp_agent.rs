@@ -2020,6 +2020,9 @@ impl acp::Agent for MvpAgent {
             "x.ai/session/support_vision" => {
                 crate::agent::handlers::support_vision::handle(self, &args).await
             }
+            "x.ai/session/unlimited_retry" => {
+                crate::agent::handlers::unlimited_retry::handle(self, &args).await
+            }
             "x.ai/session/updates" => {
                 crate::extensions::session_updates::handle(&args, &self.gateway).await
             }

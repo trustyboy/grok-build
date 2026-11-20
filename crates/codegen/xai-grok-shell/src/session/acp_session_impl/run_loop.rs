@@ -848,6 +848,10 @@ pub(super) async fn run_session(
                             let outcome = session.handle_fast_mode(action, expected_model_id.as_deref()).await;
                             let _ = responds_to.send(outcome);
                         }
+                        SessionCommand::UnlimitedRetry { action, responds_to } => {
+                            let outcome = session.handle_unlimited_retry(action).await;
+                            let _ = responds_to.send(outcome);
+                        }
                         SessionCommand::SupportVision { enabled, expected_model_id, responds_to } => {
                             let outcome = session.handle_support_vision(enabled, expected_model_id.as_deref()).await;
                             let _ = responds_to.send(outcome);

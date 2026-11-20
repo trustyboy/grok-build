@@ -3,6 +3,7 @@
 use super::{maybe_drain_queue_and_note_peek, refresh_open_settings_modals};
 use crate::app::actions::{
     Effect, FastModeAction, FastModeState, ModelRequestContext, SupportVisionState,
+    UnlimitedRetryAction, UnlimitedRetryState,
 };
 use crate::app::app_view::{ActiveView, AppView};
 use crate::scrollback::block::RenderBlock;
@@ -62,6 +63,16 @@ pub(super) fn support_vision(app: &mut AppView, enabled: Option<bool>) -> Vec<Ef
 pub(super) fn fast_mode(app: &mut AppView, action: FastModeAction) -> Vec<Effect> {
     begin_request(app)
         .map(|request| vec![Effect::FastMode { request, action }])
+        .unwrap_or_default()
+}
+
+/// 无限重试属于会话级开关，复用模型设置屏障避免与提示词并发。
+pub(super) fn unlimited_retry(
+    app: &mut AppView,
+    action: UnlimitedRetryAction,
+) -> Vec<Effect> {
+    begin_request(app)
+        .map(|request| vec![Effect::UnlimitedRetry { request, action }])
         .unwrap_or_default()
 }
 
@@ -283,6 +294,35 @@ pub(super) fn fast_mode_complete(
             }
         ),
         Err(error) => format!("快速模式查询或修改失败：{error}"),
+    };
+    agent.scrollback.push_block(RenderBlock::system(message));
+    maybe_drain_queue_and_note_peek(app, request.agent_id)
+}
+
+/// 只展示原会话的确认状态，不缓存或持久化开关。
+pub(super) fn unlimited_retry_complete(
+    app: &mut AppView,
+    request: ModelRequestContext,
+    result: Result<UnlimitedRetryState, String>,
+) -> Vec<Effect> {
+    if !finish_request(app, &request) {
+        return vec![];
+    }
+    let agent = app
+        .agents
+        .get_mut(&request.agent_id)
+        .expect("request agent");
+    let message = match result {
+        Ok(state) => format!(
+            "无限重试：{}（仅当前会话；下一轮生效；{} 秒固定间隔；不写入配置）",
+            if state.enabled {
+                "已开启"
+            } else {
+                "已关闭"
+            },
+            state.interval_secs
+        ),
+        Err(error) => format!("无限重试查询或修改失败：{error}"),
     };
     agent.scrollback.push_block(RenderBlock::system(message));
     maybe_drain_queue_and_note_peek(app, request.agent_id)

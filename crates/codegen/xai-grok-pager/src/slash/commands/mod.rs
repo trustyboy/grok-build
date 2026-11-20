@@ -52,6 +52,7 @@ pub mod release_notes;
 pub mod remember;
 pub mod rename;
 pub mod resume;
+pub mod retry;
 pub mod rewind;
 pub mod screen_mode_switch;
 pub mod session_info;
@@ -95,6 +96,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(subagents_model::SubagentsModelCommand),
         Arc::new(support_vision::SupportVisionCommand),
         Arc::new(fast::FastCommand),
+        Arc::new(retry::RetryCommand),
         Arc::new(context::ContextCommand),
         Arc::new(compact::CompactCommand),
         Arc::new(fork::ForkCommand),

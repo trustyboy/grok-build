@@ -62,6 +62,30 @@ pub struct FastModeState {
     pub supported: bool,
 }
 
+/// 无限重试操作；无参命令由服务端原子翻转。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnlimitedRetryAction {
+    /// 翻转当前有效状态。
+    Toggle,
+    /// 开启无限重试。
+    On,
+    /// 关闭无限重试。
+    Off,
+    /// 只查询当前状态。
+    Status,
+}
+
+/// 服务端确认的会话无限重试状态。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlimitedRetryState {
+    /// 下一轮是否对上游不稳定错误无限重试。
+    pub enabled: bool,
+    /// 固定重试间隔（秒）。
+    pub interval_secs: u64,
+}
+
 /// Typed error for model switch failures.
 /// Replaces the raw `String` in `TaskResult::SwitchModelComplete` so dispatch can match on the variant instead of parsing strings.
 #[derive(Debug, Clone)]
@@ -480,6 +504,11 @@ pub enum Action {
     FastMode {
         /// 服务端执行的操作。
         action: FastModeAction,
+    },
+    /// 查询或修改当前会话的无限重试模式。
+    UnlimitedRetry {
+        /// 服务端执行的操作。
+        action: UnlimitedRetryAction,
     },
     /// 查询或设置新建子代理的会话级模型。
     SubagentsModel {
@@ -1709,6 +1738,13 @@ pub enum Effect {
         /// 服务端执行的操作。
         action: FastModeAction,
     },
+    /// 向服务端请求会话的无限重试状态。
+    UnlimitedRetry {
+        /// 发起请求时的归属和过期保护。
+        request: ModelRequestContext,
+        /// 服务端执行的操作。
+        action: UnlimitedRetryAction,
+    },
     /// 请求新建子代理的会话级模型状态。
     SubagentsModel {
         /// 发起请求时的归属和过期保护。
@@ -2792,6 +2828,13 @@ pub enum TaskResult {
         request: ModelRequestContext,
         /// 服务端确认状态或错误原因。
         result: Result<FastModeState, String>,
+    },
+    /// 无限重试查询或修改完成。
+    UnlimitedRetryComplete {
+        /// 发起请求时的归属和过期保护。
+        request: ModelRequestContext,
+        /// 服务端确认状态或错误原因。
+        result: Result<UnlimitedRetryState, String>,
     },
     /// 子代理模型查询或设置完成。
     SubagentsModelComplete {

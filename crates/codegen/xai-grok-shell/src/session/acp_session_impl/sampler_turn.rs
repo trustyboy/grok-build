@@ -18,6 +18,8 @@ pub(super) struct TurnSamplingState {
     pub(super) supports_vision: bool,
     /// 本轮固定的 Fast 开关，命令覆盖在下一轮生效。
     pub(super) fast_mode: bool,
+    /// 本轮固定的无限重试开关，轮次中途的 slash 覆盖在下一轮生效。
+    pub(super) unlimited_retry: bool,
 }
 
 tokio::task_local! {
@@ -62,6 +64,8 @@ pub(crate) struct TransientRetryState {
     /// First transient failure of the current recovery episode (`None` until one happens; cleared on success).
     pub(crate) episode_start: Option<tokio::time::Instant>,
     pub(crate) enabled: bool,
+    /// 会话级无限重试：忽略步、提示与时间窗口预算，固定间隔重试。
+    pub(crate) unlimited: bool,
 }
 
 /// Ceiling shown to the user (`Retrying (N/M)`): attempts used this step plus whatever further attempts both remaining budgets allow.
@@ -74,9 +78,10 @@ pub(super) fn transient_display_ceiling(step_attempts: u32, prompt_attempts: u32
 
 impl TransientRetryState {
     fn budget_remaining(&self, window: std::time::Duration) -> bool {
-        self.step_attempts < MAX_TRANSIENT_TURN_RETRIES
-            && self.prompt_attempts < MAX_TRANSIENT_RETRIES_PER_PROMPT
-            && self.episode_start.is_none_or(|s| s.elapsed() < window)
+        self.unlimited
+            || (self.step_attempts < MAX_TRANSIENT_TURN_RETRIES
+                && self.prompt_attempts < MAX_TRANSIENT_RETRIES_PER_PROMPT
+                && self.episode_start.is_none_or(|s| s.elapsed() < window))
     }
 }
 
@@ -719,6 +724,7 @@ impl SessionActor {
                     credentials,
                     supports_vision,
                     fast_mode,
+                    unlimited_retry: self.unlimited_retry.get(),
                 };
             }
         }
@@ -793,6 +799,10 @@ impl SessionActor {
             || self.session_fast_mode_state(&cfg).enabled,
             |state| state.fast_mode,
         );
+        // 轮次快照优先，轮外调用读取当前会话开关。
+        let unlimited_retry = snapshot
+            .as_ref()
+            .map_or_else(|| self.unlimited_retry.get(), |state| state.unlimited_retry);
         let mut creds = match snapshot.as_ref() {
             Some(state)
                 if current_config.as_ref().is_none_or(|current| {
@@ -922,6 +932,7 @@ impl SessionActor {
             responses_compact_threshold: cfg.responses_compact_threshold,
             force_http1: false,
             max_retries: cfg.max_retries.or(Some(self.max_retries)),
+            unlimited_retry,
             rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,

@@ -2737,6 +2737,8 @@ impl SessionActor {
         );
         let mut transient_retry_attempts: u32 = 0;
         let transient_retry_enabled = self.transient_retry_enabled;
+        // 本轮固定无限重试开关，轮次中途的 slash 覆盖只影响下一轮。
+        let unlimited_retry = self.unlimited_retry.get();
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut structured_output_retries: u32 = 0;
         let mut media_gen_resamples: u32 = 0;
@@ -3084,6 +3086,7 @@ impl SessionActor {
                         prompt_attempts: self.transient_retries_prompt_total.get(),
                         episode_start: self.transient_episode_start.get(),
                         enabled: transient_retry_enabled,
+                        unlimited: unlimited_retry,
                     },
                     salvage.awaiting_continuation(),
                     turn_parked,
@@ -3152,9 +3155,16 @@ impl SessionActor {
                     if matches!(kind, xai_grok_sampler::SamplingErrorKind::Api) {
                         auth_retry_schedule.reset_incident_keeping_park();
                     }
-                    let delay = xai_grok_sampler::jitter_backoff(transient_backoff_delay(
-                        transient_retry_attempts,
-                    ));
+                    // 无限重试使用固定 1 秒节拍，跳过阶梯退避与抖动。
+                    let delay = if unlimited_retry {
+                        std::time::Duration::from_secs(
+                            super::unlimited_retry::UNLIMITED_RETRY_INTERVAL_SECS,
+                        )
+                    } else {
+                        xai_grok_sampler::jitter_backoff(transient_backoff_delay(
+                            transient_retry_attempts,
+                        ))
+                    };
                     transient_retry_attempts += 1;
                     let prompt_total = self.transient_retries_prompt_total.get() + 1;
                     self.transient_retries_prompt_total.set(prompt_total);
@@ -3162,8 +3172,12 @@ impl SessionActor {
                         self.transient_episode_start
                             .set(Some(tokio::time::Instant::now()));
                     }
-                    let display_max =
-                        transient_display_ceiling(transient_retry_attempts, prompt_total);
+                    // 无限重试对外显示 0 作为上限占位，界面渲染为 ∞。
+                    let display_max = if unlimited_retry {
+                        0
+                    } else {
+                        transient_display_ceiling(transient_retry_attempts, prompt_total)
+                    };
                     xai_grok_telemetry::unified_log::warn(
                         "shell.turn.transient_retry_backoff",
                         Some(self.session_info.id.0.as_ref()),

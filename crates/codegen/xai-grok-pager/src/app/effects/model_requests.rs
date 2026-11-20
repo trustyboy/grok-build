@@ -2,7 +2,10 @@
 
 use super::helpers::{SessionRpcError, format_acp_error};
 use super::{acp_send_bounded, sanitize_user_error};
-use crate::app::actions::{FastModeAction, FastModeState, ModelRequestContext, SupportVisionState};
+use crate::app::actions::{
+    FastModeAction, FastModeState, ModelRequestContext, SupportVisionState,
+    UnlimitedRetryAction, UnlimitedRetryState,
+};
 use agent_client_protocol as acp;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use xai_acp_lib::AcpAgentTx;
@@ -102,6 +105,17 @@ pub(super) async fn fast_mode(
     let mut params = request_params(request, None);
     params["action"] = serde_json::to_value(action).expect("fast mode action");
     send("x.ai/session/fast_mode", params, tx).await
+}
+
+/// 无限重试是会话级设置，不携带模型归属，避免模型切换干扰开关。
+pub(super) async fn unlimited_retry(
+    request: &ModelRequestContext,
+    action: UnlimitedRetryAction,
+    tx: &AcpAgentTx,
+) -> Result<UnlimitedRetryState, String> {
+    let mut params = serde_json::json!({ "sessionId": request.session_id });
+    params["action"] = serde_json::to_value(action).expect("unlimited retry action");
+    send("x.ai/session/unlimited_retry", params, tx).await
 }
 
 /// 共享操作类型展平到请求；未知 ID 也只走此接口。

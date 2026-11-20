@@ -975,6 +975,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::FastModeComplete { request, result } => {
             super::model_requests::fast_mode_complete(app, request, result)
         }
+        TaskResult::UnlimitedRetryComplete { request, result } => {
+            super::model_requests::unlimited_retry_complete(app, request, result)
+        }
         TaskResult::SubagentsModelComplete { request, result } => {
             super::model_requests::subagents_model_complete(app, request, result)
         }

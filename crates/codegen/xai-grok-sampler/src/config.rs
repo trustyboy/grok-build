@@ -74,6 +74,10 @@ pub struct SamplerConfig {
     pub max_request_bytes: Option<NonZeroU64>,
     pub force_http1: bool,
     pub max_retries: Option<u32>,
+    /// 无限重试：上游不稳定时对限流、5xx、传输错误按固定 1 秒间隔持续重试。
+    /// 由会话级 `/retry` 覆盖写入，不持久化；`max_retries == 0` 仍会立即终止。
+    #[serde(default)]
+    pub unlimited_retry: bool,
     /// Total-attempt ceiling for rate-limited requests.
     /// `None` keeps the actor's [`RetryPolicy::rate_limit_retry_threshold`].
     #[serde(default)]
@@ -164,6 +168,7 @@ impl Default for SamplerConfig {
             max_request_bytes: None,
             force_http1: false,
             max_retries: None,
+            unlimited_retry: false,
             rate_limit_retry_threshold: None,
             stream_tool_calls: false,
             idle_timeout_secs: None,

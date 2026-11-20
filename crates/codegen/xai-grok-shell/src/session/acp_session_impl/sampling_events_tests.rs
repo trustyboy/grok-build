@@ -1420,6 +1420,7 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                         prompt_attempts: 0,
                         episode_start: None,
                         enabled: true,
+                        unlimited: false,
                     },
                     false,
                     TurnParkState::Fresh,

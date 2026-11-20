@@ -140,6 +140,19 @@ Switch models. Accepts a model ID or display name (case-insensitive). When the m
 
 **开启后账单更高**；实际加速和计费依赖服务端、模型及账户支持。状态显示已开启只代表已选择请求优先服务，不保证上游接受或提供加速。模型配置 `fast_mode` 默认 `false`，可在 `[model.<id>]` 中设为 `true` 长期默认开启，详见[自定义模型](11-custom-models.md)。
 
+### `/retry [on|off|status]`
+
+切换或查询当前会话的无限重试模式。无参会**翻转状态**，只想查看时请使用 `/retry status`。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/retry` | 翻转当前有效状态 |
+| `/retry on` | 开启无限重试 |
+| `/retry off` | 关闭无限重试 |
+| `/retry status` | 只查询状态，不修改 |
+
+适合上游经常返回 503/429 的场景：开启后限流、5xx、连接中断等可重试错误不再消耗重试预算，而是按**固定 1 秒间隔**持续重试，`/goal` 等长任务不会因为重试耗尽而中断。鉴权失败、上下文超长、图片或请求体错误等确定性失败仍会立即终止。开关仅作用于当前会话，从下一轮生效，不写入配置；新建子代理会继承父会话的开关。界面显示 `Retrying (N/∞)`。
+
 ### `/effort <level>`
 
 Set reasoning effort on the **current** model without reselecting it. Levels are `low`, `medium`, `high`, and `xhigh`, and it only applies when the active model supports reasoning effort.
