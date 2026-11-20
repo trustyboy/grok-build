@@ -1,5 +1,12 @@
 # Grok Build 项目协作规则
 
+## 分支策略
+
+- `main` 分支由开源社区维护，是上游功能的来源；本机 `origin` 指向个人仓库 `https://github.com/trustyboy/grok-build.git`，`upstream` 跟踪官方仓库 `xai-org/grok-build`，两者 `main` 保持一致。
+- `gf` 分支是基于 `main` 的定制化开发分支，Windows 构建兼容、主题移植、协议兼容与压缩等定制功能都在此维护。
+- 需要不定期把 `main` 的新功能同步到 `gf`：在 `gf` 分支执行 `git fetch origin` 后 `git merge origin/main`。同步时不得丢失 `gf` 已有的定制改动。
+- 合并出现功能冲突时，立即停止自动处理并向用户报告冲突文件与两侧意图，由用户决定取舍；禁止未经确认丢弃 `gf` 改动或使用强制还原。
+
 ## 编译规则
 
 - 后续 Rust 编译、会触发编译的检查和定向测试统一通过 `ssh root@hkh.vnt.win11sj.top` 执行。该入口为 WSL，调用 `/mnt/d/Program Files/PowerShell/7/pwsh.exe` 使用同机 Windows 工具链；仓库为 `F:\github\grok-build`，WSL 路径为 `/mnt/f/github/grok-build`。下文 Windows 命令在该 PowerShell 7 环境执行。
